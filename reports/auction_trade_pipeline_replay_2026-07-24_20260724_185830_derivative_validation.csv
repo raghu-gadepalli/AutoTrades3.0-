@@ -1,5 +1,0 @@
-entry_snapshot_time,executed_entry_price,executed_price_matches,expected_entry_price,expected_symbol,instrument_type,planned_entry_price,planned_price_matches,symbol_matches,trade_id,trade_symbol,validation_status
-2026-07-24T10:12:00+05:30,13134.0,True,13134.0,MARUTI26AUGFUT,FUT,13134.0,True,True,2,MARUTI26AUGFUT,PASSED
-2026-07-24T10:12:00+05:30,455.7,True,455.7,MARUTI26AUG13200PE,PE,455.7,True,True,3,MARUTI26AUG13200PE,PASSED
-2026-07-24T10:57:00+05:30,13227.0,True,13227.0,MARUTI26AUGFUT,FUT,13227.0,True,True,5,MARUTI26AUGFUT,PASSED
-2026-07-24T10:57:00+05:30,430.0,True,430.0,MARUTI26AUG13200CE,CE,430.0,True,True,6,MARUTI26AUG13200CE,PASSED
