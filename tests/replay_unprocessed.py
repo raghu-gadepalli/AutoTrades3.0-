@@ -66,7 +66,7 @@ from services.trade.monitor.trade_monitor import TradeMonitor
 
 # False: generate/update signals only.
 # True:  also generate, execute, monitor, and exit VIRTUAL trades.
-GENERATE_TRADES: bool = False
+GENERATE_TRADES: bool = True
 
 # Used only when GENERATE_TRADES=True.  This user must be AUTOGEN-eligible and
 # must use VIRTUAL execution.  The utility never processes another user's
