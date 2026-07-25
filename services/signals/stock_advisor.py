@@ -76,9 +76,7 @@ class StockAdvisor:
             return AdvisorDecision(
                 symbol=snapshot.symbol,
                 snapshot_time=snapshot.snapshot_time,
-                mode=self.policy.mode,
                 action=AdvisorAction.ALLOW,
-                effective_action=AdvisorAction.ALLOW,
                 selected_candidate_id=selected.candidate_id,
                 reason_codes=("ADVISOR_DISABLED_ALLOW",),
                 diagnostics={
@@ -147,7 +145,7 @@ class StockAdvisor:
 
         exhaustion_current = self._exhaustion_is_current(snapshot, context)
         exhaustion_family_applicable = family in self._normalised_set(
-            self.policy.exhaustion_block_families
+            self.policy.same_direction_exhaustion_families
         )
         same_direction_exhaustion = bool(
             exhaustion_current
@@ -170,18 +168,16 @@ class StockAdvisor:
             atr,
         )
         diagnostics["candidate_inside_accepted_range"] = candidate_inside_accepted_range
-        inside_range_defer = bool(
-            self.policy.defer_inside_accepted_range
-            and candidate_inside_accepted_range
+        inside_range_condition = bool(
+            candidate_inside_accepted_range
             and not inside_range_exempt
             and not strong_confirmation
         )
         diagnostics["inside_range_exempt"] = inside_range_exempt
-        diagnostics["inside_range_defer"] = inside_range_defer
+        diagnostics["inside_range_condition"] = inside_range_condition
 
         extreme_chase = bool(
-            self.policy.defer_extreme_chase
-            and self._is_extreme_chase(selected, context, atr)
+            self._is_extreme_chase(selected, context, atr)
             and not strong_confirmation
         )
         diagnostics["extreme_chase"] = extreme_chase
@@ -193,62 +189,85 @@ class StockAdvisor:
             self.policy.session_path_exempt_subtypes,
         )
         against_session_path = bool(
-            self.policy.defer_against_session_path
-            and not session_path_exempt
+            not session_path_exempt
             and not strong_confirmation
             and self._against_persistent_session_path(selected, context)
         )
         diagnostics["session_path_exempt"] = session_path_exempt
         diagnostics["against_persistent_session_path"] = against_session_path
 
-        reasons: List[str] = []
-        if self.policy.block_exhausted_direction and same_direction_exhaustion:
-            action = AdvisorAction.BLOCK
-            reasons.append("ADVISOR_BLOCK_EXHAUSTED_DIRECTION")
-        else:
-            action = AdvisorAction.ALLOW
-            if inside_range_defer:
-                action = AdvisorAction.WATCH
-                reasons.append("ADVISOR_WATCH_INSIDE_ACCEPTED_RANGE")
-            if extreme_chase:
-                action = AdvisorAction.WATCH
-                reasons.append(
-                    "ADVISOR_WATCH_BUY_NEAR_SESSION_HIGH"
-                    if selected.side == "BUY"
-                    else "ADVISOR_WATCH_SELL_NEAR_SESSION_LOW"
-                )
-            if against_session_path:
-                action = AdvisorAction.WATCH
-                reasons.append(
-                    "ADVISOR_WATCH_SELL_AGAINST_CLIMB_FROM_SESSION_LOW"
-                    if selected.side == "SELL"
-                    else "ADVISOR_WATCH_BUY_AGAINST_DECLINE_FROM_SESSION_HIGH"
-                )
+        configured_rule_actions = {
+            "same_direction_exhaustion": self.policy.same_direction_exhaustion_action,
+            "inside_accepted_range": self.policy.inside_accepted_range_action,
+            "extreme_chase": self.policy.extreme_chase_action,
+            "against_session_path": self.policy.against_session_path_action,
+        }
+        diagnostics["configured_rule_actions"] = dict(configured_rule_actions)
 
-        if action is AdvisorAction.ALLOW:
+        reasons: List[str] = []
+        triggered_rules: List[Dict[str, str]] = []
+        action = AdvisorAction.ALLOW
+
+        def apply_rule(rule_name: str, configured_action: str, reason_suffix: str) -> None:
+            nonlocal action
+            rule_action = self._configured_action(configured_action)
+            reason_code = f"ADVISOR_{rule_action.value}_{reason_suffix}"
+            triggered_rules.append({
+                "rule": rule_name,
+                "action": rule_action.value,
+                "reason_code": reason_code,
+            })
+            reasons.append(reason_code)
+            action = self._stronger_action(action, rule_action)
+
+        if same_direction_exhaustion:
+            apply_rule(
+                "same_direction_exhaustion",
+                self.policy.same_direction_exhaustion_action,
+                "EXHAUSTED_DIRECTION",
+            )
+        if inside_range_condition:
+            apply_rule(
+                "inside_accepted_range",
+                self.policy.inside_accepted_range_action,
+                "INSIDE_ACCEPTED_RANGE",
+            )
+        if extreme_chase:
+            apply_rule(
+                "extreme_chase",
+                self.policy.extreme_chase_action,
+                (
+                    "BUY_NEAR_SESSION_HIGH"
+                    if selected.side == "BUY"
+                    else "SELL_NEAR_SESSION_LOW"
+                ),
+            )
+        if against_session_path:
+            apply_rule(
+                "against_session_path",
+                self.policy.against_session_path_action,
+                (
+                    "SELL_AGAINST_CLIMB_FROM_SESSION_LOW"
+                    if selected.side == "SELL"
+                    else "BUY_AGAINST_DECLINE_FROM_SESSION_HIGH"
+                ),
+            )
+
+        if not triggered_rules:
             reasons.append(
                 "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE"
                 if strong_confirmation
                 else "ADVISOR_ALLOW_SIMPLE_DEPLOYMENT_CONTEXT"
             )
 
-        effective = action
-        if self.policy.mode == "SHADOW" and action in {
-            AdvisorAction.WATCH,
-            AdvisorAction.BLOCK,
-        }:
-            effective = AdvisorAction.ALLOW
-            reasons.append("ADVISOR_SHADOW_DECISION_NOT_ENFORCED")
-
+        diagnostics["triggered_rules"] = triggered_rules
         diagnostics["advisor_action"] = action.value
-        diagnostics["advisor_effective_action"] = effective.value
+        diagnostics["signal_creation_allowed"] = action is not AdvisorAction.BLOCK
 
         return AdvisorDecision(
             symbol=snapshot.symbol,
             snapshot_time=snapshot.snapshot_time,
-            mode=self.policy.mode,
             action=action,
-            effective_action=effective,
             selected_candidate_id=selected.candidate_id,
             reason_codes=tuple(dict.fromkeys(reasons)),
             diagnostics=diagnostics,
@@ -265,9 +284,7 @@ class StockAdvisor:
         return AdvisorDecision(
             symbol=snapshot.symbol,
             snapshot_time=snapshot.snapshot_time,
-            mode=self.policy.mode,
             action=AdvisorAction.NO_ACTION,
-            effective_action=AdvisorAction.NO_ACTION,
             selected_candidate_id=None,
             reason_codes=(reason_code,),
             diagnostics={
@@ -321,9 +338,7 @@ class StockAdvisor:
         return AdvisorDecision(
             symbol=snapshot.symbol,
             snapshot_time=snapshot.snapshot_time,
-            mode=self.policy.mode,
             action=AdvisorAction.ALLOW,
-            effective_action=AdvisorAction.ALLOW,
             selected_candidate_id=candidate_id,
             reason_codes=(error_code,),
             diagnostics={
@@ -505,6 +520,33 @@ class StockAdvisor:
             family in StockAdvisor._normalised_set(families)
             or subtype in StockAdvisor._normalised_set(subtypes)
         )
+
+    @staticmethod
+    def _configured_action(value: str) -> AdvisorAction:
+        normalized = str(value or "").strip().upper()
+        try:
+            action = AdvisorAction(normalized)
+        except ValueError as exc:
+            raise _AdvisorInputError(
+                f"Unsupported configured Advisor rule action: {value!r}"
+            ) from exc
+        if action not in {AdvisorAction.ALLOW, AdvisorAction.WATCH, AdvisorAction.BLOCK}:
+            raise _AdvisorInputError(
+                f"Unsupported configured Advisor rule action: {normalized}"
+            )
+        return action
+
+    @staticmethod
+    def _stronger_action(
+        current: AdvisorAction,
+        candidate: AdvisorAction,
+    ) -> AdvisorAction:
+        precedence = {
+            AdvisorAction.ALLOW: 0,
+            AdvisorAction.WATCH: 1,
+            AdvisorAction.BLOCK: 2,
+        }
+        return candidate if precedence[candidate] > precedence[current] else current
 
     @staticmethod
     def _normalised_set(values: tuple[str, ...]) -> Set[str]:

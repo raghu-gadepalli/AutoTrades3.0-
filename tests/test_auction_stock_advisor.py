@@ -30,8 +30,8 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.ts = datetime(2026, 7, 24, 10, 54)
         self.version = AUCTION_ENGINE_CONFIG.engine.config_version
 
-    def _policy(self, mode: str) -> StockAdvisorPolicyConfig:
-        return StockAdvisorPolicyConfig(mode=mode)
+    def _policy(self, **overrides) -> StockAdvisorPolicyConfig:
+        return StockAdvisorPolicyConfig(**overrides)
 
     def _snapshot(
         self,
@@ -126,7 +126,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             ),
         )
 
-    def test_exhausted_direction_is_blocked_but_shadow_preserves_flow(self) -> None:
+    def test_exhausted_direction_uses_configured_block_action(self) -> None:
         snapshot = self._snapshot(
             family="ACCEPTED_BREAKOUT",
             subtype="CONTINUATION_ACCEPTANCE",
@@ -137,13 +137,12 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             exhausted_side="DOWN",
             exhaustion_expires_at=self.ts + timedelta(minutes=3),
         )
-        result = StockAdvisor(self._policy("SHADOW")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.BLOCK, result.action)
-        self.assertEqual(AdvisorAction.ALLOW, result.effective_action)
         self.assertIn("ADVISOR_BLOCK_EXHAUSTED_DIRECTION", result.reason_codes)
 
     def test_normal_reversal_inside_accepted_range_is_deferred(self) -> None:
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(self._snapshot())
+        result = StockAdvisor(self._policy()).evaluate(self._snapshot())
         self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn("ADVISOR_WATCH_INSIDE_ACCEPTED_RANGE", result.reason_codes)
 
@@ -152,7 +151,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             family="FAILED_BREAKOUT",
             subtype="NEUTRAL_RANGE_FAILED_AUCTION",
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.ALLOW, result.action)
         self.assertTrue(result.diagnostics["inside_range_exempt"])
 
@@ -161,7 +160,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             family="REVERSAL",
             subtype="EXHAUSTION_REVERSAL",
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.ALLOW, result.action)
         self.assertTrue(result.diagnostics["inside_range_exempt"])
 
@@ -173,7 +172,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             rise_from_low_atr=1.35,
             distance_to_high_atr=0.05,
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn("ADVISOR_WATCH_BUY_NEAR_SESSION_HIGH", result.reason_codes)
 
@@ -185,7 +184,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             decline_from_high_atr=1.35,
             distance_to_low_atr=0.05,
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn("ADVISOR_WATCH_SELL_NEAR_SESSION_LOW", result.reason_codes)
 
@@ -199,7 +198,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             low_path_efficiency=0.70,
             low_path_ratio=0.80,
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn(
             "ADVISOR_WATCH_SELL_AGAINST_CLIMB_FROM_SESSION_LOW",
@@ -216,7 +215,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             high_path_efficiency=0.70,
             high_path_ratio=0.80,
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn(
             "ADVISOR_WATCH_BUY_AGAINST_DECLINE_FROM_SESSION_HIGH",
@@ -242,7 +241,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             high_path_efficiency=0.70,
             high_path_ratio=0.80,
         )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
         self.assertEqual(AdvisorAction.ALLOW, result.action)
         self.assertIn(
             "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE",
@@ -251,15 +250,18 @@ class AuctionStockAdvisorTests(unittest.TestCase):
 
     def test_advisor_applies_only_to_new_signal_deployment(self) -> None:
         snapshot = self._snapshot()
-        advisor = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        advisor = StockAdvisor(self._policy()).evaluate(snapshot)
 
         action, reasons = _advisor_adjusted_auction_action(
             snapshot=snapshot,
             existing_signal=None,
             advisor=advisor,
         )
-        self.assertEqual("LOCAL_WATCH", action)
-        self.assertIn("SIGNAL_DEPLOYMENT_WATCHED_BY_STOCK_ADVISOR", reasons)
+        self.assertEqual("LOCAL_CONFIRMED", action)
+        self.assertIn(
+            "SIGNAL_DEPLOYMENT_ALLOWED_WITH_STOCK_ADVISOR_WATCH",
+            reasons,
+        )
 
         existing = SimpleNamespace(signal_id="SIG-1")
         action, reasons = _advisor_adjusted_auction_action(
@@ -270,6 +272,49 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.assertEqual("LOCAL_CONFIRMED", action)
         self.assertEqual((), reasons)
 
+
+    def test_rule_action_can_be_demoted_from_block_to_watch(self) -> None:
+        snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
+            side="SELL",
+            entry=97.0,
+            accepted_inside=False,
+            exhaustion_active=True,
+            exhausted_side="DOWN",
+            exhaustion_expires_at=self.ts + timedelta(minutes=3),
+        )
+        policy = self._policy(same_direction_exhaustion_action="WATCH")
+        advisor = StockAdvisor(policy).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.WATCH, advisor.action)
+        self.assertIn("ADVISOR_WATCH_EXHAUSTED_DIRECTION", advisor.reason_codes)
+
+        action, reasons = _advisor_adjusted_auction_action(
+            snapshot=snapshot,
+            existing_signal=None,
+            advisor=advisor,
+        )
+        self.assertEqual("LOCAL_CONFIRMED", action)
+        self.assertIn(
+            "SIGNAL_DEPLOYMENT_ALLOWED_WITH_STOCK_ADVISOR_WATCH",
+            reasons,
+        )
+
+    def test_rule_action_can_be_promoted_from_watch_to_block(self) -> None:
+        snapshot = self._snapshot()
+        policy = self._policy(inside_accepted_range_action="BLOCK")
+        advisor = StockAdvisor(policy).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.BLOCK, advisor.action)
+        self.assertIn("ADVISOR_BLOCK_INSIDE_ACCEPTED_RANGE", advisor.reason_codes)
+
+        action, reasons = _advisor_adjusted_auction_action(
+            snapshot=snapshot,
+            existing_signal=None,
+            advisor=advisor,
+        )
+        self.assertEqual("LOCAL_BLOCKED", action)
+        self.assertIn("SIGNAL_DEPLOYMENT_BLOCKED_BY_STOCK_ADVISOR", reasons)
+
     def test_snapshot_contract_rejects_removed_advisor_field(self) -> None:
         payload = {
             "status": "NOT_RUN",
@@ -278,9 +323,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             "state": None,
             "stock_context": None,
             "advisor": {
-                "mode": "SHADOW",
                 "action": "BLOCK",
-                "effective_action": "ALLOW",
                 "selected_candidate_id": "CANDIDATE:SELL",
                 "reason_codes": ["TEST"],
                 "diagnostics": {},
@@ -302,10 +345,9 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             "services.signals.stock_advisor",
             level="ERROR",
         ) as captured:
-            result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+            result = StockAdvisor(self._policy()).evaluate(snapshot)
 
         self.assertEqual(AdvisorAction.ALLOW, result.action)
-        self.assertEqual(AdvisorAction.ALLOW, result.effective_action)
         self.assertEqual("CANDIDATE:SELL", result.selected_candidate_id)
         self.assertIn("ADVISOR_INPUT_ERROR_FAIL_OPEN", result.reason_codes)
         self.assertTrue(result.diagnostics["fail_open"])

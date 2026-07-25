@@ -474,7 +474,7 @@ class SignalAssembler:
                 evaluation_stage="SIGNAL_GENERATOR_ADVISOR",
                 previous_state=None,
                 new_state=advisor.action.value,
-                action=advisor.effective_action.value,
+                action=advisor.action.value,
                 reason_code=reason_code,
                 reason_text=" | ".join(advisor.reason_codes),
                 confidence=None,
@@ -549,7 +549,6 @@ class SignalAssembler:
                     "auction_action": instruction.auction_action,
                     "auction_state": instruction.auction_state,
                     "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
-                    "advisor_mode": instruction.advisor_decision.mode,
                     "advisor": _advisor_context_json(instruction.advisor_decision),
                     "stock_context": _stock_context_json(snapshot),
                     "active_opportunity_key": (
@@ -741,21 +740,23 @@ def _advisor_adjusted_auction_action(
             f"advisor={advisor.selected_candidate_id} auction={decision.selected_candidate_id}"
         )
 
-    if advisor.effective_action is AdvisorAction.BLOCK:
+    if advisor.action is AdvisorAction.BLOCK:
         return "LOCAL_BLOCKED", (
             "SIGNAL_DEPLOYMENT_BLOCKED_BY_STOCK_ADVISOR",
             *tuple(advisor.reason_codes),
         )
-    if advisor.effective_action is AdvisorAction.WATCH:
-        return "LOCAL_WATCH", (
-            "SIGNAL_DEPLOYMENT_WATCHED_BY_STOCK_ADVISOR",
+    if advisor.action is AdvisorAction.WATCH:
+        # WATCH is an auditable deployment concern, not a soft block. The
+        # structurally confirmed opportunity may still create a new signal.
+        return structural_action, (
+            "SIGNAL_DEPLOYMENT_ALLOWED_WITH_STOCK_ADVISOR_WATCH",
             *tuple(advisor.reason_codes),
         )
-    if advisor.effective_action is AdvisorAction.ALLOW:
+    if advisor.action is AdvisorAction.ALLOW:
         return structural_action, tuple(advisor.reason_codes)
     raise ValueError(
         "LOCAL_CONFIRMED requires Advisor ALLOW/WATCH/BLOCK: "
-        f"{advisor.effective_action.value}"
+        f"{advisor.action.value}"
     )
 
 def _resolve_signal_lifecycle(
@@ -1352,7 +1353,6 @@ def _criteria_json(
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
         "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
-        "advisor_mode": instruction.advisor_decision.mode,
         "advisor": _advisor_context_json(instruction.advisor_decision),
         "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
@@ -1949,7 +1949,6 @@ def _latest_auction_evaluation(
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
         "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
-        "advisor_mode": instruction.advisor_decision.mode,
         "advisor": _advisor_context_json(instruction.advisor_decision),
         "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
@@ -2004,7 +2003,6 @@ def _posture_history_record(
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
         "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
-        "advisor_mode": instruction.advisor_decision.mode,
         "advisor": _advisor_context_json(instruction.advisor_decision),
         "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
@@ -2072,9 +2070,7 @@ def _current_eligibility(instruction: AuctionSignalInstruction) -> Optional[str]
 
 def _advisor_context_json(advisor: AdvisorDecision) -> Dict[str, Any]:
     return {
-        "mode": advisor.mode,
         "action": advisor.action.value,
-        "effective_action": advisor.effective_action.value,
         "selected_candidate_id": advisor.selected_candidate_id,
         "reason_codes": list(advisor.reason_codes),
         "diagnostics": dict(advisor.diagnostics),

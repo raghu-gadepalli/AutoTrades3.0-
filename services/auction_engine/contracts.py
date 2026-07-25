@@ -887,32 +887,19 @@ class StockContext(ContractModel):
 class AdvisorDecision(ContractModel):
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
-    mode: str = Field(min_length=1)
     action: AdvisorAction
-    effective_action: AdvisorAction
     selected_candidate_id: Optional[str] = None
     reason_codes: Tuple[str, ...] = ()
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
     config_version: str = Field(min_length=1)
-
-    @field_validator("mode", mode="before")
-    @classmethod
-    def _normalise_mode(cls, value: Any) -> str:
-        mode = str(value or "").strip().upper()
-        if mode not in {"SHADOW", "ENFORCE"}:
-            raise ValueError("AdvisorDecision.mode must be SHADOW or ENFORCE")
-        return mode
 
     @model_validator(mode="after")
     def _validate_advisor(self) -> "AdvisorDecision":
         if self.action in {AdvisorAction.ALLOW, AdvisorAction.WATCH, AdvisorAction.BLOCK}:
             if not self.selected_candidate_id:
                 raise ValueError("Advisor decision requires selected_candidate_id")
-        if self.mode == "SHADOW" and self.action in {AdvisorAction.WATCH, AdvisorAction.BLOCK}:
-            if self.effective_action is not AdvisorAction.ALLOW:
-                raise ValueError("SHADOW WATCH/BLOCK must preserve effective ALLOW")
-        if self.mode == "ENFORCE" and self.effective_action is not self.action:
-            raise ValueError("ENFORCE effective_action must equal action")
+        if self.action is AdvisorAction.NO_ACTION and self.selected_candidate_id is not None:
+            raise ValueError("Advisor NO_ACTION must not select a candidate")
         return self
 
 
