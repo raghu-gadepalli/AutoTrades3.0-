@@ -206,30 +206,40 @@ def _state_projection(state) -> AuctionStateProjection:
 
 def _stock_context_projection(context) -> StockContextProjection:
     return StockContextProjection(
-        name=context.name.value,
-        background_regime=context.background_regime.value,
         current_auction_state=context.current_auction_state.value,
         directional_bias=context.directional_bias.value,
-        balanced_non_directional=context.balanced_non_directional,
-        compression_active=context.compression_active,
-        rotational=context.rotational,
-        fresh_expansion_confirmed=context.fresh_expansion_confirmed,
-        directional_efficiency=context.directional_efficiency,
-        overlap_ratio=context.overlap_ratio,
-        ema_context=context.ema_context,
-        ema_spread_atr=context.ema_spread_atr,
-        ema_spread_change_atr_per_bar=context.ema_spread_change_atr_per_bar,
-        hma_context=context.hma_context,
-        hma_spread_atr=context.hma_spread_atr,
-        atr_state=context.atr_state,
-        atr_contraction_ratio=context.atr_contraction_ratio,
-        background_range_id=context.background_range_id,
-        background_range_low=context.background_range_low,
-        background_range_high=context.background_range_high,
-        background_range_position=context.background_range_position,
-        background_range_outside_atr=context.background_range_outside_atr,
-        background_range_classification=context.background_range_classification,
-        background_structure_flip_count=context.background_structure_flip_count,
+        accepted_range_id=context.accepted_range_id,
+        accepted_range_source=context.accepted_range_source,
+        accepted_range_low=context.accepted_range_low,
+        accepted_range_high=context.accepted_range_high,
+        accepted_range_established_at=context.accepted_range_established_at,
+        accepted_range_provisional=context.accepted_range_provisional,
+        accepted_range_breakout_eligible=context.accepted_range_breakout_eligible,
+        accepted_range_inside=context.accepted_range_inside,
+        accepted_range_position=context.accepted_range_position,
+        accepted_range_outside_atr=context.accepted_range_outside_atr,
+        session_open_price=context.session_open_price,
+        session_high_price=context.session_high_price,
+        session_high_time=context.session_high_time,
+        session_low_price=context.session_low_price,
+        session_low_time=context.session_low_time,
+        session_position=context.session_position,
+        distance_to_session_high_atr=context.distance_to_session_high_atr,
+        distance_to_session_low_atr=context.distance_to_session_low_atr,
+        rise_from_session_low_atr=context.rise_from_session_low_atr,
+        rise_from_session_low_pct=context.rise_from_session_low_pct,
+        decline_from_session_high_atr=context.decline_from_session_high_atr,
+        decline_from_session_high_pct=context.decline_from_session_high_pct,
+        path_from_session_low_bars=context.path_from_session_low_bars,
+        path_from_session_low_efficiency=context.path_from_session_low_efficiency,
+        path_from_session_low_directional_ratio=(
+            context.path_from_session_low_directional_ratio
+        ),
+        path_from_session_high_bars=context.path_from_session_high_bars,
+        path_from_session_high_efficiency=context.path_from_session_high_efficiency,
+        path_from_session_high_directional_ratio=(
+            context.path_from_session_high_directional_ratio
+        ),
         exhaustion_active=context.exhaustion_active,
         exhausted_side=context.exhausted_side.value,
         exhaustion_started_at=context.exhaustion_started_at,
@@ -407,18 +417,20 @@ def _build_changes(
             type="STOCK_CONTEXT_INITIALIZED",
             entity_key="STOCK_CONTEXT",
             from_=None,
-            to=stock_context.name,
+            to=stock_context.current_auction_state,
         ))
     elif (
-        previous_context.name != stock_context.name
+        previous_context.current_auction_state != stock_context.current_auction_state
+        or previous_context.accepted_range_id != stock_context.accepted_range_id
+        or previous_context.accepted_range_inside != stock_context.accepted_range_inside
         or previous_context.exhaustion_active != stock_context.exhaustion_active
         or previous_context.exhausted_side != stock_context.exhausted_side
     ):
         changes.append(AuctionChange(
             type="STOCK_CONTEXT_CHANGED",
             entity_key="STOCK_CONTEXT",
-            from_=previous_context.name,
-            to=stock_context.name,
+            from_=previous_context.current_auction_state,
+            to=stock_context.current_auction_state,
         ))
 
 

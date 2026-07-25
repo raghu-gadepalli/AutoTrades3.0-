@@ -1,14 +1,13 @@
 """Signal-time deployment Advisor.
 
-Auction/snapshot generation owns objective structure and stock context. This
-helper evaluates the selected Auction candidate only when SignalGenerator reads
-the stored snapshot, allowing rule changes and SHADOW/ENFORCE comparisons on the
-same market history.
+Auction and setup lifecycles decide which opportunity exists.  This helper only
+applies conservative new-signal deployment checks using objective stock-day
+context carried by the stored snapshot.
 """
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from configs.stock_advisor_config import (
     STOCK_ADVISOR_CONFIG,
@@ -27,8 +26,6 @@ class _AdvisorInputError(Exception):
 class StockAdvisor:
     """Return ALLOW/WATCH/BLOCK for the snapshot's selected candidate."""
 
-    _BALANCED_CONTEXTS = {"BALANCED", "COMPRESSION", "ROTATIONAL"}
-
     def __init__(
         self,
         config: StockAdvisorPolicyConfig = STOCK_ADVISOR_CONFIG,
@@ -36,13 +33,7 @@ class StockAdvisor:
         self.policy = config
 
     def evaluate(self, snapshot: SnapshotSchema) -> AdvisorDecision:
-        """Evaluate deployment context without allowing Advisor defects to stop a record.
-
-        Advisor is an optional deployment filter layered on top of a valid Auction
-        decision.  Missing or inconsistent Advisor inputs are therefore logged and
-        fail open to the underlying Auction decision.  The snapshot remains
-        processable and the error is visible in logs/audit diagnostics.
-        """
+        """Evaluate deployment context without stopping snapshot processing."""
         try:
             return self._evaluate_strict(snapshot)
         except _AdvisorInputError as exc:
@@ -99,57 +90,64 @@ class StockAdvisor:
                 config_version=self.policy.config_version,
             )
 
-        reasons: List[str] = []
+        atr = float(snapshot.indicators.atr.value)
+        if atr <= 0:
+            raise _AdvisorInputError("snapshot.indicators.atr.value must be positive")
+
+        family = selected.family.strip().upper()
+        subtype = selected.subtype.strip().upper()
         diagnostics: Dict[str, object] = {
             "auction_action": decision.action,
             "manager_action": decision.manager_action,
             "manager_reason_codes": list(decision.manager_reason_codes),
-            "stock_context": context.name,
-            "background_regime": context.background_regime,
             "current_auction_state": context.current_auction_state,
-            "stock_context_reasons": list(context.reason_codes),
-            "candidate_family": selected.family,
-            "candidate_subtype": selected.subtype,
+            "candidate_family": family,
+            "candidate_subtype": subtype,
             "candidate_side": selected.side,
             "deployment_scope": "NEW_SIGNAL_ONLY",
             "time_of_day_gate_applied": False,
+            "accepted_range_id": context.accepted_range_id,
+            "accepted_range_source": context.accepted_range_source,
+            "accepted_range_low": context.accepted_range_low,
+            "accepted_range_high": context.accepted_range_high,
+            "accepted_range_provisional": context.accepted_range_provisional,
+            "accepted_range_breakout_eligible": (
+                context.accepted_range_breakout_eligible
+            ),
+            "accepted_range_inside": context.accepted_range_inside,
+            "accepted_range_position": context.accepted_range_position,
+            "accepted_range_outside_atr": context.accepted_range_outside_atr,
+            "session_high_price": context.session_high_price,
+            "session_high_time": context.session_high_time.isoformat(),
+            "session_low_price": context.session_low_price,
+            "session_low_time": context.session_low_time.isoformat(),
+            "session_position": context.session_position,
+            "distance_to_session_high_atr": context.distance_to_session_high_atr,
+            "distance_to_session_low_atr": context.distance_to_session_low_atr,
+            "rise_from_session_low_atr": context.rise_from_session_low_atr,
+            "decline_from_session_high_atr": context.decline_from_session_high_atr,
+            "path_from_session_low_bars": context.path_from_session_low_bars,
+            "path_from_session_low_efficiency": (
+                context.path_from_session_low_efficiency
+            ),
+            "path_from_session_low_directional_ratio": (
+                context.path_from_session_low_directional_ratio
+            ),
+            "path_from_session_high_bars": context.path_from_session_high_bars,
+            "path_from_session_high_efficiency": (
+                context.path_from_session_high_efficiency
+            ),
+            "path_from_session_high_directional_ratio": (
+                context.path_from_session_high_directional_ratio
+            ),
         }
 
-        atr = float(snapshot.indicators.atr.value)
-        source_entry_percentile = self._entry_percentile(selected)
-        source_signed_outside_atr = self._signed_outside_atr(selected, atr)
-        diagnostics["entry_percentile_in_source_range"] = source_entry_percentile
-        diagnostics["signed_outside_source_range_atr"] = source_signed_outside_atr
-
-        background_entry_percentile = self._background_entry_percentile(
-            selected,
-            context,
-        )
-        background_signed_outside_atr = self._background_signed_outside_atr(
-            selected,
-            context,
-            atr,
-        )
-        diagnostics["entry_percentile_in_background_range"] = (
-            background_entry_percentile
-        )
-        diagnostics["signed_outside_background_range_atr"] = (
-            background_signed_outside_atr
-        )
-        diagnostics["background_range_id"] = context.background_range_id
-        diagnostics["background_range_low"] = context.background_range_low
-        diagnostics["background_range_high"] = context.background_range_high
-        diagnostics["background_range_classification"] = (
-            context.background_range_classification
-        )
-        diagnostics["background_structure_flip_count"] = (
-            context.background_structure_flip_count
-        )
+        strong_confirmation = self._strong_confirmation(selected, context, atr)
+        diagnostics["strong_confirmation"] = strong_confirmation
 
         exhaustion_current = self._exhaustion_is_current(snapshot, context)
-        exhaustion_family_applicable = (
-            selected.family.strip().upper()
-            in {name.strip().upper() for name in self.policy.exhaustion_block_families}
+        exhaustion_family_applicable = family in self._normalised_set(
+            self.policy.exhaustion_block_families
         )
         same_direction_exhaustion = bool(
             exhaustion_current
@@ -160,134 +158,79 @@ class StockAdvisor:
         diagnostics["exhaustion_family_applicable"] = exhaustion_family_applicable
         diagnostics["same_direction_exhaustion"] = same_direction_exhaustion
 
-        fresh_escape = self._confirmed_fresh_escape(
+        inside_range_exempt = self._is_exempt(
+            family,
+            subtype,
+            self.policy.inside_range_exempt_families,
+            self.policy.inside_range_exempt_subtypes,
+        )
+        candidate_inside_accepted_range = self._candidate_inside_accepted_range(
             selected,
             context,
-            background_signed_outside_atr,
+            atr,
         )
-        diagnostics["fresh_escape_confirmed"] = fresh_escape
-
-        confirmed_reversal_outside_range = bool(
-            selected.family.strip().upper() == "REVERSAL"
-            and context.current_auction_state.strip().upper() == "REVERSAL"
-            and background_signed_outside_atr is not None
-            and background_signed_outside_atr >= self.policy.fresh_escape_min_atr
+        diagnostics["candidate_inside_accepted_range"] = candidate_inside_accepted_range
+        inside_range_defer = bool(
+            self.policy.defer_inside_accepted_range
+            and candidate_inside_accepted_range
+            and not inside_range_exempt
+            and not strong_confirmation
         )
-        diagnostics["confirmed_reversal_outside_background_range"] = (
-            confirmed_reversal_outside_range
+        diagnostics["inside_range_exempt"] = inside_range_exempt
+        diagnostics["inside_range_defer"] = inside_range_defer
+
+        extreme_chase = bool(
+            self.policy.defer_extreme_chase
+            and self._is_extreme_chase(selected, context, atr)
+            and not strong_confirmation
         )
+        diagnostics["extreme_chase"] = extreme_chase
 
-        range_edge = self._unfavourable_range_edge(
-            selected,
-            background_entry_percentile,
+        session_path_exempt = self._is_exempt(
+            family,
+            subtype,
+            self.policy.session_path_exempt_families,
+            self.policy.session_path_exempt_subtypes,
         )
-        diagnostics["unfavourable_range_edge"] = range_edge
-
-        manager_diagnostics = decision.manager_diagnostics
-        if "recent_eligible_side_switches" in manager_diagnostics:
-            switch_value = manager_diagnostics["recent_eligible_side_switches"]
-        elif "historical_side_switches_in_lookback" in manager_diagnostics:
-            switch_value = manager_diagnostics["historical_side_switches_in_lookback"]
-        else:
-            switch_value = 0
-        projected_switches = int(switch_value or 0)
-        diagnostics["recent_eligible_side_switches"] = projected_switches
-
-        action = AdvisorAction.ALLOW
-        background_regime = context.background_regime.strip().upper()
-        inside_or_not_confirmed_outside = bool(
-            background_signed_outside_atr is None
-            or background_signed_outside_atr < self.policy.fresh_escape_min_atr
+        against_session_path = bool(
+            self.policy.defer_against_session_path
+            and not session_path_exempt
+            and not strong_confirmation
+            and self._against_persistent_session_path(selected, context)
         )
+        diagnostics["session_path_exempt"] = session_path_exempt
+        diagnostics["against_persistent_session_path"] = against_session_path
 
+        reasons: List[str] = []
         if self.policy.block_exhausted_direction and same_direction_exhaustion:
             action = AdvisorAction.BLOCK
             reasons.append("ADVISOR_BLOCK_EXHAUSTED_DIRECTION")
-
-        elif (
-            confirmed_reversal_outside_range
-            and not same_direction_exhaustion
-        ):
+        else:
             action = AdvisorAction.ALLOW
-            reasons.append("ADVISOR_ALLOW_CONFIRMED_REVERSAL_OUTSIDE_BACKGROUND_RANGE")
-
-        elif (
-            background_regime == "ROTATIONAL"
-            and self.policy.block_rotational_inside_range
-            and inside_or_not_confirmed_outside
-            and not fresh_escape
-        ):
-            action = AdvisorAction.BLOCK
-            reasons.append("ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE")
-            if range_edge:
+            if inside_range_defer:
+                action = AdvisorAction.WATCH
+                reasons.append("ADVISOR_WATCH_INSIDE_ACCEPTED_RANGE")
+            if extreme_chase:
+                action = AdvisorAction.WATCH
                 reasons.append(
-                    "ADVISOR_BLOCK_BUY_NEAR_RANGE_HIGH"
+                    "ADVISOR_WATCH_BUY_NEAR_SESSION_HIGH"
                     if selected.side == "BUY"
-                    else "ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW"
+                    else "ADVISOR_WATCH_SELL_NEAR_SESSION_LOW"
                 )
-
-        elif (
-            self.policy.block_rotational_range_edge
-            and background_regime in self._BALANCED_CONTEXTS
-            and range_edge
-            and inside_or_not_confirmed_outside
-            and not fresh_escape
-        ):
-            action = AdvisorAction.BLOCK
-            reasons.extend((
-                "ADVISOR_BLOCK_BACKGROUND_RANGE_EDGE",
-                "ADVISOR_BLOCK_BUY_NEAR_RANGE_HIGH"
-                if selected.side == "BUY"
-                else "ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW",
-            ))
-
-        elif (
-            background_regime == "ROTATIONAL"
-            and projected_switches >= self.policy.rotational_side_switches_to_block
-            and not fresh_escape
-        ):
-            action = AdvisorAction.BLOCK
-            reasons.append("ADVISOR_BLOCK_RECENT_SIDE_ROTATION")
-
-        elif (
-            background_regime in self._BALANCED_CONTEXTS
-            and self.policy.watch_unconfirmed_fresh_escape
-            and background_signed_outside_atr is not None
-            and background_signed_outside_atr >= 0.0
-            and not fresh_escape
-        ):
-            action = AdvisorAction.WATCH
-            reasons.append("ADVISOR_WATCH_BACKGROUND_RANGE_ESCAPE_NOT_CONFIRMED")
-
-        elif (
-            background_regime in {"BALANCED", "COMPRESSION"}
-            and selected.family.strip().upper() == "REVERSAL"
-            and self.policy.watch_reversal_inside_balanced_range
-            and inside_or_not_confirmed_outside
-            and not fresh_escape
-        ):
-            action = AdvisorAction.WATCH
-            reasons.append("ADVISOR_WATCH_REVERSAL_INSIDE_BACKGROUND_RANGE")
-
-        elif (
-            self.policy.block_balanced_non_directional
-            and background_regime in self._BALANCED_CONTEXTS
-            and not fresh_escape
-        ):
-            action = AdvisorAction.BLOCK
-            reasons.append("ADVISOR_BLOCK_BALANCED_NON_DIRECTIONAL")
-            if range_edge:
+            if against_session_path:
+                action = AdvisorAction.WATCH
                 reasons.append(
-                    "ADVISOR_BLOCK_BUY_NEAR_RANGE_HIGH"
-                    if selected.side == "BUY"
-                    else "ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW"
+                    "ADVISOR_WATCH_SELL_AGAINST_CLIMB_FROM_SESSION_LOW"
+                    if selected.side == "SELL"
+                    else "ADVISOR_WATCH_BUY_AGAINST_DECLINE_FROM_SESSION_HIGH"
                 )
 
         if action is AdvisorAction.ALLOW:
-            if not reasons:
-                reasons.append("ADVISOR_ALLOW_DEPLOYMENT_CONTEXT")
-            if fresh_escape:
-                reasons.append("ADVISOR_ALLOW_CONFIRMED_PRICE_LED_EXPANSION")
+            reasons.append(
+                "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE"
+                if strong_confirmation
+                else "ADVISOR_ALLOW_SIMPLE_DEPLOYMENT_CONTEXT"
+            )
 
         effective = action
         if self.policy.mode == "SHADOW" and action in {
@@ -398,37 +341,121 @@ class StockAdvisor:
             config_version=self.policy.config_version,
         )
 
-    def _confirmed_fresh_escape(
+    def _candidate_inside_accepted_range(
         self,
         candidate: CandidateProjection,
         context: StockContextProjection,
-        signed_outside_atr: Optional[float],
+        atr: float,
     ) -> bool:
-        if not self.policy.allow_confirmed_fresh_expansion_override:
+        if (
+            context.accepted_range_low is None
+            or context.accepted_range_high is None
+        ):
             return False
-        if signed_outside_atr is None or signed_outside_atr < self.policy.fresh_escape_min_atr:
-            return False
-        efficiency = context.directional_efficiency
-        if efficiency is None or efficiency < self.policy.fresh_escape_efficiency_min:
-            return False
-        if context.fresh_expansion_confirmed:
-            return True
-        aligned_states = {
-            "BUY": {"FRESH_EXPANSION", "ORDERLY_UPTREND", "REACCELERATION"},
-            "SELL": {"FRESH_EXPANSION", "ORDERLY_DOWNTREND", "REACCELERATION"},
-        }
-        return candidate.auction_state in aligned_states[candidate.side]
+        tolerance = atr * self.policy.accepted_range_tolerance_atr
+        entry = float(candidate.entry_price)
+        return bool(
+            float(context.accepted_range_low) - tolerance
+            <= entry
+            <= float(context.accepted_range_high) + tolerance
+        )
 
-    def _unfavourable_range_edge(
+    def _strong_confirmation(
         self,
         candidate: CandidateProjection,
-        percentile: Optional[float],
+        context: StockContextProjection,
+        atr: float,
     ) -> bool:
-        if percentile is None:
+        if candidate.family.strip().upper() not in self._normalised_set(
+            self.policy.strong_confirmation_families
+        ):
             return False
+        if context.accepted_range_provisional:
+            return False
+        if not context.accepted_range_breakout_eligible:
+            return False
+        signed_outside = self._signed_outside_accepted_range_atr(
+            candidate,
+            context,
+            atr,
+        )
+        if (
+            signed_outside is None
+            or signed_outside < self.policy.strong_confirmation_min_outside_atr
+        ):
+            return False
+        state = context.current_auction_state.strip().upper()
+        aligned = (
+            self.policy.strong_confirmation_states_buy
+            if candidate.side == "BUY"
+            else self.policy.strong_confirmation_states_sell
+        )
+        return state in self._normalised_set(aligned)
+
+    def _is_extreme_chase(
+        self,
+        candidate: CandidateProjection,
+        context: StockContextProjection,
+        atr: float,
+    ) -> bool:
+        entry = float(candidate.entry_price)
         if candidate.side == "BUY":
-            return percentile >= self.policy.buy_range_edge_percentile
-        return percentile <= self.policy.sell_range_edge_percentile
+            distance = max(0.0, float(context.session_high_price) - entry) / atr
+            return bool(
+                distance <= self.policy.extreme_near_atr
+                and context.rise_from_session_low_atr
+                >= self.policy.extreme_min_prior_move_atr
+            )
+        if candidate.side == "SELL":
+            distance = max(0.0, entry - float(context.session_low_price)) / atr
+            return bool(
+                distance <= self.policy.extreme_near_atr
+                and context.decline_from_session_high_atr
+                >= self.policy.extreme_min_prior_move_atr
+            )
+        raise _AdvisorInputError(
+            f"Unsupported Advisor candidate side: {candidate.side}"
+        )
+
+    def _against_persistent_session_path(
+        self,
+        candidate: CandidateProjection,
+        context: StockContextProjection,
+    ) -> bool:
+        if candidate.side == "SELL":
+            return self._path_is_persistent(
+                bars=context.path_from_session_low_bars,
+                move_atr=context.rise_from_session_low_atr,
+                efficiency=context.path_from_session_low_efficiency,
+                directional_ratio=context.path_from_session_low_directional_ratio,
+            )
+        if candidate.side == "BUY":
+            return self._path_is_persistent(
+                bars=context.path_from_session_high_bars,
+                move_atr=context.decline_from_session_high_atr,
+                efficiency=context.path_from_session_high_efficiency,
+                directional_ratio=context.path_from_session_high_directional_ratio,
+            )
+        raise _AdvisorInputError(
+            f"Unsupported Advisor candidate side: {candidate.side}"
+        )
+
+    def _path_is_persistent(
+        self,
+        *,
+        bars: int,
+        move_atr: float,
+        efficiency: Optional[float],
+        directional_ratio: Optional[float],
+    ) -> bool:
+        return bool(
+            bars >= self.policy.session_path_min_bars
+            and move_atr >= self.policy.session_path_min_move_atr
+            and efficiency is not None
+            and efficiency >= self.policy.session_path_efficiency_min
+            and directional_ratio is not None
+            and directional_ratio >= self.policy.session_path_directional_ratio_min
+        )
 
     @staticmethod
     def _exhaustion_is_current(
@@ -443,24 +470,7 @@ class StockAdvisor:
         return snapshot.snapshot_time <= expires_at
 
     @staticmethod
-    def _background_entry_percentile(
-        candidate: CandidateProjection,
-        context: StockContextProjection,
-    ) -> Optional[float]:
-        if (
-            context.background_range_low is None
-            or context.background_range_high is None
-        ):
-            return None
-        low = float(context.background_range_low)
-        high = float(context.background_range_high)
-        width = high - low
-        if width <= 0:
-            return None
-        return (float(candidate.entry_price) - low) / width
-
-    @staticmethod
-    def _background_signed_outside_atr(
+    def _signed_outside_accepted_range_atr(
         candidate: CandidateProjection,
         context: StockContextProjection,
         atr: float,
@@ -468,50 +478,37 @@ class StockAdvisor:
         if atr <= 0:
             return None
         if (
-            context.background_range_low is None
-            or context.background_range_high is None
+            context.accepted_range_low is None
+            or context.accepted_range_high is None
         ):
             return None
         if candidate.side == "BUY":
             return (
-                float(candidate.entry_price) - float(context.background_range_high)
+                float(candidate.entry_price) - float(context.accepted_range_high)
             ) / atr
         if candidate.side == "SELL":
             return (
-                float(context.background_range_low) - float(candidate.entry_price)
+                float(context.accepted_range_low) - float(candidate.entry_price)
             ) / atr
         raise _AdvisorInputError(
             f"Unsupported Advisor candidate side: {candidate.side}"
         )
 
     @staticmethod
-    def _entry_percentile(candidate: CandidateProjection) -> Optional[float]:
-        if (
-            candidate.source_frozen_range_low is None
-            or candidate.source_frozen_range_high is None
-        ):
-            return None
-        low = float(candidate.source_frozen_range_low)
-        high = float(candidate.source_frozen_range_high)
-        width = high - low
-        if width <= 0:
-            return None
-        return (float(candidate.entry_price) - low) / width
+    def _is_exempt(
+        family: str,
+        subtype: str,
+        families: tuple[str, ...],
+        subtypes: tuple[str, ...],
+    ) -> bool:
+        return bool(
+            family in StockAdvisor._normalised_set(families)
+            or subtype in StockAdvisor._normalised_set(subtypes)
+        )
 
     @staticmethod
-    def _signed_outside_atr(
-        candidate: CandidateProjection,
-        atr: float,
-    ) -> Optional[float]:
-        if atr <= 0:
-            return None
-        if candidate.side == "BUY":
-            if candidate.source_frozen_range_high is None:
-                return None
-            return (float(candidate.entry_price) - float(candidate.source_frozen_range_high)) / atr
-        if candidate.source_frozen_range_low is None:
-            return None
-        return (float(candidate.source_frozen_range_low) - float(candidate.entry_price)) / atr
+    def _normalised_set(values: tuple[str, ...]) -> Set[str]:
+        return {str(value).strip().upper() for value in values}
 
     @staticmethod
     def _direction_for_side(side: str) -> str:

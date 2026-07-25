@@ -95,30 +95,6 @@ class AuctionStateName(StringEnum):
     CHAOTIC_ROTATION = "CHAOTIC_ROTATION"
 
 
-class StockContextName(StringEnum):
-    UNKNOWN = "UNKNOWN"
-    BALANCED = "BALANCED"
-    COMPRESSION = "COMPRESSION"
-    ROTATIONAL = "ROTATIONAL"
-    EARLY_EXPANSION = "EARLY_EXPANSION"
-    DIRECTIONAL = "DIRECTIONAL"
-    MATURE_EXTENSION = "MATURE_EXTENSION"
-    TREND_FAILURE = "TREND_FAILURE"
-    REVERSAL = "REVERSAL"
-
-
-class BackgroundRegimeName(StringEnum):
-    """Slow stock environment, independent of the current local Auction event."""
-
-    UNKNOWN = "UNKNOWN"
-    BALANCED = "BALANCED"
-    COMPRESSION = "COMPRESSION"
-    ROTATIONAL = "ROTATIONAL"
-    EARLY_EXPANSION = "EARLY_EXPANSION"
-    DIRECTIONAL = "DIRECTIONAL"
-    MATURE_EXTENSION = "MATURE_EXTENSION"
-
-
 class AdvisorAction(StringEnum):
     NO_ACTION = "NO_ACTION"
     ALLOW = "ALLOW"
@@ -829,32 +805,48 @@ class SetupCandidate(ContractModel):
 
 
 class StockContext(ContractModel):
+    """Objective stock-day context used by the signal-time Advisor.
+
+    This projection deliberately avoids regime labels.  It records only the
+    current Auction state, accepted-range geometry, complete day-so-far extreme
+    path metrics and the existing exhaustion episode.
+    """
+
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
-    name: StockContextName
-    background_regime: BackgroundRegimeName = BackgroundRegimeName.UNKNOWN
     current_auction_state: AuctionStateName = AuctionStateName.UNKNOWN
     directional_bias: DirectionalBias = DirectionalBias.UNKNOWN
-    balanced_non_directional: bool = False
-    compression_active: bool = False
-    rotational: bool = False
-    fresh_expansion_confirmed: bool = False
-    directional_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    overlap_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    ema_context: str = "UNKNOWN"
-    ema_spread_atr: Optional[float] = Field(default=None, ge=0.0)
-    ema_spread_change_atr_per_bar: Optional[float] = None
-    hma_context: str = "UNKNOWN"
-    hma_spread_atr: Optional[float] = Field(default=None, ge=0.0)
-    atr_state: str = "UNKNOWN"
-    atr_contraction_ratio: Optional[float] = Field(default=None, ge=0.0)
-    background_range_id: Optional[str] = None
-    background_range_low: Optional[float] = None
-    background_range_high: Optional[float] = None
-    background_range_position: Optional[float] = None
-    background_range_outside_atr: Optional[float] = None
-    background_range_classification: str = "UNKNOWN"
-    background_structure_flip_count: int = Field(default=0, ge=0)
+
+    accepted_range_id: Optional[str] = None
+    accepted_range_source: str = "UNKNOWN"
+    accepted_range_low: Optional[float] = None
+    accepted_range_high: Optional[float] = None
+    accepted_range_established_at: Optional[datetime] = None
+    accepted_range_provisional: bool = False
+    accepted_range_breakout_eligible: bool = False
+    accepted_range_inside: bool = False
+    accepted_range_position: Optional[float] = None
+    accepted_range_outside_atr: Optional[float] = None
+
+    session_open_price: float = Field(gt=0.0)
+    session_high_price: float = Field(gt=0.0)
+    session_high_time: datetime
+    session_low_price: float = Field(gt=0.0)
+    session_low_time: datetime
+    session_position: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    distance_to_session_high_atr: float = Field(ge=0.0)
+    distance_to_session_low_atr: float = Field(ge=0.0)
+    rise_from_session_low_atr: float = Field(ge=0.0)
+    rise_from_session_low_pct: float = Field(ge=0.0)
+    decline_from_session_high_atr: float = Field(ge=0.0)
+    decline_from_session_high_pct: float = Field(ge=0.0)
+    path_from_session_low_bars: int = Field(ge=0)
+    path_from_session_low_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    path_from_session_low_directional_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    path_from_session_high_bars: int = Field(ge=0)
+    path_from_session_high_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    path_from_session_high_directional_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     exhaustion_active: bool = False
     exhausted_side: DirectionalBias = DirectionalBias.UNKNOWN
     exhaustion_started_at: Optional[datetime] = None
@@ -865,14 +857,20 @@ class StockContext(ContractModel):
 
     @model_validator(mode="after")
     def _validate_stock_context(self) -> "StockContext":
-        if (self.background_range_low is None) != (self.background_range_high is None):
-            raise ValueError("Background range low/high must be provided together")
+        if (self.accepted_range_low is None) != (self.accepted_range_high is None):
+            raise ValueError("Accepted range low/high must be provided together")
         if (
-            self.background_range_low is not None
-            and self.background_range_high is not None
-            and self.background_range_high <= self.background_range_low
+            self.accepted_range_low is not None
+            and self.accepted_range_high is not None
+            and self.accepted_range_high <= self.accepted_range_low
         ):
-            raise ValueError("Background range high must exceed background range low")
+            raise ValueError("Accepted range high must exceed accepted range low")
+        if self.accepted_range_inside and self.accepted_range_low is None:
+            raise ValueError("accepted_range_inside requires accepted range geometry")
+        if self.session_high_price < self.session_low_price:
+            raise ValueError("Session high cannot be below session low")
+        if not (self.session_low_price <= self.session_open_price <= self.session_high_price):
+            raise ValueError("Session open must lie within the day-so-far range")
         if self.exhaustion_active:
             if self.exhausted_side not in (DirectionalBias.UP, DirectionalBias.DOWN):
                 raise ValueError("Active exhaustion context requires UP or DOWN exhausted_side")
@@ -1117,7 +1115,7 @@ def _normalise_key_part(value: Any) -> str:
 
 __all__ = [
     "TradeSide", "BoundarySide", "DirectionalBias", "QualityStatus",
-    "EvidencePolarity", "AuctionStateName", "StockContextName", "BackgroundRegimeName", "AdvisorAction",
+    "EvidencePolarity", "AuctionStateName", "AdvisorAction",
     "BoundaryEpisodeStatus",
     "BoundaryResolution", "SetupFamily", "CandidateEligibility", "CandidateRole",
     "ContextAlignment", "ManagerAction", "LocalDecisionAction",

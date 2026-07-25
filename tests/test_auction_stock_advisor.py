@@ -1,4 +1,4 @@
-"""Focused tests for decoupled Auction stock context and signal-time Advisor."""
+"""Focused tests for the simplified signal-time StockAdvisor."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -13,11 +13,13 @@ from services.auction_engine.contracts import (
     AdvisorAction,
     AuctionStateName,
     BarEvidence,
+    BoundarySide,
     DirectionalBias,
     EvidenceSnapshot,
     ExtensionEvidence,
     PriceActionEvidence,
 )
+from services.auction_engine.evidence import EvidenceBuilder
 from services.auction_engine.state_engine import AuctionStateEngine, _StateMemory
 from services.signals.signal_generator import _advisor_adjusted_auction_action
 from services.signals.stock_advisor import StockAdvisor
@@ -34,26 +36,32 @@ class AuctionStockAdvisorTests(unittest.TestCase):
     def _snapshot(
         self,
         *,
-        family: str = "ACCEPTED_BREAKOUT",
-        subtype: str = "CONTINUATION_ACCEPTANCE",
+        family: str = "REVERSAL",
+        subtype: str = "NORMAL_REVERSAL",
         side: str = "SELL",
-        entry: float = 99.1,
-        low: float = 99.0,
-        high: float = 101.0,
-        state: str = "ORDERLY_DOWNTREND",
-        context_name: str = "ROTATIONAL",
-        background_regime: str = "ROTATIONAL",
-        rotational: bool = True,
-        fresh_expansion: bool = False,
+        entry: float = 105.0,
+        state: str = "REVERSAL",
+        accepted_low: float | None = 100.0,
+        accepted_high: float | None = 110.0,
+        accepted_inside: bool = True,
+        accepted_breakout_eligible: bool = True,
+        accepted_provisional: bool = False,
+        session_high: float = 112.0,
+        session_low: float = 98.0,
+        rise_from_low_atr: float = 1.0,
+        decline_from_high_atr: float = 1.0,
+        distance_to_high_atr: float = 0.7,
+        distance_to_low_atr: float = 0.7,
+        low_path_bars: int = 0,
+        low_path_efficiency: float | None = None,
+        low_path_ratio: float | None = None,
+        high_path_bars: int = 0,
+        high_path_efficiency: float | None = None,
+        high_path_ratio: float | None = None,
         exhaustion_active: bool = False,
         exhausted_side: str = "UNKNOWN",
         exhaustion_expires_at=None,
-        switches: int = 0,
-        background_low: float | None = None,
-        background_high: float | None = None,
     ) -> SimpleNamespace:
-        background_low = low if background_low is None else background_low
-        background_high = high if background_high is None else background_high
         candidate = SimpleNamespace(
             candidate_id=f"CANDIDATE:{side}",
             family=family,
@@ -61,37 +69,56 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             side=side,
             auction_state=state,
             entry_price=entry,
-            source_frozen_range_low=low,
-            source_frozen_range_high=high,
+            source_frozen_range_low=accepted_low,
+            source_frozen_range_high=accepted_high,
         )
         decision = SimpleNamespace(
             action="LOCAL_CONFIRMED",
             manager_action="SELECT",
             selected_candidate_id=candidate.candidate_id,
             manager_reason_codes=[],
-            manager_diagnostics={"recent_eligible_side_switches": switches},
+            manager_diagnostics={},
         )
         context = SimpleNamespace(
-            name=context_name,
-            background_regime=background_regime,
             current_auction_state=state,
+            directional_bias="UNKNOWN",
             reason_codes=[],
-            rotational=rotational,
-            fresh_expansion_confirmed=fresh_expansion,
-            directional_efficiency=0.70 if fresh_expansion else 0.20,
+            accepted_range_id=("RANGE:1" if accepted_low is not None else None),
+            accepted_range_source="INTRADAY_BALANCE",
+            accepted_range_low=accepted_low,
+            accepted_range_high=accepted_high,
+            accepted_range_established_at=self.ts - timedelta(minutes=30),
+            accepted_range_provisional=accepted_provisional,
+            accepted_range_breakout_eligible=accepted_breakout_eligible,
+            accepted_range_inside=accepted_inside,
+            accepted_range_position=0.5 if accepted_inside else None,
+            accepted_range_outside_atr=0.0 if accepted_inside else 0.3,
+            session_open_price=105.0,
+            session_high_price=session_high,
+            session_high_time=self.ts - timedelta(minutes=18),
+            session_low_price=session_low,
+            session_low_time=self.ts - timedelta(minutes=45),
+            session_position=0.5,
+            distance_to_session_high_atr=distance_to_high_atr,
+            distance_to_session_low_atr=distance_to_low_atr,
+            rise_from_session_low_atr=rise_from_low_atr,
+            rise_from_session_low_pct=0.01,
+            decline_from_session_high_atr=decline_from_high_atr,
+            decline_from_session_high_pct=0.01,
+            path_from_session_low_bars=low_path_bars,
+            path_from_session_low_efficiency=low_path_efficiency,
+            path_from_session_low_directional_ratio=low_path_ratio,
+            path_from_session_high_bars=high_path_bars,
+            path_from_session_high_efficiency=high_path_efficiency,
+            path_from_session_high_directional_ratio=high_path_ratio,
             exhaustion_active=exhaustion_active,
             exhausted_side=exhausted_side,
             exhaustion_expires_at=exhaustion_expires_at,
-            background_range_id="RANGE:1",
-            background_range_low=background_low,
-            background_range_high=background_high,
-            background_range_classification="BALANCE_QUALIFIED",
-            background_structure_flip_count=4,
         )
         return SimpleNamespace(
             symbol="TEST",
             snapshot_time=self.ts,
-            indicators=SimpleNamespace(atr=SimpleNamespace(value=1.0)),
+            indicators=SimpleNamespace(atr=SimpleNamespace(value=10.0)),
             auction=SimpleNamespace(
                 decision=decision,
                 stock_context=context,
@@ -101,9 +128,11 @@ class AuctionStockAdvisorTests(unittest.TestCase):
 
     def test_exhausted_direction_is_blocked_but_shadow_preserves_flow(self) -> None:
         snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
             side="SELL",
-            context_name="MATURE_EXTENSION",
-            rotational=False,
+            entry=97.0,
+            accepted_inside=False,
             exhaustion_active=True,
             exhausted_side="DOWN",
             exhaustion_expires_at=self.ts + timedelta(minutes=3),
@@ -113,114 +142,115 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.assertEqual(AdvisorAction.ALLOW, result.effective_action)
         self.assertIn("ADVISOR_BLOCK_EXHAUSTED_DIRECTION", result.reason_codes)
 
-    def test_exhausted_direction_is_enforced(self) -> None:
+    def test_normal_reversal_inside_accepted_range_is_deferred(self) -> None:
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(self._snapshot())
+        self.assertEqual(AdvisorAction.WATCH, result.action)
+        self.assertIn("ADVISOR_WATCH_INSIDE_ACCEPTED_RANGE", result.reason_codes)
+
+    def test_failed_breakout_inside_range_uses_own_setup_logic(self) -> None:
         snapshot = self._snapshot(
-            side="SELL",
-            context_name="MATURE_EXTENSION",
-            rotational=False,
-            exhaustion_active=True,
-            exhausted_side="DOWN",
-            exhaustion_expires_at=self.ts + timedelta(minutes=3),
+            family="FAILED_BREAKOUT",
+            subtype="NEUTRAL_RANGE_FAILED_AUCTION",
         )
         result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.BLOCK, result.action)
-        self.assertEqual(AdvisorAction.BLOCK, result.effective_action)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertTrue(result.diagnostics["inside_range_exempt"])
 
-    def test_rotational_sell_near_range_low_is_blocked(self) -> None:
-        snapshot = self._snapshot(side="SELL", entry=99.1, switches=1)
+    def test_exhaustion_reversal_inside_range_is_not_reinterpreted(self) -> None:
+        snapshot = self._snapshot(
+            family="REVERSAL",
+            subtype="EXHAUSTION_REVERSAL",
+        )
         result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.BLOCK, result.action)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertTrue(result.diagnostics["inside_range_exempt"])
+
+    def test_buy_near_session_high_after_material_rise_is_deferred(self) -> None:
+        snapshot = self._snapshot(
+            side="BUY",
+            entry=111.5,
+            accepted_inside=False,
+            rise_from_low_atr=1.35,
+            distance_to_high_atr=0.05,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.WATCH, result.action)
+        self.assertIn("ADVISOR_WATCH_BUY_NEAR_SESSION_HIGH", result.reason_codes)
+
+    def test_sell_near_session_low_after_material_decline_is_deferred(self) -> None:
+        snapshot = self._snapshot(
+            side="SELL",
+            entry=98.5,
+            accepted_inside=False,
+            decline_from_high_atr=1.35,
+            distance_to_low_atr=0.05,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.WATCH, result.action)
+        self.assertIn("ADVISOR_WATCH_SELL_NEAR_SESSION_LOW", result.reason_codes)
+
+    def test_sell_against_persistent_climb_from_session_low_is_deferred(self) -> None:
+        snapshot = self._snapshot(
+            side="SELL",
+            entry=106.0,
+            accepted_inside=False,
+            rise_from_low_atr=0.9,
+            low_path_bars=5,
+            low_path_efficiency=0.70,
+            low_path_ratio=0.80,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.WATCH, result.action)
         self.assertIn(
-            "ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE",
+            "ADVISOR_WATCH_SELL_AGAINST_CLIMB_FROM_SESSION_LOW",
             result.reason_codes,
         )
-        self.assertIn("ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW", result.reason_codes)
 
-    def test_confirmed_price_led_expansion_is_allowed(self) -> None:
+    def test_buy_against_persistent_decline_from_session_high_is_deferred(self) -> None:
         snapshot = self._snapshot(
-            side="SELL",
-            entry=98.6,
+            side="BUY",
+            entry=104.0,
+            accepted_inside=False,
+            decline_from_high_atr=0.9,
+            high_path_bars=5,
+            high_path_efficiency=0.70,
+            high_path_ratio=0.80,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.WATCH, result.action)
+        self.assertIn(
+            "ADVISOR_WATCH_BUY_AGAINST_DECLINE_FROM_SESSION_HIGH",
+            result.reason_codes,
+        )
+
+    def test_strong_accepted_breakout_can_clear_extreme_and_path_deferral(self) -> None:
+        snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
+            side="BUY",
+            entry=111.8,
             state="FRESH_EXPANSION",
-            context_name="EARLY_EXPANSION",
-            background_regime="EARLY_EXPANSION",
-            rotational=False,
-            fresh_expansion=True,
-        )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.ALLOW, result.action)
-        self.assertIn("ADVISOR_ALLOW_CONFIRMED_PRICE_LED_EXPANSION", result.reason_codes)
-        self.assertFalse(result.diagnostics["time_of_day_gate_applied"])
-
-    def test_reversal_is_not_blocked_by_same_side_exhaustion(self) -> None:
-        snapshot = self._snapshot(
-            family="REVERSAL",
-            subtype="NORMAL_REVERSAL",
-            side="BUY",
-            entry=101.4,
-            state="REVERSAL",
-            context_name="REVERSAL",
-            background_regime="DIRECTIONAL",
-            rotational=False,
-            exhaustion_active=True,
-            exhausted_side="UP",
-            exhaustion_expires_at=self.ts + timedelta(minutes=3),
-        )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.ALLOW, result.action)
-        self.assertFalse(result.diagnostics["exhaustion_family_applicable"])
-
-    def test_expired_exhaustion_does_not_block_continuation(self) -> None:
-        snapshot = self._snapshot(
-            side="SELL",
-            context_name="MATURE_EXTENSION",
-            background_regime="DIRECTIONAL",
-            rotational=False,
-            exhaustion_active=True,
-            exhausted_side="DOWN",
-            exhaustion_expires_at=self.ts - timedelta(minutes=3),
-        )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.ALLOW, result.action)
-        self.assertFalse(result.diagnostics["exhaustion_context_current"])
-
-    def test_current_reversal_inside_rotational_background_is_blocked(self) -> None:
-        snapshot = self._snapshot(
-            family="REVERSAL",
-            subtype="NORMAL_REVERSAL",
-            side="BUY",
-            entry=100.8,
-            state="REVERSAL",
-            context_name="REVERSAL",
-            background_regime="ROTATIONAL",
-            rotational=False,
-        )
-        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.BLOCK, result.action)
-        self.assertIn(
-            "ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE",
-            result.reason_codes,
-        )
-
-    def test_confirmed_reversal_outside_background_range_is_allowed(self) -> None:
-        snapshot = self._snapshot(
-            family="REVERSAL",
-            subtype="NORMAL_REVERSAL",
-            side="BUY",
-            entry=101.4,
-            state="REVERSAL",
-            context_name="REVERSAL",
-            background_regime="ROTATIONAL",
-            rotational=True,
+            accepted_low=100.0,
+            accepted_high=110.0,
+            accepted_inside=False,
+            session_high=112.0,
+            session_low=98.0,
+            rise_from_low_atr=1.38,
+            distance_to_high_atr=0.02,
+            high_path_bars=5,
+            decline_from_high_atr=0.8,
+            high_path_efficiency=0.70,
+            high_path_ratio=0.80,
         )
         result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
         self.assertEqual(AdvisorAction.ALLOW, result.action)
         self.assertIn(
-            "ADVISOR_ALLOW_CONFIRMED_REVERSAL_OUTSIDE_BACKGROUND_RANGE",
+            "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE",
             result.reason_codes,
         )
 
     def test_advisor_applies_only_to_new_signal_deployment(self) -> None:
-        snapshot = self._snapshot(side="SELL")
+        snapshot = self._snapshot()
         advisor = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
 
         action, reasons = _advisor_adjusted_auction_action(
@@ -228,8 +258,8 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             existing_signal=None,
             advisor=advisor,
         )
-        self.assertEqual("LOCAL_BLOCKED", action)
-        self.assertIn("SIGNAL_DEPLOYMENT_BLOCKED_BY_STOCK_ADVISOR", reasons)
+        self.assertEqual("LOCAL_WATCH", action)
+        self.assertIn("SIGNAL_DEPLOYMENT_WATCHED_BY_STOCK_ADVISOR", reasons)
 
         existing = SimpleNamespace(signal_id="SIG-1")
         action, reasons = _advisor_adjusted_auction_action(
@@ -280,6 +310,96 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.assertIn("ADVISOR_INPUT_ERROR_FAIL_OPEN", result.reason_codes)
         self.assertTrue(result.diagnostics["fail_open"])
         self.assertIn("candidate_id=CANDIDATE:SELL matches=0", " ".join(captured.output))
+
+    def test_session_path_memory_uses_all_completed_candles(self) -> None:
+        engine = AuctionStateEngine(AUCTION_ENGINE_CONFIG)
+        memory = _StateMemory(trading_day=self.ts.date())
+        bars = [
+            (100.0, 101.0, 99.0, 100.0),
+            (100.0, 102.0, 99.5, 101.0),
+            (101.0, 103.0, 100.5, 102.0),
+            (102.0, 104.0, 101.5, 103.0),
+        ]
+        for index, (opn, high, low, close) in enumerate(bars):
+            ts = self.ts + timedelta(minutes=index * 3)
+            evidence = EvidenceSnapshot(
+                symbol="TEST",
+                trading_day=ts.date(),
+                snapshot_time=ts,
+                close=close,
+                atr=1.0,
+                bar=BarEvidence(
+                    snapshot_time=ts,
+                    open=opn,
+                    high=high,
+                    low=low,
+                    close=close,
+                    direction=DirectionalBias.UP,
+                ),
+                price_action=PriceActionEvidence(
+                    direction=DirectionalBias.UP,
+                    rejection=False,
+                    failed_extreme=False,
+                ),
+                extension=ExtensionEvidence(
+                    extended=False,
+                    mature=False,
+                    move_from_anchor_atr=0.5,
+                    progress_decay=0.0,
+                    failed_extreme_count=0,
+                ),
+                config_version=self.version,
+            )
+            engine._update_session_path_memory(memory, evidence)
+
+        self.assertEqual(99.0, memory.session_low_price)
+        self.assertEqual(104.0, memory.session_high_price)
+        self.assertGreaterEqual(memory.path_from_low_steps, 3)
+        self.assertGreater(memory.path_from_low_up_steps, 0)
+
+    def test_boundary_builder_rejects_orb_seed_and_candidate_fallback(self) -> None:
+        builder = EvidenceBuilder(AUCTION_ENGINE_CONFIG)
+        bar = BarEvidence(
+            snapshot_time=self.ts,
+            open=100.0,
+            high=101.0,
+            low=99.5,
+            close=100.5,
+            direction=DirectionalBias.UP,
+        )
+        base_range = {
+            "range_id": "ORB:2026-07-24",
+            "version": 1,
+            "high": 101.0,
+            "low": 99.0,
+            "source": "ORB",
+            "range_type": "OPENING_RANGE",
+            "start_time": self.ts - timedelta(minutes=15),
+            "end_time": self.ts,
+            "provisional": False,
+            "breakout_eligible": False,
+        }
+        data = {
+            "structure": {
+                "accepted": {"range": base_range},
+                "candidate": {"range": {**base_range, "source": "INTRADAY_BALANCE"}},
+                "raw": {"range": {**base_range, "source": "INTRADAY_BALANCE"}},
+            }
+        }
+        self.assertIsNone(builder._build_boundary(data, bar, 1.0))
+
+        evolved = dict(base_range)
+        evolved.update({
+            "range_id": "DYNAMIC:1",
+            "source": "INTRADAY_BALANCE",
+            "range_type": "BALANCE",
+            "breakout_eligible": True,
+        })
+        data["structure"]["accepted"]["range"] = evolved
+        observation = builder._build_boundary(data, bar, 1.0)
+        self.assertIsNotNone(observation)
+        self.assertEqual("INTRADAY_BALANCE", observation.boundary_source)
+        self.assertIn("ACCEPTED_RANGE_ONLY", observation.reason_codes)
 
     def test_exhaustion_context_survives_confirmed_reversal_state(self) -> None:
         engine = AuctionStateEngine(AUCTION_ENGINE_CONFIG)

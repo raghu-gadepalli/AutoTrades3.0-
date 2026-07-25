@@ -506,30 +506,39 @@ class OpportunityProjection(StrictBaseModel):
 
 
 class StockContextProjection(StrictBaseModel):
-    name: str
-    background_regime: str
     current_auction_state: str
     directional_bias: str
-    balanced_non_directional: bool
-    compression_active: bool
-    rotational: bool
-    fresh_expansion_confirmed: bool
-    directional_efficiency: Optional[float]
-    overlap_ratio: Optional[float]
-    ema_context: str
-    ema_spread_atr: Optional[float]
-    ema_spread_change_atr_per_bar: Optional[float]
-    hma_context: str
-    hma_spread_atr: Optional[float]
-    atr_state: str
-    atr_contraction_ratio: Optional[float]
-    background_range_id: Optional[str]
-    background_range_low: Optional[float]
-    background_range_high: Optional[float]
-    background_range_position: Optional[float]
-    background_range_outside_atr: Optional[float]
-    background_range_classification: str
-    background_structure_flip_count: int = Field(ge=0)
+
+    accepted_range_id: Optional[str]
+    accepted_range_source: str
+    accepted_range_low: Optional[float]
+    accepted_range_high: Optional[float]
+    accepted_range_established_at: Optional[datetime]
+    accepted_range_provisional: bool
+    accepted_range_breakout_eligible: bool
+    accepted_range_inside: bool
+    accepted_range_position: Optional[float]
+    accepted_range_outside_atr: Optional[float]
+
+    session_open_price: float
+    session_high_price: float
+    session_high_time: datetime
+    session_low_price: float
+    session_low_time: datetime
+    session_position: Optional[float]
+    distance_to_session_high_atr: float = Field(ge=0.0)
+    distance_to_session_low_atr: float = Field(ge=0.0)
+    rise_from_session_low_atr: float = Field(ge=0.0)
+    rise_from_session_low_pct: float = Field(ge=0.0)
+    decline_from_session_high_atr: float = Field(ge=0.0)
+    decline_from_session_high_pct: float = Field(ge=0.0)
+    path_from_session_low_bars: int = Field(ge=0)
+    path_from_session_low_efficiency: Optional[float]
+    path_from_session_low_directional_ratio: Optional[float]
+    path_from_session_high_bars: int = Field(ge=0)
+    path_from_session_high_efficiency: Optional[float]
+    path_from_session_high_directional_ratio: Optional[float]
+
     exhaustion_active: bool
     exhausted_side: str
     exhaustion_started_at: Optional[datetime]

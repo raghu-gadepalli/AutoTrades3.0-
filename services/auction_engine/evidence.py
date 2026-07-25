@@ -337,11 +337,14 @@ class EvidenceBuilder:
         bar: BarEvidence,
         atr: Optional[float],
     ) -> Optional[BoundaryObservation]:
-        candidates = (
-            ("ACCEPTED_RANGE", _path(data, "structure.accepted.range")),
-            ("CANDIDATE_RANGE", _path(data, "structure.candidate.range")),
-            ("RAW_RANGE", _path(data, "structure.raw.range")),
-        )
+        accepted = _path(data, "structure.accepted.range")
+        candidates: list[tuple[str, Any]] = [("ACCEPTED_RANGE", accepted)]
+        if not self.config.boundary.require_accepted_range:
+            if self.config.boundary.allow_candidate_range_fallback:
+                candidates.append(("CANDIDATE_RANGE", _path(data, "structure.candidate.range")))
+            if self.config.boundary.allow_raw_range_fallback:
+                candidates.append(("RAW_RANGE", _path(data, "structure.raw.range")))
+
         selected_source = ""
         selected: Optional[Mapping[str, Any]] = None
         for source, value in candidates:
@@ -349,10 +352,27 @@ class EvidenceBuilder:
                 continue
             high = _positive_float(value["high"])
             low = _positive_float(value["low"])
-            if high is not None and low is not None and high > low:
-                selected_source = source
-                selected = value
-                break
+            if high is None or low is None or high <= low:
+                continue
+
+            if source == "ACCEPTED_RANGE":
+                if bool(value["provisional"]):
+                    continue
+                if (
+                    self.config.boundary.require_breakout_eligible_accepted_range
+                    and not bool(value["breakout_eligible"])
+                ):
+                    continue
+                range_source = _normalise_word(value["source"])
+                if (
+                    not self.config.boundary.allow_orb_seeded_accepted_range
+                    and range_source == "ORB"
+                ):
+                    continue
+
+            selected_source = source
+            selected = value
+            break
         if selected is None:
             return None
 
@@ -387,6 +407,8 @@ class EvidenceBuilder:
         range_quality_score = None
         boundary_id = f"{range_id or stable_key('range', bar.snapshot_time.date(), low, high)}:{side.value.lower()}"
         reason_codes = [selected_source, f"NEAREST_{side.value}"]
+        if self.config.boundary.require_accepted_range:
+            reason_codes.append("ACCEPTED_RANGE_ONLY")
         if _normalise_word(selected["range_type"]) == "MICRO_COMPRESSION":
             reason_codes.append("MICRO_COMPRESSION_RANGE")
 
@@ -1272,6 +1294,7 @@ class EvidenceBuilder:
                 "accepted_range_low": _path(data, "structure.accepted.range.low"),
                 "accepted_range_high": _path(data, "structure.accepted.range.high"),
                 "accepted_range_source": _path(data, "structure.accepted.range.source"),
+                "accepted_range_established_at": _path(data, "structure.accepted.range.established_at"),
                 "accepted_range_provisional": _path(data, "structure.accepted.range.provisional"),
                 "accepted_range_breakout_eligible": _path(data, "structure.accepted.range.breakout_eligible"),
                 "accepted_range_classification": _path(data, "structure.accepted.metrics.classification"),

@@ -33,7 +33,7 @@ class AuctionEngineRuntimeConfig(BaseModel):
 
     engine_name: str = "AUCTION_STATE_SIGNAL_ENGINE"
     engine_version: str = "0.7.0"
-    config_version: str = "AUCTION_ENGINE_STRICT_LOCAL_V5_STOCK_CONTEXT"
+    config_version: str = "AUCTION_ENGINE_STRICT_LOCAL_V6_SIMPLE_SESSION_RANGE"
 
     timezone: str = "Asia/Kolkata"
     snapshot_interval_minutes: float = Field(default=3.0, gt=0.0)
@@ -251,8 +251,7 @@ class AuctionStatePolicyConfig(BaseModel):
     stock_context_directional_efficiency_min: float = Field(default=0.45, ge=0.0, le=1.0)
     stock_context_balance_confirmation_bars: int = Field(default=2, ge=1)
     stock_context_early_expansion_displacement_atr: float = Field(default=0.35, ge=0.0)
-    stock_context_background_rotation_flip_count: int = Field(default=3, ge=1)
-    stock_context_background_range_tolerance_atr: float = Field(default=0.15, ge=0.0)
+    accepted_range_tolerance_atr: float = Field(default=0.15, ge=0.0)
 
     # Exhaustion is persistent market context independent of whether an
     # EXHAUSTION_REVERSAL candidate has enough VWAP room to become a trade.
@@ -297,6 +296,14 @@ class BoundaryPolicyConfig(BaseModel):
     # initial authoritative boundary universe.  Fixed levels can be added later
     # through reviewed selector policy.
     dynamic_boundaries_only: bool = True
+    # Baseline: only a non-provisional, breakout-eligible accepted range may
+    # originate accepted/failed breakout episodes. Candidate/raw fallbacks and
+    # the opening-range seed remain observable but non-tradable.
+    require_accepted_range: bool = True
+    require_breakout_eligible_accepted_range: bool = True
+    allow_candidate_range_fallback: bool = False
+    allow_raw_range_fallback: bool = False
+    allow_orb_seeded_accepted_range: bool = False
     immutable_event_identity: bool = True
     freeze_range_at_attempt: bool = True
     share_episode_between_accepted_and_failed: bool = True

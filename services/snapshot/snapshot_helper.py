@@ -1832,7 +1832,9 @@ def _opening_range_seed(
         established_at=asof,
         evidence_cutoff=asof,
         provisional=False,
-        breakout_eligible=True,
+        breakout_eligible=bool(
+            SNAPSHOT_CONFIG.structure.initial_accepted_seed_breakout_eligible
+        ),
     )
     quality = _range_quality(r, None)
     return AcceptedStructureBlock(

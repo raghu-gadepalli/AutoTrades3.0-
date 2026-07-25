@@ -35,7 +35,6 @@ from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineCo
 from services.auction_engine.contracts import (
     AuctionState,
     AuctionStateName,
-    BackgroundRegimeName,
     BoundarySide,
     ConfidenceChannel,
     DirectionalBias,
@@ -44,7 +43,6 @@ from services.auction_engine.contracts import (
     EvidenceSnapshot,
     QualityStatus,
     StockContext,
-    StockContextName,
     stable_key,
 )
 
@@ -74,6 +72,21 @@ class _StateMemory:
     last_snapshot_time: Optional[datetime] = None
     observation_count: int = 0
     state_age_bars: int = 0
+
+    # Complete causal day-so-far path.  These values are updated from every
+    # completed candle and reset whenever a new session high/low is printed.
+    session_open_price: Optional[float] = None
+    session_high_price: Optional[float] = None
+    session_high_time: Optional[datetime] = None
+    session_low_price: Optional[float] = None
+    session_low_time: Optional[datetime] = None
+    session_previous_close: Optional[float] = None
+    path_from_low_points: float = 0.0
+    path_from_low_steps: int = 0
+    path_from_low_up_steps: int = 0
+    path_from_high_points: float = 0.0
+    path_from_high_steps: int = 0
+    path_from_high_down_steps: int = 0
 
     pending_state: Optional[AuctionStateName] = None
     pending_bars: int = 0
@@ -303,6 +316,7 @@ class AuctionStateEngine:
 
         memory.current_state = selected
         memory.observation_count += 1
+        self._update_session_path_memory(memory, evidence)
         memory.last_snapshot_time = evidence.snapshot_time
         self._update_rotation_memory(memory, evidence)
 
@@ -1182,6 +1196,62 @@ class AuctionStateEngine:
         memory.exhaustion_clear_bars = 0
         memory.exhaustion_reason_codes = ()
 
+    def _update_session_path_memory(
+        self,
+        memory: _StateMemory,
+        evidence: EvidenceSnapshot,
+    ) -> None:
+        """Update complete causal paths from the current day high and low."""
+
+        bar = evidence.bar
+        close = float(evidence.close)
+        high = float(bar.high)
+        low = float(bar.low)
+        open_price = float(bar.open)
+        tolerance = self.config.evidence.floating_point_tolerance
+        previous_close = memory.session_previous_close
+
+        if memory.session_open_price is None:
+            memory.session_open_price = open_price
+
+        new_low = bool(
+            memory.session_low_price is None
+            or low < float(memory.session_low_price) - tolerance
+        )
+        if new_low:
+            memory.session_low_price = low
+            memory.session_low_time = evidence.snapshot_time
+            initial = max(0.0, close - low)
+            memory.path_from_low_points = initial
+            memory.path_from_low_steps = 1 if initial > tolerance else 0
+            memory.path_from_low_up_steps = 1 if initial > tolerance else 0
+        elif previous_close is not None:
+            delta = close - float(previous_close)
+            memory.path_from_low_points += abs(delta)
+            memory.path_from_low_steps += 1
+            if delta > tolerance:
+                memory.path_from_low_up_steps += 1
+
+        new_high = bool(
+            memory.session_high_price is None
+            or high > float(memory.session_high_price) + tolerance
+        )
+        if new_high:
+            memory.session_high_price = high
+            memory.session_high_time = evidence.snapshot_time
+            initial = max(0.0, high - close)
+            memory.path_from_high_points = initial
+            memory.path_from_high_steps = 1 if initial > tolerance else 0
+            memory.path_from_high_down_steps = 1 if initial > tolerance else 0
+        elif previous_close is not None:
+            delta = close - float(previous_close)
+            memory.path_from_high_points += abs(delta)
+            memory.path_from_high_steps += 1
+            if delta < -tolerance:
+                memory.path_from_high_down_steps += 1
+
+        memory.session_previous_close = close
+
     def _build_stock_context(
         self,
         evidence: EvidenceSnapshot,
@@ -1190,48 +1260,43 @@ class AuctionStateEngine:
         selected_state: AuctionStateName,
         flags: Mapping[str, Any],
     ) -> StockContext:
-        if selected_state is AuctionStateName.REVERSAL:
-            name = StockContextName.REVERSAL
-        elif selected_state is AuctionStateName.TREND_FAILURE:
-            name = StockContextName.TREND_FAILURE
-        elif memory.exhaustion_active or selected_state is AuctionStateName.MATURE_EXTENSION:
-            name = StockContextName.MATURE_EXTENSION
-        elif bool(flags["fresh_expansion_confirmed"]):
-            name = StockContextName.EARLY_EXPANSION
-        elif bool(flags["rotational_context"]):
-            name = StockContextName.ROTATIONAL
-        elif bool(flags["compression_ready"]):
-            name = StockContextName.COMPRESSION
-        elif bool(flags["balanced_non_directional"]):
-            name = StockContextName.BALANCED
-        elif memory.established_trend_side in (DirectionalBias.UP, DirectionalBias.DOWN):
-            name = StockContextName.DIRECTIONAL
-        else:
-            name = StockContextName.UNKNOWN
+        """Build objective day-so-far and accepted-range context.
+
+        No BALANCED/ROTATIONAL/COMPRESSION regime is projected.  Those local
+        Auction states remain available through ``current_auction_state`` while
+        the Advisor consumes only observable geometry and session-path facts.
+        """
 
         source_structure = _required_raw_section(evidence, "source_structure")
         range_id_raw = source_structure["accepted_range_id"]
         range_low = _optional_number(source_structure["accepted_range_low"])
         range_high = _optional_number(source_structure["accepted_range_high"])
-        range_classification = str(
-            source_structure["accepted_range_classification"] or "UNKNOWN"
+        range_source = str(
+            source_structure["accepted_range_source"] or "UNKNOWN"
         ).strip().upper()
-        structure_flip_count = int(source_structure["structure_flip_count"] or 0)
+        range_established_at = _optional_datetime(
+            source_structure["accepted_range_established_at"]
+        )
+        range_provisional = bool(source_structure["accepted_range_provisional"])
+        range_breakout_eligible = bool(
+            source_structure["accepted_range_breakout_eligible"]
+        )
         range_valid = bool(
             range_low is not None
             and range_high is not None
             and range_high > range_low
         )
+
+        atr = _required_evidence_atr(evidence)
         range_position = None
         range_outside_atr = None
-        inside_background_range = False
+        range_inside = False
         if range_valid:
             assert range_low is not None and range_high is not None
             width = range_high - range_low
             range_position = (evidence.close - range_low) / width
-            atr = _required_evidence_atr(evidence)
-            tolerance = atr * self.cfg.stock_context_background_range_tolerance_atr
-            inside_background_range = bool(
+            tolerance = atr * self.cfg.accepted_range_tolerance_atr
+            range_inside = bool(
                 range_low - tolerance <= evidence.close <= range_high + tolerance
             )
             if evidence.close > range_high:
@@ -1241,39 +1306,60 @@ class AuctionStateEngine:
             else:
                 range_outside_atr = 0.0
 
-        if range_valid and inside_background_range:
-            if bool(flags["compression_ready"]):
-                background_regime = BackgroundRegimeName.COMPRESSION
-            elif (
-                bool(flags["rotational_context"])
-                or structure_flip_count
-                >= self.cfg.stock_context_background_rotation_flip_count
-            ):
-                background_regime = BackgroundRegimeName.ROTATIONAL
-            else:
-                background_regime = BackgroundRegimeName.BALANCED
-        elif bool(flags["fresh_expansion_confirmed"]):
-            background_regime = BackgroundRegimeName.EARLY_EXPANSION
-        elif memory.exhaustion_active or selected_state is AuctionStateName.MATURE_EXTENSION:
-            background_regime = BackgroundRegimeName.MATURE_EXTENSION
-        elif memory.established_trend_side in (
-            DirectionalBias.UP,
-            DirectionalBias.DOWN,
+        if (
+            memory.session_open_price is None
+            or memory.session_high_price is None
+            or memory.session_high_time is None
+            or memory.session_low_price is None
+            or memory.session_low_time is None
         ):
-            background_regime = BackgroundRegimeName.DIRECTIONAL
-        else:
-            background_regime = BackgroundRegimeName.UNKNOWN
+            raise ValueError("Session path memory was not initialised")
 
-        reasons = [
-            f"STOCK_CONTEXT_{name.value}",
-            f"BACKGROUND_REGIME_{background_regime.value}",
-        ]
-        if bool(flags["balanced_non_directional"]):
-            reasons.append("BALANCED_NON_DIRECTIONAL_CONFIRMED")
-        if bool(flags["rotational_context"]):
-            reasons.append("ROTATIONAL_CONTEXT_CONFIRMED")
-        if bool(flags["fresh_expansion_confirmed"]):
-            reasons.append("PRICE_LED_FRESH_EXPANSION_CONFIRMED")
+        session_open = float(memory.session_open_price)
+        session_high = float(memory.session_high_price)
+        session_low = float(memory.session_low_price)
+        session_width = session_high - session_low
+        session_position = (
+            (evidence.close - session_low) / session_width
+            if session_width > self.config.evidence.floating_point_tolerance
+            else 0.5
+        )
+        session_position = max(0.0, min(1.0, session_position))
+
+        rise_points = max(0.0, evidence.close - session_low)
+        decline_points = max(0.0, session_high - evidence.close)
+        distance_to_high_atr = decline_points / atr
+        distance_to_low_atr = rise_points / atr
+
+        low_efficiency = _path_efficiency(
+            rise_points,
+            memory.path_from_low_points,
+            self.config.evidence.floating_point_tolerance,
+        )
+        high_efficiency = _path_efficiency(
+            decline_points,
+            memory.path_from_high_points,
+            self.config.evidence.floating_point_tolerance,
+        )
+        low_ratio = _step_ratio(
+            memory.path_from_low_up_steps,
+            memory.path_from_low_steps,
+        )
+        high_ratio = _step_ratio(
+            memory.path_from_high_down_steps,
+            memory.path_from_high_steps,
+        )
+
+        reasons = ["STOCK_CONTEXT_OBJECTIVE_SESSION_PATH"]
+        if range_valid:
+            reasons.append("ACCEPTED_RANGE_PRESENT")
+            reasons.append(
+                "PRICE_INSIDE_ACCEPTED_RANGE"
+                if range_inside
+                else "PRICE_OUTSIDE_ACCEPTED_RANGE"
+            )
+        else:
+            reasons.append("ACCEPTED_RANGE_MISSING")
         if memory.exhaustion_active:
             reasons.append("EXHAUSTION_CONTEXT_ACTIVE")
 
@@ -1293,45 +1379,48 @@ class AuctionStateEngine:
         return StockContext(
             symbol=evidence.symbol,
             snapshot_time=evidence.snapshot_time,
-            name=name,
-            background_regime=background_regime,
             current_auction_state=selected_state,
             directional_bias=directional_bias,
-            balanced_non_directional=bool(flags["balanced_non_directional"]),
-            compression_active=bool(flags["compression_ready"]),
-            rotational=bool(flags["rotational_context"]),
-            fresh_expansion_confirmed=bool(flags["fresh_expansion_confirmed"]),
-            directional_efficiency=evidence.trend.directional_efficiency,
-            overlap_ratio=evidence.price_action.overlap_ratio,
-            ema_context=evidence.trend.ema_context,
-            ema_spread_atr=evidence.trend.ema_slow_ref_spread_atr,
-            ema_spread_change_atr_per_bar=evidence.trend.ema_spread_change_atr_per_bar,
-            hma_context=evidence.trend.hma_order,
-            hma_spread_atr=evidence.trend.hma_spread_atr,
-            atr_state=evidence.compression.atr_state,
-            atr_contraction_ratio=evidence.compression.atr_contraction_ratio,
-            background_range_id=(str(range_id_raw) if range_id_raw else None),
-            background_range_low=range_low,
-            background_range_high=range_high,
-            background_range_position=range_position,
-            background_range_outside_atr=range_outside_atr,
-            background_range_classification=range_classification,
-            background_structure_flip_count=structure_flip_count,
+            accepted_range_id=(str(range_id_raw) if range_id_raw else None),
+            accepted_range_source=range_source,
+            accepted_range_low=range_low,
+            accepted_range_high=range_high,
+            accepted_range_established_at=range_established_at,
+            accepted_range_provisional=range_provisional,
+            accepted_range_breakout_eligible=range_breakout_eligible,
+            accepted_range_inside=range_inside,
+            accepted_range_position=range_position,
+            accepted_range_outside_atr=range_outside_atr,
+            session_open_price=session_open,
+            session_high_price=session_high,
+            session_high_time=memory.session_high_time,
+            session_low_price=session_low,
+            session_low_time=memory.session_low_time,
+            session_position=session_position,
+            distance_to_session_high_atr=distance_to_high_atr,
+            distance_to_session_low_atr=distance_to_low_atr,
+            rise_from_session_low_atr=rise_points / atr,
+            rise_from_session_low_pct=(rise_points / session_low),
+            decline_from_session_high_atr=decline_points / atr,
+            decline_from_session_high_pct=(decline_points / session_high),
+            path_from_session_low_bars=memory.path_from_low_steps,
+            path_from_session_low_efficiency=low_efficiency,
+            path_from_session_low_directional_ratio=low_ratio,
+            path_from_session_high_bars=memory.path_from_high_steps,
+            path_from_session_high_efficiency=high_efficiency,
+            path_from_session_high_directional_ratio=high_ratio,
             exhaustion_active=memory.exhaustion_active,
             exhausted_side=memory.exhaustion_side,
             exhaustion_started_at=memory.exhaustion_started_at,
             exhaustion_expires_at=expires_at,
             reason_codes=_unique(reasons),
             diagnostics={
-                "slow_ema_slope_atr_per_bar": evidence.trend.ema_slow_slope_atr_per_bar,
-                "ref_ema_slope_atr_per_bar": evidence.trend.ema_ref_slope_atr_per_bar,
-                "local_flip_counts": dict(flags["local_flip_counts"]),
-                "independent_flip_channels": int(flags["independent_flip_channels"]),
-                "balanced_observed": bool(flags["balanced_observed"]),
-                "balance_confirmation_bars": int(flags["stock_context_balance_bars"]),
+                "path_from_session_low_points": memory.path_from_low_points,
+                "path_from_session_high_points": memory.path_from_high_points,
                 "current_leg_distance_atr": flags["current_leg_distance_atr"],
-                "current_leg_current_distance_atr": flags["current_leg_current_distance_atr"],
-                "inside_background_range": inside_background_range,
+                "current_leg_current_distance_atr": flags[
+                    "current_leg_current_distance_atr"
+                ],
             },
             config_version=self.version,
         )
@@ -2730,6 +2819,33 @@ def _optional_number(value: Any) -> Optional[float]:
     if number != number or number in (float("inf"), float("-inf")):
         raise ValueError(f"Auction numeric fact must be finite, got {value!r}")
     return number
+
+
+def _optional_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected datetime Auction fact, got {value!r}") from exc
+
+
+def _path_efficiency(
+    net_points: float,
+    path_points: float,
+    tolerance: float,
+) -> Optional[float]:
+    if path_points <= tolerance:
+        return None
+    return max(0.0, min(1.0, float(net_points) / float(path_points)))
+
+
+def _step_ratio(favourable_steps: int, total_steps: int) -> Optional[float]:
+    if total_steps <= 0:
+        return None
+    return max(0.0, min(1.0, float(favourable_steps) / float(total_steps)))
 
 
 def _strict_int(value: Any, path: str) -> int:

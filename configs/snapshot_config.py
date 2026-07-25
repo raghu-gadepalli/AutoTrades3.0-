@@ -154,6 +154,9 @@ class StructureConfig(BaseModel):
     # It does not make ORB a permanent hardcoded accepted range.
     use_previous_day_range_as_initial_seed: bool = False
     initial_accepted_seed_source: str = "ORB"
+    # The opening range may seed structure continuity but cannot originate a
+    # tradable accepted/failed breakout until an intraday balance evolves.
+    initial_accepted_seed_breakout_eligible: bool = False
     trust_intraday_after_minutes: int = 15
 
     # Dynamic intraday balance discovery.  The latest completed candle is
