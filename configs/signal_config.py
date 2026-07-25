@@ -13,6 +13,7 @@ class SignalServiceConfig(BaseModel):
 
 
 class SignalResolutionConfig(BaseModel):
+
     stage_rank: dict[str, int] = Field(default_factory=lambda: {
         "FORCE_EXIT": 0,
         "EXIT_BIAS": 10,

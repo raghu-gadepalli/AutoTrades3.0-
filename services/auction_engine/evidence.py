@@ -484,6 +484,68 @@ class EvidenceBuilder:
         else:
             hma_change = _word_direction(current_hma)
 
+        # EMA100/EMA200 are slow stock-state context, never setup triggers.
+        # Derive their current separation and causal slope from the bounded
+        # Auction history.  A close/flat pair supports balance; a freshly
+        # widening pair may support price-led early expansion despite EMA lag.
+        ema_slow = _positive_float(_path(data, "indicators.ema.slow"))
+        ema_ref = _positive_float(_path(data, "indicators.ema.ref"))
+        ema_spread_atr = (
+            abs(ema_slow - ema_ref) / atr
+            if ema_slow is not None and ema_ref is not None and atr
+            else None
+        )
+        lookback = int(self.cfg.ema_slow_context_lookback_bars)
+        ema_history = [
+            item for item in history[-lookback:]
+            if getattr(item.trend, "ema_slow", None) is not None
+            and getattr(item.trend, "ema_ref", None) is not None
+        ]
+        ema_slow_slope = None
+        ema_ref_slope = None
+        ema_spread_change = None
+        if ema_history and ema_slow is not None and ema_ref is not None and atr:
+            previous = ema_history[0].trend
+            bars_elapsed = max(1, len(ema_history))
+            ema_slow_slope = (ema_slow - float(previous.ema_slow)) / atr / bars_elapsed
+            ema_ref_slope = (ema_ref - float(previous.ema_ref)) / atr / bars_elapsed
+            previous_spread = abs(float(previous.ema_slow) - float(previous.ema_ref)) / atr
+            if ema_spread_atr is not None:
+                ema_spread_change = (ema_spread_atr - previous_spread) / bars_elapsed
+
+        state_cfg = self.config.state
+        close_pair = bool(
+            ema_spread_atr is not None
+            and ema_spread_atr <= state_cfg.slow_ema_close_spread_atr_max
+        )
+        flat_pair = bool(
+            ema_slow_slope is not None
+            and ema_ref_slope is not None
+            and abs(ema_slow_slope) <= state_cfg.slow_ema_flat_slope_atr_per_bar_max
+            and abs(ema_ref_slope) <= state_cfg.slow_ema_flat_slope_atr_per_bar_max
+        )
+        expanding_pair = bool(
+            ema_spread_change is not None
+            and ema_spread_change >= state_cfg.slow_ema_spread_expansion_atr_per_bar_min
+        )
+        if ema_slow is None or ema_ref is None:
+            ema_context = "UNKNOWN"
+        elif close_pair and flat_pair and not expanding_pair:
+            ema_context = "COMPRESSED_FLAT"
+        elif close_pair and expanding_pair and ema_slow_slope is not None and ema_ref_slope is not None:
+            if ema_slow_slope > 0 and ema_ref_slope >= 0:
+                ema_context = "EARLY_DIVERGENCE_UP"
+            elif ema_slow_slope < 0 and ema_ref_slope <= 0:
+                ema_context = "EARLY_DIVERGENCE_DOWN"
+            else:
+                ema_context = "COMPRESSED_MIXED"
+        elif ema_slow > ema_ref and (ema_slow_slope is None or ema_slow_slope >= 0):
+            ema_context = "UP_ALIGNED"
+        elif ema_slow < ema_ref and (ema_slow_slope is None or ema_slow_slope <= 0):
+            ema_context = "DOWN_ALIGNED"
+        else:
+            ema_context = "MIXED"
+
         retained: Optional[bool] = None
         if direction is DirectionalBias.UP:
             if raw_state in _DOWN_WORDS or raw_side in _DOWN_WORDS:
@@ -526,6 +588,13 @@ class EvidenceBuilder:
             hma_order=current_hma,
             hma_spread_atr=hma_spread_atr,
             hma_change=hma_change,
+            ema_slow=ema_slow,
+            ema_ref=ema_ref,
+            ema_slow_ref_spread_atr=ema_spread_atr,
+            ema_slow_slope_atr_per_bar=ema_slow_slope,
+            ema_ref_slope_atr_per_bar=ema_ref_slope,
+            ema_spread_change_atr_per_bar=ema_spread_change,
+            ema_context=ema_context,
             retained_structure=retained,
             supporting_facts=tuple(supporting),
             contradicting_facts=tuple(contradicting),
@@ -672,6 +741,29 @@ class EvidenceBuilder:
             and hma_contraction_ratio <= self.cfg.compression_hma_contraction_ratio_max
         )
 
+        # ATR trend is context, not a directional trigger.  Contracting ATR
+        # strengthens quiet compression; stable/rising ATR can still coexist
+        # with a volatile rotational range, which is handled by efficiency and
+        # overlap rather than ATR alone.
+        atr_values = [
+            float(value)
+            for value in (getattr(item, "atr", None) for item in history[-self.cfg.atr_context_lookback_bars:])
+            if value is not None and float(value) > 0
+        ]
+        atr_contraction_ratio = None
+        if atr_values and atr is not None:
+            prior_average = sum(atr_values) / len(atr_values)
+            if prior_average > self.cfg.floating_point_tolerance:
+                atr_contraction_ratio = atr / prior_average
+        if atr_contraction_ratio is None:
+            atr_state = "UNKNOWN"
+        elif atr_contraction_ratio <= self.config.state.atr_contraction_ratio_max:
+            atr_state = "CONTRACTING"
+        elif atr_contraction_ratio >= self.config.state.atr_expansion_ratio_min:
+            atr_state = "EXPANDING"
+        else:
+            atr_state = "STABLE"
+
         # HMA bunching/fan behaviour remains supporting evidence only.  This is
         # an objective compression *observation*; the state engine performs the
         # multi-bar confirmation and freezes the episode box.
@@ -710,6 +802,8 @@ class EvidenceBuilder:
             range_width_atr=range_width_atr,
             contraction_ratio=contraction_ratio,
             hma_convergence=trend.hma_spread_atr,
+            atr_contraction_ratio=atr_contraction_ratio,
+            atr_state=atr_state,
             frozen_box_id=range_id if compressed else None,
             reason_codes=_unique(reason_codes),
             quality=quality,
@@ -1189,6 +1283,10 @@ class EvidenceBuilder:
                 "hma_flip_count": _path(data, "indicators.hma.flip_count_today"),
                 "vwap": _path(data, "indicators.vwap.side"),
                 "vwap_flip_count": _path(data, "indicators.vwap.flip_count_today"),
+                "ema_slow": _path(data, "indicators.ema.slow"),
+                "ema_ref": _path(data, "indicators.ema.ref"),
+                "atr": _path(data, "indicators.atr.value"),
+                "atr_band": _path(data, "indicators.atr.band"),
             },
             "source_windows": {
                 "sod": _compact_mapping(_path(data, "market_windows.sod")),

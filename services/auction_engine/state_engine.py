@@ -42,6 +42,8 @@ from services.auction_engine.contracts import (
     EvidencePolarity,
     EvidenceSnapshot,
     QualityStatus,
+    StockContext,
+    StockContextName,
     stable_key,
 )
 
@@ -55,6 +57,7 @@ class StateEvaluation:
     """Report-only result accompanying the typed state contract."""
 
     state: AuctionState
+    stock_context: StockContext
     proposed_state: AuctionStateName
     transitioned: bool
     flags: Dict[str, Any] = field(default_factory=dict)
@@ -185,6 +188,21 @@ class _StateMemory:
     reversal_side: DirectionalBias = DirectionalBias.UNKNOWN
     reversal_onset_time: Optional[datetime] = None
 
+    # Persistent exhaustion context is independent of whether the opposite
+    # EXHAUSTION_REVERSAL has enough VWAP room to be tradable.
+    exhaustion_active: bool = False
+    exhaustion_side: DirectionalBias = DirectionalBias.UNKNOWN
+    exhaustion_started_at: Optional[datetime] = None
+    exhaustion_last_seen_at: Optional[datetime] = None
+    exhaustion_age_bars: int = 0
+    exhaustion_clear_bars: int = 0
+    exhaustion_reason_codes: Tuple[str, ...] = ()
+
+    # Cross-indicator non-directional balance must persist before it can be
+    # used as deployment context. A single quiet candle cannot classify the
+    # stock as balanced.
+    stock_context_balance_bars: int = 0
+
     chaos_candidate_bars: int = 0
 
     hma_direction_history: list[DirectionalBias] = field(default_factory=list)
@@ -290,6 +308,12 @@ class AuctionStateEngine:
         # Recompute memory-derived diagnostics after a transition (for example a
         # new leg anchor set by REACCELERATION).
         self._attach_memory_flags(flags, memory, evidence)
+        stock_context = self._build_stock_context(
+            evidence,
+            memory,
+            selected_state=selected,
+            flags=flags,
+        )
 
         supporting, contradicting = self._state_facts(evidence, selected, flags)
         channels = self._confidence_channels(evidence, flags)
@@ -417,6 +441,14 @@ class AuctionStateEngine:
             "reversal_confirmation_bars": memory.reversal_confirmation_bars,
             "reversal_side": memory.reversal_side.value,
             "reversal_onset_time": _iso(memory.reversal_onset_time),
+            "stock_context": stock_context.to_storage_dict(exclude_none=False),
+            "exhaustion_context_active": memory.exhaustion_active,
+            "exhausted_side": memory.exhaustion_side.value,
+            "exhaustion_started_at": _iso(memory.exhaustion_started_at),
+            "exhaustion_last_seen_at": _iso(memory.exhaustion_last_seen_at),
+            "exhaustion_age_bars": memory.exhaustion_age_bars,
+            "exhaustion_clear_bars": memory.exhaustion_clear_bars,
+            "exhaustion_reason_codes": list(memory.exhaustion_reason_codes),
             "data_quality": evidence.data_quality.status.value,
             "proposal_reasons": list(proposal_reasons),
             "policy_reasons": list(policy_reasons),
@@ -424,6 +456,7 @@ class AuctionStateEngine:
 
         evaluation = StateEvaluation(
             state=state,
+            stock_context=stock_context,
             proposed_state=proposed,
             transitioned=transitioned,
             flags=flags,
@@ -849,6 +882,70 @@ class AuctionStateEngine:
             and not structural_failure_confirmed
         )
 
+        self._update_exhaustion_context(
+            memory,
+            evidence,
+            established=established,
+            current_leg_mature=current_leg_mature,
+            leg_distance_atr=leg_distance_atr,
+            leg_progress_or_rejection=leg_progress_or_rejection,
+            trend_resume=trend_resume,
+            reversal_ready=reversal_ready,
+        )
+
+        hma_word = str(trend.hma_order or "UNKNOWN").strip().upper()
+        hma_tangled = bool(
+            hma_word in {
+                "UNKNOWN", "NEUTRAL", "MIXED", "FLAT", "RANGE",
+                "BALANCE", "COMPRESSION", "INTERTWINED", "TANGLED",
+            }
+            or (
+                trend.hma_spread_atr is not None
+                and trend.hma_spread_atr <= self.evidence_cfg.compression_hma_spread_atr_max
+                and trend.direction in {
+                    DirectionalBias.NEUTRAL,
+                    DirectionalBias.MIXED,
+                    DirectionalBias.UNKNOWN,
+                }
+            )
+        )
+        slow_ema_non_directional = trend.ema_context in {
+            "COMPRESSED_FLAT",
+            "COMPRESSED_MIXED",
+        }
+        atr_contracting = evidence.compression.atr_state == "CONTRACTING"
+        atr_expanding = evidence.compression.atr_state == "EXPANDING"
+        balanced_observed = bool(
+            (balance or compression_ready or chaos_ready)
+            and (slow_ema_non_directional or hma_tangled or local_rotation)
+            and not fresh_expansion
+        )
+        memory.stock_context_balance_bars = (
+            memory.stock_context_balance_bars + 1 if balanced_observed else 0
+        )
+        balanced_non_directional = bool(
+            memory.stock_context_balance_bars
+            >= self.cfg.stock_context_balance_confirmation_bars
+        )
+        fresh_expansion_confirmed = bool(
+            fresh_expansion
+            and abs(move_atr)
+            >= self.cfg.stock_context_early_expansion_displacement_atr
+            and efficiency is not None
+            and efficiency >= self.cfg.stock_context_directional_efficiency_min
+            and (
+                boundary_outside
+                or atr_expanding
+                or trend.ema_context in {"EARLY_DIVERGENCE_UP", "EARLY_DIVERGENCE_DOWN"}
+                or not hma_tangled
+            )
+        )
+        rotational_context = bool(
+            chaos_ready
+            or (balance and local_rotation)
+            or (balance and hma_tangled and not slow_ema_non_directional and not atr_contracting)
+        )
+
         neutral_context_observed = bool(
             established in (DirectionalBias.UP, DirectionalBias.DOWN)
             and not strong_up
@@ -892,6 +989,20 @@ class AuctionStateEngine:
             "boundary_outside": boundary_outside,
             "outside_direction": outside_direction.value,
             "balance": balance,
+            "balanced_observed": balanced_observed,
+            "stock_context_balance_bars": memory.stock_context_balance_bars,
+            "balanced_non_directional": balanced_non_directional,
+            "rotational_context": rotational_context,
+            "fresh_expansion_confirmed": fresh_expansion_confirmed,
+            "slow_ema_non_directional": slow_ema_non_directional,
+            "ema_context": trend.ema_context,
+            "ema_spread_atr": trend.ema_slow_ref_spread_atr,
+            "ema_spread_change_atr_per_bar": trend.ema_spread_change_atr_per_bar,
+            "hma_tangled": hma_tangled,
+            "hma_context": hma_word,
+            "hma_spread_atr": trend.hma_spread_atr,
+            "atr_state": evidence.compression.atr_state,
+            "atr_contraction_ratio": evidence.compression.atr_contraction_ratio,
             "compression_observed": compression_observed,
             "compression_ready": compression_ready,
             "compression": compression_ready,
@@ -905,6 +1016,11 @@ class AuctionStateEngine:
             "current_leg_retracement_atr": leg_retracement_atr,
             "current_leg_retracement_fraction": leg_retracement_fraction,
             "current_leg_progress_or_rejection": leg_progress_or_rejection,
+            "exhaustion_context_active": memory.exhaustion_active,
+            "exhausted_side": memory.exhaustion_side.value,
+            "exhaustion_started_at": _iso(memory.exhaustion_started_at),
+            "exhaustion_age_bars": memory.exhaustion_age_bars,
+            "exhaustion_reason_codes": list(memory.exhaustion_reason_codes),
             "chaos_observed": chaos_observed,
             "chaos_ready": chaos_ready,
             "chaos": chaos_ready,
@@ -942,6 +1058,192 @@ class AuctionStateEngine:
         }
         self._attach_memory_flags(flags, memory, evidence)
         return flags
+
+    def _update_exhaustion_context(
+        self,
+        memory: _StateMemory,
+        evidence: EvidenceSnapshot,
+        *,
+        established: DirectionalBias,
+        current_leg_mature: bool,
+        leg_distance_atr: Optional[float],
+        leg_progress_or_rejection: bool,
+        trend_resume: bool,
+        reversal_ready: bool,
+    ) -> None:
+        if not self.cfg.exhaustion_context_enabled:
+            self._clear_exhaustion_context(memory)
+            return
+
+        extension_move = evidence.extension.move_from_anchor_atr
+        extension_large = bool(
+            extension_move is not None
+            and abs(float(extension_move)) >= self.cfg.exhaustion_context_min_extension_atr
+        )
+        progress_lost = bool(
+            evidence.extension.progress_decay is not None
+            and evidence.extension.progress_decay
+            >= self.cfg.exhaustion_context_progress_decay_min
+        )
+        rejection = bool(
+            evidence.price_action.rejection
+            or evidence.price_action.failed_extreme
+            or evidence.extension.failed_extreme_count > 0
+        )
+        exhaustion_observed = bool(
+            established in (DirectionalBias.UP, DirectionalBias.DOWN)
+            and (current_leg_mature or extension_large or evidence.extension.mature is True)
+            and (leg_progress_or_rejection or progress_lost or rejection)
+        )
+
+        if (
+            exhaustion_observed
+            and (
+                not memory.exhaustion_active
+                or memory.exhaustion_side is established
+            )
+        ):
+            if not memory.exhaustion_active:
+                memory.exhaustion_active = True
+                memory.exhaustion_side = established
+                memory.exhaustion_started_at = evidence.snapshot_time
+                memory.exhaustion_age_bars = 1
+            else:
+                memory.exhaustion_age_bars += 1
+            memory.exhaustion_last_seen_at = evidence.snapshot_time
+            memory.exhaustion_clear_bars = 0
+            reasons = []
+            if current_leg_mature:
+                reasons.append("CURRENT_LEG_MATURE")
+            if extension_large:
+                reasons.append("PRIOR_MOVE_EXTENDED")
+            if progress_lost:
+                reasons.append("PROGRESS_DECAY")
+            if rejection:
+                reasons.append("REJECTION_OR_FAILED_EXTREME")
+            memory.exhaustion_reason_codes = tuple(reasons)
+            return
+
+        if not memory.exhaustion_active:
+            return
+
+        memory.exhaustion_age_bars += 1
+
+        # A confirmed reversal does not erase the contextual fact that the old
+        # directional move exhausted.  The opposite candidate can trade only
+        # after its own structural confirmation; the context expires naturally
+        # or clears if the exhausted trend genuinely resumes.
+        clear_observed = bool(
+            trend_resume
+            and established is memory.exhaustion_side
+            and not progress_lost
+            and not rejection
+        )
+        memory.exhaustion_clear_bars = (
+            memory.exhaustion_clear_bars + 1 if clear_observed else 0
+        )
+        if (
+            memory.exhaustion_clear_bars
+            >= self.cfg.exhaustion_context_clear_confirmation_bars
+            or memory.exhaustion_age_bars > self.cfg.exhaustion_context_max_bars
+        ):
+            self._clear_exhaustion_context(memory)
+
+    @staticmethod
+    def _clear_exhaustion_context(memory: _StateMemory) -> None:
+        memory.exhaustion_active = False
+        memory.exhaustion_side = DirectionalBias.UNKNOWN
+        memory.exhaustion_started_at = None
+        memory.exhaustion_last_seen_at = None
+        memory.exhaustion_age_bars = 0
+        memory.exhaustion_clear_bars = 0
+        memory.exhaustion_reason_codes = ()
+
+    def _build_stock_context(
+        self,
+        evidence: EvidenceSnapshot,
+        memory: _StateMemory,
+        *,
+        selected_state: AuctionStateName,
+        flags: Mapping[str, Any],
+    ) -> StockContext:
+        if selected_state is AuctionStateName.REVERSAL:
+            name = StockContextName.REVERSAL
+        elif selected_state is AuctionStateName.TREND_FAILURE:
+            name = StockContextName.TREND_FAILURE
+        elif memory.exhaustion_active or selected_state is AuctionStateName.MATURE_EXTENSION:
+            name = StockContextName.MATURE_EXTENSION
+        elif bool(flags["fresh_expansion_confirmed"]):
+            name = StockContextName.EARLY_EXPANSION
+        elif bool(flags["rotational_context"]):
+            name = StockContextName.ROTATIONAL
+        elif bool(flags["compression_ready"]):
+            name = StockContextName.COMPRESSION
+        elif bool(flags["balanced_non_directional"]):
+            name = StockContextName.BALANCED
+        elif memory.established_trend_side in (DirectionalBias.UP, DirectionalBias.DOWN):
+            name = StockContextName.DIRECTIONAL
+        else:
+            name = StockContextName.UNKNOWN
+
+        reasons = [f"STOCK_CONTEXT_{name.value}"]
+        if bool(flags["balanced_non_directional"]):
+            reasons.append("BALANCED_NON_DIRECTIONAL_CONFIRMED")
+        if bool(flags["rotational_context"]):
+            reasons.append("ROTATIONAL_CONTEXT_CONFIRMED")
+        if bool(flags["fresh_expansion_confirmed"]):
+            reasons.append("PRICE_LED_FRESH_EXPANSION_CONFIRMED")
+        if memory.exhaustion_active:
+            reasons.append("EXHAUSTION_CONTEXT_ACTIVE")
+
+        expires_at = None
+        if memory.exhaustion_active and memory.exhaustion_started_at is not None:
+            expires_at = memory.exhaustion_started_at + timedelta(
+                minutes=(
+                    self.cfg.exhaustion_context_max_bars
+                    * self.config.engine.snapshot_interval_minutes
+                )
+            )
+
+        directional_bias = memory.established_trend_side
+        if directional_bias not in (DirectionalBias.UP, DirectionalBias.DOWN):
+            directional_bias = _direction_from_text(evidence.trend.direction.value)
+
+        return StockContext(
+            symbol=evidence.symbol,
+            snapshot_time=evidence.snapshot_time,
+            name=name,
+            directional_bias=directional_bias,
+            balanced_non_directional=bool(flags["balanced_non_directional"]),
+            compression_active=bool(flags["compression_ready"]),
+            rotational=bool(flags["rotational_context"]),
+            fresh_expansion_confirmed=bool(flags["fresh_expansion_confirmed"]),
+            directional_efficiency=evidence.trend.directional_efficiency,
+            overlap_ratio=evidence.price_action.overlap_ratio,
+            ema_context=evidence.trend.ema_context,
+            ema_spread_atr=evidence.trend.ema_slow_ref_spread_atr,
+            ema_spread_change_atr_per_bar=evidence.trend.ema_spread_change_atr_per_bar,
+            hma_context=evidence.trend.hma_order,
+            hma_spread_atr=evidence.trend.hma_spread_atr,
+            atr_state=evidence.compression.atr_state,
+            atr_contraction_ratio=evidence.compression.atr_contraction_ratio,
+            exhaustion_active=memory.exhaustion_active,
+            exhausted_side=memory.exhaustion_side,
+            exhaustion_started_at=memory.exhaustion_started_at,
+            exhaustion_expires_at=expires_at,
+            reason_codes=_unique(reasons),
+            diagnostics={
+                "slow_ema_slope_atr_per_bar": evidence.trend.ema_slow_slope_atr_per_bar,
+                "ref_ema_slope_atr_per_bar": evidence.trend.ema_ref_slope_atr_per_bar,
+                "local_flip_counts": dict(flags["local_flip_counts"]),
+                "independent_flip_channels": int(flags["independent_flip_channels"]),
+                "balanced_observed": bool(flags["balanced_observed"]),
+                "balance_confirmation_bars": int(flags["stock_context_balance_bars"]),
+                "current_leg_distance_atr": flags["current_leg_distance_atr"],
+                "current_leg_current_distance_atr": flags["current_leg_current_distance_atr"],
+            },
+            config_version=self.version,
+        )
 
     def _update_trend_candidate(
         self,
@@ -2008,6 +2310,12 @@ class AuctionStateEngine:
             "trend_failure_age_bars": memory.trend_failure_age_bars,
             "trend_failure_expired": memory.trend_failure_expired,
             "reversal_confirmation_bars": memory.reversal_confirmation_bars,
+            "stock_context_balance_bars": memory.stock_context_balance_bars,
+            "exhaustion_context_active": memory.exhaustion_active,
+            "exhausted_side": memory.exhaustion_side.value,
+            "exhaustion_started_at": _iso(memory.exhaustion_started_at),
+            "exhaustion_age_bars": memory.exhaustion_age_bars,
+            "exhaustion_reason_codes": list(memory.exhaustion_reason_codes),
             "leg_anchor_price": memory.leg_anchor_price,
             "leg_extreme_price": memory.leg_extreme_price,
             "leg_age_bars": memory.leg_age_bars,

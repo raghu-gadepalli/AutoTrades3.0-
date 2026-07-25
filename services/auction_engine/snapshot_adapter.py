@@ -25,6 +25,7 @@ from schemas.snapshot import (
     FrozenRangeProjection,
     OpportunityProjection,
     SnapshotSchema,
+    StockContextProjection,
 )
 from services.auction_engine.engine import AuctionEngine
 
@@ -57,6 +58,7 @@ def empty_auction_block() -> AuctionSnapshotBlock:
         continuity_mode="COLD_START",
         previous_snapshot_time=None,
         state=None,
+        stock_context=None,
         boundary=None,
         candidates=[],
         opportunities=[],
@@ -112,6 +114,7 @@ def enrich_snapshot_with_auction(
     )
 
     state = _state_projection(result.auction_state)
+    stock_context = _stock_context_projection(result.stock_context)
     boundary = (
         _boundary_projection(result.boundary_episode)
         if result.boundary_episode is not None
@@ -129,6 +132,7 @@ def enrich_snapshot_with_auction(
         and previous_snapshot.snapshot_time.date() == snapshot_time.date()
         else None,
         state=state,
+        stock_context=stock_context,
         boundary=boundary,
         candidates=candidates,
         opportunities=opportunities,
@@ -155,6 +159,7 @@ def enrich_snapshot_with_auction(
         continuity_mode=continuity_mode,
         previous_snapshot_time=previous_time,
         state=state,
+        stock_context=stock_context,
         boundary=boundary,
         candidates=candidates,
         opportunities=opportunities,
@@ -174,6 +179,31 @@ def _state_projection(state) -> AuctionStateProjection:
         entered_at=state.entered_at,
         expires_at=state.expires_at,
         reason_codes=list(state.reason_codes),
+    )
+
+
+def _stock_context_projection(context) -> StockContextProjection:
+    return StockContextProjection(
+        name=context.name.value,
+        directional_bias=context.directional_bias.value,
+        balanced_non_directional=context.balanced_non_directional,
+        compression_active=context.compression_active,
+        rotational=context.rotational,
+        fresh_expansion_confirmed=context.fresh_expansion_confirmed,
+        directional_efficiency=context.directional_efficiency,
+        overlap_ratio=context.overlap_ratio,
+        ema_context=context.ema_context,
+        ema_spread_atr=context.ema_spread_atr,
+        ema_spread_change_atr_per_bar=context.ema_spread_change_atr_per_bar,
+        hma_context=context.hma_context,
+        hma_spread_atr=context.hma_spread_atr,
+        atr_state=context.atr_state,
+        atr_contraction_ratio=context.atr_contraction_ratio,
+        exhaustion_active=context.exhaustion_active,
+        exhausted_side=context.exhausted_side.value,
+        exhaustion_started_at=context.exhaustion_started_at,
+        exhaustion_expires_at=context.exhaustion_expires_at,
+        reason_codes=list(context.reason_codes),
     )
 
 
@@ -257,6 +287,8 @@ def _candidate_projection(candidate) -> CandidateProjection:
         source_boundary_price=candidate.source_boundary_price,
         source_frozen_range_id=candidate.source_frozen_range_id,
         source_frozen_range_version=candidate.source_frozen_range_version,
+        source_frozen_range_low=candidate.source_frozen_range_low,
+        source_frozen_range_high=candidate.source_frozen_range_high,
         terminal=candidate.terminal,
         consumed=candidate.consumed,
         superseded=candidate.superseded,
@@ -307,6 +339,8 @@ def _decision_projection(result) -> AuctionDecisionProjection:
         ),
         valid_until=local.valid_until,
         reason_codes=list(local.reason_codes),
+        manager_reason_codes=list(manager.reason_codes),
+        manager_diagnostics=dict(manager.diagnostics),
     )
 
 
@@ -314,6 +348,7 @@ def _build_changes(
     previous: Optional[AuctionSnapshotBlock],
     *,
     state: AuctionStateProjection,
+    stock_context: StockContextProjection,
     boundary: Optional[BoundaryProjection],
     candidates: list[CandidateProjection],
     opportunities: list[OpportunityProjection],
@@ -334,6 +369,27 @@ def _build_changes(
             from_=previous.state.current,
             to=state.current,
         ))
+
+    previous_context = previous.stock_context if previous is not None else None
+    if previous_context is None:
+        changes.append(AuctionChange(
+            type="STOCK_CONTEXT_INITIALIZED",
+            entity_key="STOCK_CONTEXT",
+            from_=None,
+            to=stock_context.name,
+        ))
+    elif (
+        previous_context.name != stock_context.name
+        or previous_context.exhaustion_active != stock_context.exhaustion_active
+        or previous_context.exhausted_side != stock_context.exhausted_side
+    ):
+        changes.append(AuctionChange(
+            type="STOCK_CONTEXT_CHANGED",
+            entity_key="STOCK_CONTEXT",
+            from_=previous_context.name,
+            to=stock_context.name,
+        ))
+
 
     previous_boundary = previous.boundary if previous is not None else None
     if boundary is not None:

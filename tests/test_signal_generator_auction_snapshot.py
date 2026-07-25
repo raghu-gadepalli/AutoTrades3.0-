@@ -15,6 +15,7 @@ from schemas.snapshot import (
     CandidateProjection,
     OpportunityProjection,
     SnapshotSchema,
+    StockContextProjection,
 )
 from services.signals.signal_generator import SignalAssembler
 from services.trade.monitor.signal_contract import AuctionTradeSignalContext
@@ -35,6 +36,31 @@ def _state(current: str = "ORDERLY_DOWNTREND") -> AuctionStateProjection:
         "entered_at": TS,
         "expires_at": None,
         "reason_codes": ["TEST_STATE"],
+    })
+
+
+def _stock_context() -> StockContextProjection:
+    return StockContextProjection.model_validate({
+        "name": "DIRECTIONAL",
+        "directional_bias": "DOWN",
+        "balanced_non_directional": False,
+        "compression_active": False,
+        "rotational": False,
+        "fresh_expansion_confirmed": True,
+        "directional_efficiency": 0.75,
+        "overlap_ratio": 0.20,
+        "ema_context": "DIVERGING_DOWN",
+        "ema_spread_atr": 0.50,
+        "ema_spread_change_atr_per_bar": 0.05,
+        "hma_context": "DOWNTREND",
+        "hma_spread_atr": 0.40,
+        "atr_state": "EXPANDING",
+        "atr_contraction_ratio": 1.10,
+        "exhaustion_active": False,
+        "exhausted_side": "UNKNOWN",
+        "exhaustion_started_at": None,
+        "exhaustion_expires_at": None,
+        "reason_codes": ["TEST_DIRECTIONAL_CONTEXT"],
     })
 
 
@@ -145,6 +171,7 @@ def _snapshot(
         "continuity_mode": "INCREMENTAL_PREVIOUS_SNAPSHOT",
         "previous_snapshot_time": TS,
         "state": _state(auction_state).model_dump(mode="python"),
+        "stock_context": _stock_context().model_dump(mode="python"),
         "boundary": None,
         "candidates": [x.model_dump(mode="python") for x in candidates],
         "opportunities": [x.model_dump(mode="python") for x in opportunities],
@@ -162,6 +189,7 @@ def _snapshot(
         ltp=ltp,
         ltp_time=None,
         gen_signals=True,
+        indicators=SimpleNamespace(atr=SimpleNamespace(value=10.0)),
         structure=SimpleNamespace(raw=SimpleNamespace(side=raw_side)),
         auction=auction,
     )

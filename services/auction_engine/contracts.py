@@ -95,6 +95,25 @@ class AuctionStateName(StringEnum):
     CHAOTIC_ROTATION = "CHAOTIC_ROTATION"
 
 
+class StockContextName(StringEnum):
+    UNKNOWN = "UNKNOWN"
+    BALANCED = "BALANCED"
+    COMPRESSION = "COMPRESSION"
+    ROTATIONAL = "ROTATIONAL"
+    EARLY_EXPANSION = "EARLY_EXPANSION"
+    DIRECTIONAL = "DIRECTIONAL"
+    MATURE_EXTENSION = "MATURE_EXTENSION"
+    TREND_FAILURE = "TREND_FAILURE"
+    REVERSAL = "REVERSAL"
+
+
+class AdvisorAction(StringEnum):
+    NO_ACTION = "NO_ACTION"
+    ALLOW = "ALLOW"
+    WATCH = "WATCH"
+    BLOCK = "BLOCK"
+
+
 class BoundaryEpisodeStatus(StringEnum):
     APPROACHING = "APPROACHING"
     OUTSIDE_ATTEMPT = "OUTSIDE_ATTEMPT"
@@ -372,6 +391,13 @@ class TrendEvidence(ContractModel):
     hma_order: str = "UNKNOWN"
     hma_spread_atr: Optional[float] = None
     hma_change: DirectionalBias = DirectionalBias.UNKNOWN
+    ema_slow: Optional[float] = Field(default=None, gt=0.0)
+    ema_ref: Optional[float] = Field(default=None, gt=0.0)
+    ema_slow_ref_spread_atr: Optional[float] = Field(default=None, ge=0.0)
+    ema_slow_slope_atr_per_bar: Optional[float] = None
+    ema_ref_slope_atr_per_bar: Optional[float] = None
+    ema_spread_change_atr_per_bar: Optional[float] = None
+    ema_context: str = "UNKNOWN"
     retained_structure: Optional[bool] = None
     supporting_facts: Tuple[EvidenceFact, ...] = ()
     contradicting_facts: Tuple[EvidenceFact, ...] = ()
@@ -386,6 +412,8 @@ class CompressionEvidence(ContractModel):
     range_width_atr: Optional[float] = Field(default=None, ge=0.0)
     contraction_ratio: Optional[float] = Field(default=None, ge=0.0)
     hma_convergence: Optional[float] = Field(default=None, ge=0.0)
+    atr_contraction_ratio: Optional[float] = Field(default=None, ge=0.0)
+    atr_state: str = "UNKNOWN"
     frozen_box_id: Optional[str] = None
     reason_codes: Tuple[str, ...] = ()
     quality: SourceQuality = Field(default_factory=SourceQuality)
@@ -788,6 +816,74 @@ class SetupCandidate(ContractModel):
         return self
 
 
+class StockContext(ContractModel):
+    symbol: str = Field(min_length=1)
+    snapshot_time: datetime
+    name: StockContextName
+    directional_bias: DirectionalBias = DirectionalBias.UNKNOWN
+    balanced_non_directional: bool = False
+    compression_active: bool = False
+    rotational: bool = False
+    fresh_expansion_confirmed: bool = False
+    directional_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    overlap_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    ema_context: str = "UNKNOWN"
+    ema_spread_atr: Optional[float] = Field(default=None, ge=0.0)
+    ema_spread_change_atr_per_bar: Optional[float] = None
+    hma_context: str = "UNKNOWN"
+    hma_spread_atr: Optional[float] = Field(default=None, ge=0.0)
+    atr_state: str = "UNKNOWN"
+    atr_contraction_ratio: Optional[float] = Field(default=None, ge=0.0)
+    exhaustion_active: bool = False
+    exhausted_side: DirectionalBias = DirectionalBias.UNKNOWN
+    exhaustion_started_at: Optional[datetime] = None
+    exhaustion_expires_at: Optional[datetime] = None
+    reason_codes: Tuple[str, ...] = ()
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    config_version: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_stock_context(self) -> "StockContext":
+        if self.exhaustion_active:
+            if self.exhausted_side not in (DirectionalBias.UP, DirectionalBias.DOWN):
+                raise ValueError("Active exhaustion context requires UP or DOWN exhausted_side")
+            if self.exhaustion_started_at is None:
+                raise ValueError("Active exhaustion context requires exhaustion_started_at")
+        return self
+
+
+class AdvisorDecision(ContractModel):
+    symbol: str = Field(min_length=1)
+    snapshot_time: datetime
+    mode: str = Field(min_length=1)
+    action: AdvisorAction
+    effective_action: AdvisorAction
+    selected_candidate_id: Optional[str] = None
+    reason_codes: Tuple[str, ...] = ()
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    config_version: str = Field(min_length=1)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalise_mode(cls, value: Any) -> str:
+        mode = str(value or "").strip().upper()
+        if mode not in {"SHADOW", "ENFORCE"}:
+            raise ValueError("AdvisorDecision.mode must be SHADOW or ENFORCE")
+        return mode
+
+    @model_validator(mode="after")
+    def _validate_advisor(self) -> "AdvisorDecision":
+        if self.action in {AdvisorAction.ALLOW, AdvisorAction.WATCH, AdvisorAction.BLOCK}:
+            if not self.selected_candidate_id:
+                raise ValueError("Advisor decision requires selected_candidate_id")
+        if self.mode == "SHADOW" and self.action in {AdvisorAction.WATCH, AdvisorAction.BLOCK}:
+            if self.effective_action is not AdvisorAction.ALLOW:
+                raise ValueError("SHADOW WATCH/BLOCK must preserve effective ALLOW")
+        if self.mode == "ENFORCE" and self.effective_action is not self.action:
+            raise ValueError("ENFORCE effective_action must equal action")
+        return self
+
+
 class ManagerDecision(ContractModel):
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
@@ -881,6 +977,7 @@ class AuctionEngineResult(ContractModel):
     auction_state: AuctionState
     boundary_episode: Optional[BoundaryEpisode] = None
     candidates: Tuple[SetupCandidate, ...] = ()
+    stock_context: StockContext
     manager_decision: ManagerDecision
     local_decision: LocalDecision
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
@@ -890,6 +987,7 @@ class AuctionEngineResult(ContractModel):
         objects = (
             self.evidence,
             self.auction_state,
+            self.stock_context,
             self.manager_decision,
             self.local_decision,
         )
@@ -985,7 +1083,8 @@ def _normalise_key_part(value: Any) -> str:
 
 __all__ = [
     "TradeSide", "BoundarySide", "DirectionalBias", "QualityStatus",
-    "EvidencePolarity", "AuctionStateName", "BoundaryEpisodeStatus",
+    "EvidencePolarity", "AuctionStateName", "StockContextName", "AdvisorAction",
+    "BoundaryEpisodeStatus",
     "BoundaryResolution", "SetupFamily", "CandidateEligibility", "CandidateRole",
     "ContextAlignment", "ManagerAction", "LocalDecisionAction",
     "ContractModel", "Reason", "SourceQuality", "EvidenceFact", "ConfidenceChannel",
@@ -993,6 +1092,7 @@ __all__ = [
     "CompressionEvidence", "ExtensionEvidence", "OpportunityEvidence",
     "MarketContextEvidence", "DerivativesContextEvidence", "EvidenceSnapshot",
     "AuctionState", "FrozenRange", "BoundaryEpisode", "SetupCandidate",
-    "ManagerDecision", "LocalDecision", "StoredStateEnvelope", "AuctionEngineResult", "RunManifest",
+    "StockContext", "AdvisorDecision", "ManagerDecision", "LocalDecision",
+    "StoredStateEnvelope", "AuctionEngineResult", "RunManifest",
     "OutcomeMetrics", "stable_key",
 ]

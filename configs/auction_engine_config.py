@@ -32,8 +32,8 @@ class AuctionEngineRuntimeConfig(BaseModel):
     strict_evaluation: bool = True
 
     engine_name: str = "AUCTION_STATE_SIGNAL_ENGINE"
-    engine_version: str = "0.6.0"
-    config_version: str = "AUCTION_ENGINE_STRICT_LOCAL_V3_REVERSAL"
+    engine_version: str = "0.7.0"
+    config_version: str = "AUCTION_ENGINE_STRICT_LOCAL_V5_STOCK_CONTEXT"
 
     timezone: str = "Asia/Kolkata"
     snapshot_interval_minutes: float = Field(default=3.0, gt=0.0)
@@ -144,6 +144,8 @@ class AuctionEvidenceConfig(BaseModel):
     # remain an early-history fallback and a diagnostic only.
     rolling_efficiency_bars: int = Field(default=8, ge=4)
     rolling_overlap_bars: int = Field(default=6, ge=3)
+    ema_slow_context_lookback_bars: int = Field(default=5, ge=2)
+    atr_context_lookback_bars: int = Field(default=5, ge=2)
     compression_recent_bars: int = Field(default=5, ge=3)
     compression_reference_bars: int = Field(default=12, ge=5)
     compression_contraction_ratio_max: float = Field(default=0.80, gt=0.0, le=1.0)
@@ -237,6 +239,26 @@ class AuctionStatePolicyConfig(BaseModel):
     chaotic_independent_channels_min: int = Field(default=2, ge=1, le=3)
     chaotic_bar_direction_flips_min: int = Field(default=4, ge=1)
     use_cumulative_day_flip_counts_for_state: bool = False
+
+    # Slow context is descriptive, never a standalone signal trigger.  EMA100
+    # and EMA200 are deliberately lagging; their compression/expansion is used
+    # only with price containment, efficiency and HMA context.
+    slow_ema_close_spread_atr_max: float = Field(default=0.75, ge=0.0)
+    slow_ema_flat_slope_atr_per_bar_max: float = Field(default=0.04, ge=0.0)
+    slow_ema_spread_expansion_atr_per_bar_min: float = Field(default=0.01, ge=0.0)
+    atr_contraction_ratio_max: float = Field(default=0.90, gt=0.0)
+    atr_expansion_ratio_min: float = Field(default=1.10, gt=0.0)
+    stock_context_directional_efficiency_min: float = Field(default=0.45, ge=0.0, le=1.0)
+    stock_context_balance_confirmation_bars: int = Field(default=2, ge=1)
+    stock_context_early_expansion_displacement_atr: float = Field(default=0.35, ge=0.0)
+
+    # Exhaustion is persistent market context independent of whether an
+    # EXHAUSTION_REVERSAL candidate has enough VWAP room to become a trade.
+    exhaustion_context_enabled: bool = True
+    exhaustion_context_min_extension_atr: float = Field(default=1.50, ge=0.0)
+    exhaustion_context_progress_decay_min: float = Field(default=0.35, ge=0.0, le=1.0)
+    exhaustion_context_max_bars: int = Field(default=6, ge=1)
+    exhaustion_context_clear_confirmation_bars: int = Field(default=2, ge=1)
 
     chaotic_rotation_blocks_create: bool = True
     mature_extension_blocks_late_breakout: bool = True
@@ -510,6 +532,7 @@ class AuctionDecisionPolicyConfig(BaseModel):
     rotation_lookback_minutes: float = Field(default=90.0, gt=0.0)
     rotation_side_switches_to_defer: int = Field(default=2, ge=1)
     unresolved_watch_opposition_enabled: bool = True
+
 
 
 class AuctionDiagnosticsConfig(BaseModel):

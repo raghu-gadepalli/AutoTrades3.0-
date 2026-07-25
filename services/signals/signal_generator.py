@@ -2,8 +2,9 @@
 """Auction-driven signal persistence and lifecycle translation.
 
 The snapshot pipeline has already completed Structure and Auction evaluation.
-This module deliberately does not run a secondary setup or signal-decision engine.
-It translates the validated Auction result
+This module does not run a secondary setup engine. It applies the independent
+StockAdvisor deployment policy at signal-evaluation time, then translates the
+validated Auction result
 into the existing signal table, including operational lifecycle stage/status.
 
 Rules
@@ -47,6 +48,8 @@ from schemas.snapshot import (
 )
 from schemas.symbol import SymbolSchema
 from services.audit.auditlog import write_auditlog
+from services.auction_engine.contracts import AdvisorAction, AdvisorDecision
+from services.signals.stock_advisor import StockAdvisor
 from services.signals.signal_metrics import calculate_signal_metrics
 from utils.json_utils import sanitize_json
 
@@ -120,6 +123,7 @@ class AuctionSignalInstruction:
     auction_state: str
     reason_codes: Tuple[str, ...]
     decision: AuctionDecisionProjection
+    advisor_decision: AdvisorDecision
     active_identity: Optional[AuctionSignalIdentity]
     current_opportunity: Optional[OpportunityProjection]
     current_candidate: Optional[CandidateProjection]
@@ -244,10 +248,12 @@ class SignalAssembler:
         *,
         fetcher: Optional[SignalFetcher] = None,
         persister: Optional[SignalPersister] = None,
+        advisor: Optional[StockAdvisor] = None,
     ) -> None:
         self.lifecycle = DEFAULT_LIFECYCLE
         self.fetcher = fetcher or SignalFetcher()
         self.persister = persister or SignalPersister()
+        self.advisor = advisor or StockAdvisor()
 
     def assemble(self, snapshot: SnapshotSchema) -> List[Tuple[str, SignalSchema]]:
         if not isinstance(snapshot, SnapshotSchema):
@@ -284,7 +290,12 @@ class SignalAssembler:
 
         equity_ref = str(symbol_row.equity_ref or symbol).strip().upper()
         existing_signal = self.fetcher.fetch_active_signal(equity_ref, self.lifecycle)
-        instruction = _build_instruction(snapshot, existing_signal)
+        instruction = _build_instruction(
+            snapshot,
+            existing_signal,
+            self.advisor,
+        )
+        self._audit_advisor(snapshot, existing_signal, instruction)
 
         if instruction.persistence_action == "NO_ACTION":
             logger.info(
@@ -435,6 +446,66 @@ class SignalAssembler:
         )
         return [(event_action, persisted)]
 
+    def _audit_advisor(
+        self,
+        snapshot: SnapshotSchema,
+        existing_signal: Optional[SignalSchema],
+        instruction: AuctionSignalInstruction,
+    ) -> None:
+        """Persist the signal-time Advisor decision independently of signal rows.
+
+        This audit is emitted for ALLOW/WATCH/BLOCK selected-candidate decisions,
+        including enforced decisions that suppress signal creation. Existing signal
+        lifecycle is not changed by the Advisor decision.
+        """
+        advisor = instruction.advisor_decision
+        if advisor.action is AdvisorAction.NO_ACTION:
+            return
+        try:
+            reason_code = (
+                advisor.reason_codes[0]
+                if advisor.reason_codes
+                else "STOCK_ADVISOR_DECISION"
+            )
+            write_auditlog(
+                entity_type="STOCK_ADVISOR",
+                entity_id=advisor.selected_candidate_id,
+                symbol=snapshot.symbol,
+                evaluation_stage="SIGNAL_GENERATOR_ADVISOR",
+                previous_state=None,
+                new_state=advisor.action.value,
+                action=advisor.effective_action.value,
+                reason_code=reason_code,
+                reason_text=" | ".join(advisor.reason_codes),
+                confidence=None,
+                ts=snapshot.snapshot_time,
+                payload_json={
+                    "snapshot_time": snapshot.snapshot_time,
+                    "close": snapshot.close,
+                    "advisor": _advisor_context_json(advisor),
+                    "stock_context": _stock_context_json(snapshot),
+                    "snapshot_auction_action": (
+                        snapshot.auction.decision.action
+                        if snapshot.auction.decision is not None
+                        else None
+                    ),
+                    "resolved_signal_auction_action": instruction.auction_action,
+                    "existing_signal_id": (
+                        existing_signal.signal_id
+                        if existing_signal is not None
+                        else None
+                    ),
+                    "deployment_applied": existing_signal is None,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "StockAdvisor audit write failed | symbol=%s candidate=%s snapshot_time=%s",
+                snapshot.symbol,
+                advisor.selected_candidate_id,
+                snapshot.snapshot_time,
+            )
+
     def _audit(
         self,
         *,
@@ -477,6 +548,10 @@ class SignalAssembler:
                     "ltp": snapshot.ltp,
                     "auction_action": instruction.auction_action,
                     "auction_state": instruction.auction_state,
+                    "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
+                    "advisor_mode": instruction.advisor_decision.mode,
+                    "advisor": _advisor_context_json(instruction.advisor_decision),
+                    "stock_context": _stock_context_json(snapshot),
                     "active_opportunity_key": (
                         instruction.active_identity.opportunity_key
                         if instruction.active_identity is not None
@@ -529,16 +604,35 @@ class SignalGenerator:
 def _build_instruction(
     snapshot: SnapshotSchema,
     existing_signal: Optional[SignalSchema],
+    advisor_service: StockAdvisor,
 ) -> AuctionSignalInstruction:
     decision = snapshot.auction.decision
     state = snapshot.auction.state
     if decision is None or state is None:
         raise ValueError("Auction decision/state missing")
 
-    action = decision.action.strip().upper()
+    structural_action = decision.action.strip().upper()
+    if existing_signal is None and structural_action == "LOCAL_CONFIRMED":
+        advisor = advisor_service.evaluate(snapshot)
+    else:
+        advisor = advisor_service.not_applied(
+            snapshot,
+            "ADVISOR_NOT_APPLIED_EXISTING_SIGNAL"
+            if existing_signal is not None
+            else "ADVISOR_NO_NEW_DEPLOYMENT",
+        )
+    action, advisor_override_reasons = _advisor_adjusted_auction_action(
+        snapshot=snapshot,
+        existing_signal=existing_signal,
+        advisor=advisor,
+    )
     if action not in _ALLOWED_AUCTION_ACTIONS:
         raise ValueError(f"Unsupported Auction action for signal processing: {action}")
 
+    instruction_reasons = tuple(dict.fromkeys((
+        *tuple(decision.reason_codes),
+        *advisor_override_reasons,
+    )))
     active_identity = _signal_identity(existing_signal) if existing_signal is not None else None
 
     if action == "LOCAL_CONFIRMED":
@@ -566,8 +660,9 @@ def _build_instruction(
             ),
             auction_action=action,
             auction_state=state.current,
-            reason_codes=tuple(decision.reason_codes),
+            reason_codes=instruction_reasons,
             decision=decision,
+            advisor_decision=advisor,
             active_identity=active_identity,
             current_opportunity=opportunity,
             current_candidate=candidate,
@@ -607,8 +702,9 @@ def _build_instruction(
         ),
         auction_action=action,
         auction_state=state.current,
-        reason_codes=tuple(decision.reason_codes),
+        reason_codes=instruction_reasons,
         decision=decision,
+        advisor_decision=advisor,
         active_identity=active_identity,
         current_opportunity=current_opportunity,
         current_candidate=current_candidate,
@@ -618,6 +714,49 @@ def _build_instruction(
     )
 
 
+
+def _advisor_adjusted_auction_action(
+    *,
+    snapshot: SnapshotSchema,
+    existing_signal: Optional[SignalSchema],
+    advisor: AdvisorDecision,
+) -> Tuple[str, Tuple[str, ...]]:
+    """Apply StockAdvisor only to new signal deployment.
+
+    Auction's stored local decision remains the authoritative structural result.
+    Existing signal lifecycle, including opposite-signal replacement, is never
+    reversed or downgraded merely because Advisor would not deploy a new trade.
+    """
+    decision = snapshot.auction.decision
+    if decision is None:
+        raise ValueError("Auction decision missing")
+    structural_action = decision.action.strip().upper()
+
+    if existing_signal is not None or structural_action != "LOCAL_CONFIRMED":
+        return structural_action, ()
+
+    if advisor.selected_candidate_id != decision.selected_candidate_id:
+        raise ValueError(
+            "StockAdvisor selected candidate does not match Auction decision: "
+            f"advisor={advisor.selected_candidate_id} auction={decision.selected_candidate_id}"
+        )
+
+    if advisor.effective_action is AdvisorAction.BLOCK:
+        return "LOCAL_BLOCKED", (
+            "SIGNAL_DEPLOYMENT_BLOCKED_BY_STOCK_ADVISOR",
+            *tuple(advisor.reason_codes),
+        )
+    if advisor.effective_action is AdvisorAction.WATCH:
+        return "LOCAL_WATCH", (
+            "SIGNAL_DEPLOYMENT_WATCHED_BY_STOCK_ADVISOR",
+            *tuple(advisor.reason_codes),
+        )
+    if advisor.effective_action is AdvisorAction.ALLOW:
+        return structural_action, tuple(advisor.reason_codes)
+    raise ValueError(
+        "LOCAL_CONFIRMED requires Advisor ALLOW/WATCH/BLOCK: "
+        f"{advisor.effective_action.value}"
+    )
 
 def _resolve_signal_lifecycle(
     *,
@@ -1187,6 +1326,7 @@ def _as_update_instruction(
         auction_state=instruction.auction_state,
         reason_codes=instruction.reason_codes,
         decision=instruction.decision,
+        advisor_decision=instruction.advisor_decision,
         active_identity=active_identity,
         current_opportunity=instruction.current_opportunity,
         current_candidate=instruction.current_candidate,
@@ -1211,6 +1351,10 @@ def _criteria_json(
         "snapshot_time": snapshot.snapshot_time,
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
+        "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
+        "advisor_mode": instruction.advisor_decision.mode,
+        "advisor": _advisor_context_json(instruction.advisor_decision),
+        "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
         "signal_stage": instruction.lifecycle.stage.value,
         "signal_status": instruction.lifecycle.status.value,
@@ -1804,6 +1948,10 @@ def _latest_auction_evaluation(
         "snapshot_time": snapshot.snapshot_time,
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
+        "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
+        "advisor_mode": instruction.advisor_decision.mode,
+        "advisor": _advisor_context_json(instruction.advisor_decision),
+        "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
         "signal_stage": instruction.lifecycle.stage.value,
         "signal_status": instruction.lifecycle.status.value,
@@ -1855,6 +2003,10 @@ def _posture_history_record(
         "snapshot_time": snapshot.snapshot_time,
         "auction_action": instruction.auction_action,
         "auction_state": instruction.auction_state,
+        "snapshot_auction_action": snapshot.auction.decision.action if snapshot.auction.decision is not None else None,
+        "advisor_mode": instruction.advisor_decision.mode,
+        "advisor": _advisor_context_json(instruction.advisor_decision),
+        "stock_context": _stock_context_json(snapshot),
         "signal_action": instruction.lifecycle.signal_action,
         "signal_stage": instruction.lifecycle.stage.value,
         "signal_status": instruction.lifecycle.status.value,
@@ -1916,6 +2068,46 @@ def _current_eligibility(instruction: AuctionSignalInstruction) -> Optional[str]
     if instruction.current_opportunity is not None:
         return instruction.current_opportunity.primary_eligibility
     return None
+
+
+def _advisor_context_json(advisor: AdvisorDecision) -> Dict[str, Any]:
+    return {
+        "mode": advisor.mode,
+        "action": advisor.action.value,
+        "effective_action": advisor.effective_action.value,
+        "selected_candidate_id": advisor.selected_candidate_id,
+        "reason_codes": list(advisor.reason_codes),
+        "diagnostics": dict(advisor.diagnostics),
+        "config_version": advisor.config_version,
+    }
+
+
+def _stock_context_json(snapshot: SnapshotSchema) -> Optional[Dict[str, Any]]:
+    context = snapshot.auction.stock_context
+    if context is None:
+        return None
+    return {
+        "name": context.name,
+        "directional_bias": context.directional_bias,
+        "balanced_non_directional": context.balanced_non_directional,
+        "compression_active": context.compression_active,
+        "rotational": context.rotational,
+        "fresh_expansion_confirmed": context.fresh_expansion_confirmed,
+        "directional_efficiency": context.directional_efficiency,
+        "overlap_ratio": context.overlap_ratio,
+        "ema_context": context.ema_context,
+        "ema_spread_atr": context.ema_spread_atr,
+        "ema_spread_change_atr_per_bar": context.ema_spread_change_atr_per_bar,
+        "hma_context": context.hma_context,
+        "hma_spread_atr": context.hma_spread_atr,
+        "atr_state": context.atr_state,
+        "atr_contraction_ratio": context.atr_contraction_ratio,
+        "exhaustion_active": context.exhaustion_active,
+        "exhausted_side": context.exhausted_side,
+        "exhaustion_started_at": context.exhaustion_started_at,
+        "exhaustion_expires_at": context.exhaustion_expires_at,
+        "reason_codes": list(context.reason_codes),
+    }
 
 
 # ---------------------------------------------------------------------------

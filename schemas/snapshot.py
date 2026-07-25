@@ -478,6 +478,8 @@ class CandidateProjection(StrictBaseModel):
     source_boundary_price: float
     source_frozen_range_id: str
     source_frozen_range_version: int
+    source_frozen_range_low: Optional[float] = None
+    source_frozen_range_high: Optional[float] = None
     terminal: bool
     consumed: bool
     superseded: bool
@@ -503,6 +505,38 @@ class OpportunityProjection(StrictBaseModel):
     reason_codes: List[str]
 
 
+class StockContextProjection(StrictBaseModel):
+    name: str
+    directional_bias: str
+    balanced_non_directional: bool
+    compression_active: bool
+    rotational: bool
+    fresh_expansion_confirmed: bool
+    directional_efficiency: Optional[float]
+    overlap_ratio: Optional[float]
+    ema_context: str
+    ema_spread_atr: Optional[float]
+    ema_spread_change_atr_per_bar: Optional[float]
+    hma_context: str
+    hma_spread_atr: Optional[float]
+    atr_state: str
+    atr_contraction_ratio: Optional[float]
+    exhaustion_active: bool
+    exhausted_side: str
+    exhaustion_started_at: Optional[datetime]
+    exhaustion_expires_at: Optional[datetime]
+    reason_codes: List[str]
+
+
+class AdvisorDecisionProjection(StrictBaseModel):
+    mode: str
+    action: str
+    effective_action: str
+    selected_candidate_id: Optional[str]
+    reason_codes: List[str]
+    diagnostics: Dict[str, Any]
+
+
 class AuctionDecisionProjection(StrictBaseModel):
     action: str
     manager_action: str
@@ -518,6 +552,8 @@ class AuctionDecisionProjection(StrictBaseModel):
     target_reference_price: Optional[float]
     valid_until: Optional[datetime]
     reason_codes: List[str]
+    manager_reason_codes: List[str] = Field(default_factory=list)
+    manager_diagnostics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AuctionChange(StrictBaseModel):
@@ -532,6 +568,10 @@ class AuctionSnapshotBlock(StrictBaseModel):
     continuity_mode: str
     previous_snapshot_time: Optional[datetime]
     state: Optional[AuctionStateProjection]
+    stock_context: Optional[StockContextProjection] = None
+    # Backward-compatible read only. Advisor is evaluated by SignalGenerator
+    # and is deliberately excluded from newly persisted snapshots.
+    advisor: Optional[AdvisorDecisionProjection] = Field(default=None, exclude=True, repr=False)
     boundary: Optional[BoundaryProjection]
     candidates: List[CandidateProjection]
     opportunities: List[OpportunityProjection]

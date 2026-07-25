@@ -45,6 +45,8 @@ from services.auction_engine.contracts import BarEvidence, SetupCandidate
 class _HistoryTrend:
     hma_order: str
     hma_spread_atr: Optional[float]
+    ema_slow: Optional[float] = None
+    ema_ref: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class _HistoryEvidence:
     close: float
     bar: Any
     trend: _HistoryTrend
+    atr: Optional[float] = None
 
 
 class AuctionEngine:
@@ -210,6 +213,7 @@ class AuctionEngine:
             auction_state=state_evaluation.state,
             boundary_episode=boundary_evaluation.episode,
             candidates=candidates,
+            stock_context=state_evaluation.stock_context,
             manager_decision=manager,
             local_decision=local_decision,
             diagnostics={
@@ -222,6 +226,7 @@ class AuctionEngine:
                 "transitioned": state_evaluation.transitioned,
                 "state_flags": state_evaluation.flags,
                 "state_diagnostics": state_evaluation.diagnostics,
+                "stock_context": state_evaluation.stock_context.to_storage_dict(exclude_none=False),
                 "boundary_transitioned": boundary_evaluation.transitioned,
                 "boundary_previous_status": (
                     boundary_evaluation.previous_status.value
@@ -332,6 +337,7 @@ class AuctionEngine:
                 "close": float(item.close),
                 "bar": to_plain(item.bar),
                 "trend": to_plain(item.trend),
+                "atr": item.atr,
             }
             for item in self._history[key]
         ]
@@ -428,6 +434,11 @@ class AuctionEngine:
                 close=float(item["close"]),
                 bar=BarEvidence.model_validate(item["bar"]),
                 trend=restore_dataclass(_HistoryTrend, item["trend"]),
+                atr=(
+                    float(item["atr"])
+                    if "atr" in item and item["atr"] is not None
+                    else None
+                ),
             )
             for item in decoded["history"]
         ]
@@ -675,7 +686,10 @@ def _compact_history_evidence(evidence: EvidenceSnapshot) -> _HistoryEvidence:
         trend=_HistoryTrend(
             hma_order=evidence.trend.hma_order,
             hma_spread_atr=evidence.trend.hma_spread_atr,
+            ema_slow=evidence.trend.ema_slow,
+            ema_ref=evidence.trend.ema_ref,
         ),
+        atr=evidence.atr,
     )
 
 
