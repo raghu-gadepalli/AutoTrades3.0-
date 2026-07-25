@@ -120,7 +120,29 @@ def enrich_snapshot_with_auction(
         if result.boundary_episode is not None
         else None
     )
-    candidates = [_candidate_projection(item) for item in result.candidates]
+    public_candidates = list(result.candidates)
+    selected_candidate = result.local_decision.selected_candidate
+    if (
+        selected_candidate is not None
+        and all(
+            item.candidate_id != selected_candidate.candidate_id
+            for item in public_candidates
+        )
+    ):
+        # SetupManager may select a still-active candidate carried by the
+        # opportunity ledger rather than a candidate freshly observed on this
+        # snapshot.  The public snapshot decision references that identity, so
+        # include its objective geometry in the candidate projection as well.
+        public_candidates.append(selected_candidate)
+        logger.debug(
+            "auction_snapshot carried selected candidate into public projection | "
+            "symbol=%s snapshot_time=%s candidate_id=%s",
+            symbol,
+            snapshot_time,
+            selected_candidate.candidate_id,
+        )
+
+    candidates = [_candidate_projection(item) for item in public_candidates]
     opportunities = [
         _opportunity_projection(record)
         for record in engine.opportunity_ledger.records(symbol)

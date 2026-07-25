@@ -528,15 +528,6 @@ class StockContextProjection(StrictBaseModel):
     reason_codes: List[str]
 
 
-class AdvisorDecisionProjection(StrictBaseModel):
-    mode: str
-    action: str
-    effective_action: str
-    selected_candidate_id: Optional[str]
-    reason_codes: List[str]
-    diagnostics: Dict[str, Any]
-
-
 class AuctionDecisionProjection(StrictBaseModel):
     action: str
     manager_action: str
@@ -569,9 +560,6 @@ class AuctionSnapshotBlock(StrictBaseModel):
     previous_snapshot_time: Optional[datetime]
     state: Optional[AuctionStateProjection]
     stock_context: Optional[StockContextProjection] = None
-    # Backward-compatible read only. Advisor is evaluated by SignalGenerator
-    # and is deliberately excluded from newly persisted snapshots.
-    advisor: Optional[AdvisorDecisionProjection] = Field(default=None, exclude=True, repr=False)
     boundary: Optional[BoundaryProjection]
     candidates: List[CandidateProjection]
     opportunities: List[OpportunityProjection]

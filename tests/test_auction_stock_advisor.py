@@ -7,7 +7,8 @@ import unittest
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG
 from configs.stock_advisor_config import StockAdvisorPolicyConfig
-from schemas.snapshot import AdvisorDecisionProjection, AuctionSnapshotBlock
+from pydantic import ValidationError
+from schemas.snapshot import AuctionSnapshotBlock
 from services.auction_engine.contracts import (
     AdvisorAction,
     AuctionStateName,
@@ -149,29 +150,46 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.assertEqual("LOCAL_CONFIRMED", action)
         self.assertEqual((), reasons)
 
-    def test_legacy_advisor_projection_is_not_serialized_in_snapshot(self) -> None:
-        block = AuctionSnapshotBlock(
-            status="NOT_RUN",
-            continuity_mode="COLD_START",
-            previous_snapshot_time=None,
-            state=None,
-            stock_context=None,
-            advisor=AdvisorDecisionProjection(
-                mode="SHADOW",
-                action="BLOCK",
-                effective_action="ALLOW",
-                selected_candidate_id="CANDIDATE:SELL",
-                reason_codes=["TEST"],
-                diagnostics={},
-            ),
-            boundary=None,
-            candidates=[],
-            opportunities=[],
-            decision=None,
-            changes=[],
-            error=None,
-        )
-        self.assertNotIn("advisor", block.model_dump(mode="python"))
+    def test_snapshot_contract_rejects_removed_advisor_field(self) -> None:
+        payload = {
+            "status": "NOT_RUN",
+            "continuity_mode": "COLD_START",
+            "previous_snapshot_time": None,
+            "state": None,
+            "stock_context": None,
+            "advisor": {
+                "mode": "SHADOW",
+                "action": "BLOCK",
+                "effective_action": "ALLOW",
+                "selected_candidate_id": "CANDIDATE:SELL",
+                "reason_codes": ["TEST"],
+                "diagnostics": {},
+            },
+            "boundary": None,
+            "candidates": [],
+            "opportunities": [],
+            "decision": None,
+            "changes": [],
+            "error": None,
+        }
+        with self.assertRaises(ValidationError):
+            AuctionSnapshotBlock.model_validate(payload)
+
+    def test_missing_selected_candidate_is_logged_and_fails_open(self) -> None:
+        snapshot = self._snapshot(side="SELL")
+        snapshot.auction.candidates = []
+        with self.assertLogs(
+            "services.signals.stock_advisor",
+            level="ERROR",
+        ) as captured:
+            result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertEqual(AdvisorAction.ALLOW, result.effective_action)
+        self.assertEqual("CANDIDATE:SELL", result.selected_candidate_id)
+        self.assertIn("ADVISOR_INPUT_ERROR_FAIL_OPEN", result.reason_codes)
+        self.assertTrue(result.diagnostics["fail_open"])
+        self.assertIn("candidate_id=CANDIDATE:SELL matches=0", " ".join(captured.output))
 
     def test_exhaustion_context_survives_confirmed_reversal_state(self) -> None:
         engine = AuctionStateEngine(AUCTION_ENGINE_CONFIG)

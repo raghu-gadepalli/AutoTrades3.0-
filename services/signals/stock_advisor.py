@@ -7,6 +7,7 @@ same market history.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 
 from configs.stock_advisor_config import (
@@ -15,6 +16,12 @@ from configs.stock_advisor_config import (
 )
 from schemas.snapshot import CandidateProjection, SnapshotSchema, StockContextProjection
 from services.auction_engine.contracts import AdvisorAction, AdvisorDecision
+
+logger = logging.getLogger(__name__)
+
+
+class _AdvisorInputError(Exception):
+    """Internal validation error converted into a logged fail-open decision."""
 
 
 class StockAdvisor:
@@ -29,9 +36,39 @@ class StockAdvisor:
         self.policy = config
 
     def evaluate(self, snapshot: SnapshotSchema) -> AdvisorDecision:
+        """Evaluate deployment context without allowing Advisor defects to stop a record.
+
+        Advisor is an optional deployment filter layered on top of a valid Auction
+        decision.  Missing or inconsistent Advisor inputs are therefore logged and
+        fail open to the underlying Auction decision.  The snapshot remains
+        processable and the error is visible in logs/audit diagnostics.
+        """
+        try:
+            return self._evaluate_strict(snapshot)
+        except _AdvisorInputError as exc:
+            logger.error(
+                "StockAdvisor input error; failing open | symbol=%s snapshot_time=%s "
+                "selected_candidate_id=%s error=%s",
+                snapshot.symbol,
+                snapshot.snapshot_time,
+                self._decision_candidate_id(snapshot),
+                exc,
+            )
+            return self._fail_open(snapshot, exc, unexpected=False)
+        except Exception as exc:
+            logger.exception(
+                "StockAdvisor evaluation error; failing open | symbol=%s "
+                "snapshot_time=%s selected_candidate_id=%s",
+                snapshot.symbol,
+                snapshot.snapshot_time,
+                self._decision_candidate_id(snapshot),
+            )
+            return self._fail_open(snapshot, exc, unexpected=True)
+
+    def _evaluate_strict(self, snapshot: SnapshotSchema) -> AdvisorDecision:
         decision = snapshot.auction.decision
         if decision is None:
-            raise ValueError("StockAdvisor requires snapshot.auction.decision")
+            raise _AdvisorInputError("snapshot.auction.decision is missing")
 
         if (
             decision.action.strip().upper() != "LOCAL_CONFIRMED"
@@ -41,7 +78,7 @@ class StockAdvisor:
 
         context = snapshot.auction.stock_context
         if context is None:
-            raise ValueError("StockAdvisor requires snapshot.auction.stock_context")
+            raise _AdvisorInputError("snapshot.auction.stock_context is missing")
 
         selected = self._selected_candidate(snapshot, decision.selected_candidate_id)
         if not self.policy.enabled:
@@ -225,11 +262,56 @@ class StockAdvisor:
             if candidate.candidate_id == candidate_id
         ]
         if len(matches) != 1:
-            raise ValueError(
-                "StockAdvisor requires exactly one selected candidate: "
+            raise _AdvisorInputError(
+                "selected candidate projection mismatch: "
                 f"candidate_id={candidate_id} matches={len(matches)}"
             )
         return matches[0]
+
+    @staticmethod
+    def _decision_candidate_id(snapshot: SnapshotSchema) -> Optional[str]:
+        decision = snapshot.auction.decision
+        return decision.selected_candidate_id if decision is not None else None
+
+    def _fail_open(
+        self,
+        snapshot: SnapshotSchema,
+        error: Exception,
+        *,
+        unexpected: bool,
+    ) -> AdvisorDecision:
+        candidate_id = self._decision_candidate_id(snapshot)
+        decision = snapshot.auction.decision
+        if candidate_id is None:
+            return self.not_applied(snapshot, "ADVISOR_ERROR_NO_SELECTED_CANDIDATE")
+
+        error_code = (
+            "ADVISOR_UNEXPECTED_ERROR_FAIL_OPEN"
+            if unexpected
+            else "ADVISOR_INPUT_ERROR_FAIL_OPEN"
+        )
+        return AdvisorDecision(
+            symbol=snapshot.symbol,
+            snapshot_time=snapshot.snapshot_time,
+            mode=self.policy.mode,
+            action=AdvisorAction.ALLOW,
+            effective_action=AdvisorAction.ALLOW,
+            selected_candidate_id=candidate_id,
+            reason_codes=(error_code,),
+            diagnostics={
+                "auction_action": decision.action if decision is not None else "UNKNOWN",
+                "manager_action": (
+                    decision.manager_action if decision is not None else "UNKNOWN"
+                ),
+                "deployment_scope": "NEW_SIGNAL_ONLY",
+                "deployment_applied": False,
+                "fail_open": True,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "time_of_day_gate_applied": False,
+            },
+            config_version=self.policy.config_version,
+        )
 
     def _confirmed_fresh_escape(
         self,
@@ -298,7 +380,7 @@ class StockAdvisor:
             return "UP"
         if side == "SELL":
             return "DOWN"
-        raise ValueError(f"Unsupported Advisor candidate side: {side}")
+        raise _AdvisorInputError(f"Unsupported Advisor candidate side: {side}")
 
 
 __all__ = ["StockAdvisor"]
