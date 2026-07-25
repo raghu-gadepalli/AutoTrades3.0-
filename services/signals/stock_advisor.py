@@ -105,6 +105,8 @@ class StockAdvisor:
             "manager_action": decision.manager_action,
             "manager_reason_codes": list(decision.manager_reason_codes),
             "stock_context": context.name,
+            "background_regime": context.background_regime,
+            "current_auction_state": context.current_auction_state,
             "stock_context_reasons": list(context.reason_codes),
             "candidate_family": selected.family,
             "candidate_subtype": selected.subtype,
@@ -114,25 +116,71 @@ class StockAdvisor:
         }
 
         atr = float(snapshot.indicators.atr.value)
-        entry_percentile = self._entry_percentile(selected)
-        signed_outside_atr = self._signed_outside_atr(selected, atr)
-        diagnostics["entry_percentile_in_source_range"] = entry_percentile
-        diagnostics["signed_outside_source_range_atr"] = signed_outside_atr
+        source_entry_percentile = self._entry_percentile(selected)
+        source_signed_outside_atr = self._signed_outside_atr(selected, atr)
+        diagnostics["entry_percentile_in_source_range"] = source_entry_percentile
+        diagnostics["signed_outside_source_range_atr"] = source_signed_outside_atr
 
+        background_entry_percentile = self._background_entry_percentile(
+            selected,
+            context,
+        )
+        background_signed_outside_atr = self._background_signed_outside_atr(
+            selected,
+            context,
+            atr,
+        )
+        diagnostics["entry_percentile_in_background_range"] = (
+            background_entry_percentile
+        )
+        diagnostics["signed_outside_background_range_atr"] = (
+            background_signed_outside_atr
+        )
+        diagnostics["background_range_id"] = context.background_range_id
+        diagnostics["background_range_low"] = context.background_range_low
+        diagnostics["background_range_high"] = context.background_range_high
+        diagnostics["background_range_classification"] = (
+            context.background_range_classification
+        )
+        diagnostics["background_structure_flip_count"] = (
+            context.background_structure_flip_count
+        )
+
+        exhaustion_current = self._exhaustion_is_current(snapshot, context)
+        exhaustion_family_applicable = (
+            selected.family.strip().upper()
+            in {name.strip().upper() for name in self.policy.exhaustion_block_families}
+        )
         same_direction_exhaustion = bool(
-            context.exhaustion_active
+            exhaustion_current
+            and exhaustion_family_applicable
             and self._direction_for_side(selected.side) == context.exhausted_side
         )
+        diagnostics["exhaustion_context_current"] = exhaustion_current
+        diagnostics["exhaustion_family_applicable"] = exhaustion_family_applicable
         diagnostics["same_direction_exhaustion"] = same_direction_exhaustion
 
         fresh_escape = self._confirmed_fresh_escape(
             selected,
             context,
-            signed_outside_atr,
+            background_signed_outside_atr,
         )
         diagnostics["fresh_escape_confirmed"] = fresh_escape
 
-        range_edge = self._unfavourable_range_edge(selected, entry_percentile)
+        confirmed_reversal_outside_range = bool(
+            selected.family.strip().upper() == "REVERSAL"
+            and context.current_auction_state.strip().upper() == "REVERSAL"
+            and background_signed_outside_atr is not None
+            and background_signed_outside_atr >= self.policy.fresh_escape_min_atr
+        )
+        diagnostics["confirmed_reversal_outside_background_range"] = (
+            confirmed_reversal_outside_range
+        )
+
+        range_edge = self._unfavourable_range_edge(
+            selected,
+            background_entry_percentile,
+        )
         diagnostics["unfavourable_range_edge"] = range_edge
 
         manager_diagnostics = decision.manager_diagnostics
@@ -146,29 +194,55 @@ class StockAdvisor:
         diagnostics["recent_eligible_side_switches"] = projected_switches
 
         action = AdvisorAction.ALLOW
-        context_name = context.name.strip().upper()
+        background_regime = context.background_regime.strip().upper()
+        inside_or_not_confirmed_outside = bool(
+            background_signed_outside_atr is None
+            or background_signed_outside_atr < self.policy.fresh_escape_min_atr
+        )
 
         if self.policy.block_exhausted_direction and same_direction_exhaustion:
             action = AdvisorAction.BLOCK
             reasons.append("ADVISOR_BLOCK_EXHAUSTED_DIRECTION")
 
         elif (
+            confirmed_reversal_outside_range
+            and not same_direction_exhaustion
+        ):
+            action = AdvisorAction.ALLOW
+            reasons.append("ADVISOR_ALLOW_CONFIRMED_REVERSAL_OUTSIDE_BACKGROUND_RANGE")
+
+        elif (
+            background_regime == "ROTATIONAL"
+            and self.policy.block_rotational_inside_range
+            and inside_or_not_confirmed_outside
+            and not fresh_escape
+        ):
+            action = AdvisorAction.BLOCK
+            reasons.append("ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE")
+            if range_edge:
+                reasons.append(
+                    "ADVISOR_BLOCK_BUY_NEAR_RANGE_HIGH"
+                    if selected.side == "BUY"
+                    else "ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW"
+                )
+
+        elif (
             self.policy.block_rotational_range_edge
-            and context.rotational
+            and background_regime in self._BALANCED_CONTEXTS
             and range_edge
+            and inside_or_not_confirmed_outside
             and not fresh_escape
         ):
             action = AdvisorAction.BLOCK
             reasons.extend((
-                "ADVISOR_BLOCK_ROTATIONAL_RANGE_EDGE",
+                "ADVISOR_BLOCK_BACKGROUND_RANGE_EDGE",
                 "ADVISOR_BLOCK_BUY_NEAR_RANGE_HIGH"
                 if selected.side == "BUY"
                 else "ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW",
             ))
 
         elif (
-            self.policy.block_rotational_range_edge
-            and context.rotational
+            background_regime == "ROTATIONAL"
             and projected_switches >= self.policy.rotational_side_switches_to_block
             and not fresh_escape
         ):
@@ -176,18 +250,28 @@ class StockAdvisor:
             reasons.append("ADVISOR_BLOCK_RECENT_SIDE_ROTATION")
 
         elif (
-            context_name in self._BALANCED_CONTEXTS
+            background_regime in self._BALANCED_CONTEXTS
             and self.policy.watch_unconfirmed_fresh_escape
-            and signed_outside_atr is not None
-            and signed_outside_atr >= 0.0
+            and background_signed_outside_atr is not None
+            and background_signed_outside_atr >= 0.0
             and not fresh_escape
         ):
             action = AdvisorAction.WATCH
-            reasons.append("ADVISOR_WATCH_RANGE_ESCAPE_NOT_CONFIRMED")
+            reasons.append("ADVISOR_WATCH_BACKGROUND_RANGE_ESCAPE_NOT_CONFIRMED")
+
+        elif (
+            background_regime in {"BALANCED", "COMPRESSION"}
+            and selected.family.strip().upper() == "REVERSAL"
+            and self.policy.watch_reversal_inside_balanced_range
+            and inside_or_not_confirmed_outside
+            and not fresh_escape
+        ):
+            action = AdvisorAction.WATCH
+            reasons.append("ADVISOR_WATCH_REVERSAL_INSIDE_BACKGROUND_RANGE")
 
         elif (
             self.policy.block_balanced_non_directional
-            and context_name in self._BALANCED_CONTEXTS
+            and background_regime in self._BALANCED_CONTEXTS
             and not fresh_escape
         ):
             action = AdvisorAction.BLOCK
@@ -200,7 +284,8 @@ class StockAdvisor:
                 )
 
         if action is AdvisorAction.ALLOW:
-            reasons.append("ADVISOR_ALLOW_DEPLOYMENT_CONTEXT")
+            if not reasons:
+                reasons.append("ADVISOR_ALLOW_DEPLOYMENT_CONTEXT")
             if fresh_escape:
                 reasons.append("ADVISOR_ALLOW_CONFIRMED_PRICE_LED_EXPANSION")
 
@@ -344,6 +429,60 @@ class StockAdvisor:
         if candidate.side == "BUY":
             return percentile >= self.policy.buy_range_edge_percentile
         return percentile <= self.policy.sell_range_edge_percentile
+
+    @staticmethod
+    def _exhaustion_is_current(
+        snapshot: SnapshotSchema,
+        context: StockContextProjection,
+    ) -> bool:
+        if not context.exhaustion_active:
+            return False
+        expires_at = context.exhaustion_expires_at
+        if expires_at is None:
+            return True
+        return snapshot.snapshot_time <= expires_at
+
+    @staticmethod
+    def _background_entry_percentile(
+        candidate: CandidateProjection,
+        context: StockContextProjection,
+    ) -> Optional[float]:
+        if (
+            context.background_range_low is None
+            or context.background_range_high is None
+        ):
+            return None
+        low = float(context.background_range_low)
+        high = float(context.background_range_high)
+        width = high - low
+        if width <= 0:
+            return None
+        return (float(candidate.entry_price) - low) / width
+
+    @staticmethod
+    def _background_signed_outside_atr(
+        candidate: CandidateProjection,
+        context: StockContextProjection,
+        atr: float,
+    ) -> Optional[float]:
+        if atr <= 0:
+            return None
+        if (
+            context.background_range_low is None
+            or context.background_range_high is None
+        ):
+            return None
+        if candidate.side == "BUY":
+            return (
+                float(candidate.entry_price) - float(context.background_range_high)
+            ) / atr
+        if candidate.side == "SELL":
+            return (
+                float(context.background_range_low) - float(candidate.entry_price)
+            ) / atr
+        raise _AdvisorInputError(
+            f"Unsupported Advisor candidate side: {candidate.side}"
+        )
 
     @staticmethod
     def _entry_percentile(candidate: CandidateProjection) -> Optional[float]:

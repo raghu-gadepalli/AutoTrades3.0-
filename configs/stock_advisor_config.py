@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,11 +32,19 @@ class StockAdvisorPolicyConfig(BaseModel):
 
     enabled: bool = True
     mode: Literal["SHADOW", "ENFORCE"] = "SHADOW"
-    config_version: str = "STOCK_ADVISOR_V1_DECOUPLED"
+    config_version: str = "STOCK_ADVISOR_V1_1_BACKGROUND_RANGE"
 
     block_exhausted_direction: bool = True
+    exhaustion_block_families: Tuple[str, ...] = (
+        "BREAKOUT_INITIATION",
+        "ACCEPTED_BREAKOUT",
+        "CONTINUATION",
+        "REACCELERATION",
+    )
     block_balanced_non_directional: bool = True
     block_rotational_range_edge: bool = True
+    block_rotational_inside_range: bool = True
+    watch_reversal_inside_balanced_range: bool = True
     watch_unconfirmed_fresh_escape: bool = True
     allow_confirmed_fresh_expansion_override: bool = True
 

@@ -42,6 +42,8 @@ def _state(current: str = "ORDERLY_DOWNTREND") -> AuctionStateProjection:
 def _stock_context() -> StockContextProjection:
     return StockContextProjection.model_validate({
         "name": "DIRECTIONAL",
+        "background_regime": "EARLY_EXPANSION",
+        "current_auction_state": "ORDERLY_DOWNTREND",
         "directional_bias": "DOWN",
         "balanced_non_directional": False,
         "compression_active": False,
@@ -56,6 +58,13 @@ def _stock_context() -> StockContextProjection:
         "hma_spread_atr": 0.40,
         "atr_state": "EXPANDING",
         "atr_contraction_ratio": 1.10,
+        "background_range_id": "RANGE:test",
+        "background_range_low": 1499.0,
+        "background_range_high": 1501.0,
+        "background_range_position": -0.65,
+        "background_range_outside_atr": 0.65,
+        "background_range_classification": "BALANCE_QUALIFIED",
+        "background_structure_flip_count": 1,
         "exhaustion_active": False,
         "exhausted_side": "UNKNOWN",
         "exhaustion_started_at": None,

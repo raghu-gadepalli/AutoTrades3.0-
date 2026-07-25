@@ -35,6 +35,7 @@ from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineCo
 from services.auction_engine.contracts import (
     AuctionState,
     AuctionStateName,
+    BackgroundRegimeName,
     BoundarySide,
     ConfidenceChannel,
     DirectionalBias,
@@ -1075,10 +1076,31 @@ class AuctionStateEngine:
             self._clear_exhaustion_context(memory)
             return
 
+        # Timestamp expiry is authoritative. A stale context must never remain
+        # active merely because its age counter was restored or skipped.
+        if memory.exhaustion_active and memory.exhaustion_started_at is not None:
+            expires_at = memory.exhaustion_started_at + timedelta(
+                minutes=(
+                    self.cfg.exhaustion_context_max_bars
+                    * self.config.engine.snapshot_interval_minutes
+                )
+            )
+            if evidence.snapshot_time > expires_at:
+                self._clear_exhaustion_context(memory)
+
         extension_move = evidence.extension.move_from_anchor_atr
         extension_large = bool(
             extension_move is not None
-            and abs(float(extension_move)) >= self.cfg.exhaustion_context_min_extension_atr
+            and (
+                (
+                    established is DirectionalBias.UP
+                    and float(extension_move) >= self.cfg.exhaustion_context_min_extension_atr
+                )
+                or (
+                    established is DirectionalBias.DOWN
+                    and float(extension_move) <= -self.cfg.exhaustion_context_min_extension_atr
+                )
+            )
         )
         progress_lost = bool(
             evidence.extension.progress_decay is not None
@@ -1092,6 +1114,7 @@ class AuctionStateEngine:
         )
         exhaustion_observed = bool(
             established in (DirectionalBias.UP, DirectionalBias.DOWN)
+            and memory.leg_age_bars >= self.cfg.exhaustion_context_min_leg_age_bars
             and (current_leg_mature or extension_large or evidence.extension.mature is True)
             and (leg_progress_or_rejection or progress_lost or rejection)
         )
@@ -1186,7 +1209,65 @@ class AuctionStateEngine:
         else:
             name = StockContextName.UNKNOWN
 
-        reasons = [f"STOCK_CONTEXT_{name.value}"]
+        source_structure = _required_raw_section(evidence, "source_structure")
+        range_id_raw = source_structure["accepted_range_id"]
+        range_low = _optional_number(source_structure["accepted_range_low"])
+        range_high = _optional_number(source_structure["accepted_range_high"])
+        range_classification = str(
+            source_structure["accepted_range_classification"] or "UNKNOWN"
+        ).strip().upper()
+        structure_flip_count = int(source_structure["structure_flip_count"] or 0)
+        range_valid = bool(
+            range_low is not None
+            and range_high is not None
+            and range_high > range_low
+        )
+        range_position = None
+        range_outside_atr = None
+        inside_background_range = False
+        if range_valid:
+            assert range_low is not None and range_high is not None
+            width = range_high - range_low
+            range_position = (evidence.close - range_low) / width
+            atr = _required_evidence_atr(evidence)
+            tolerance = atr * self.cfg.stock_context_background_range_tolerance_atr
+            inside_background_range = bool(
+                range_low - tolerance <= evidence.close <= range_high + tolerance
+            )
+            if evidence.close > range_high:
+                range_outside_atr = (evidence.close - range_high) / atr
+            elif evidence.close < range_low:
+                range_outside_atr = (range_low - evidence.close) / atr
+            else:
+                range_outside_atr = 0.0
+
+        if range_valid and inside_background_range:
+            if bool(flags["compression_ready"]):
+                background_regime = BackgroundRegimeName.COMPRESSION
+            elif (
+                bool(flags["rotational_context"])
+                or structure_flip_count
+                >= self.cfg.stock_context_background_rotation_flip_count
+            ):
+                background_regime = BackgroundRegimeName.ROTATIONAL
+            else:
+                background_regime = BackgroundRegimeName.BALANCED
+        elif bool(flags["fresh_expansion_confirmed"]):
+            background_regime = BackgroundRegimeName.EARLY_EXPANSION
+        elif memory.exhaustion_active or selected_state is AuctionStateName.MATURE_EXTENSION:
+            background_regime = BackgroundRegimeName.MATURE_EXTENSION
+        elif memory.established_trend_side in (
+            DirectionalBias.UP,
+            DirectionalBias.DOWN,
+        ):
+            background_regime = BackgroundRegimeName.DIRECTIONAL
+        else:
+            background_regime = BackgroundRegimeName.UNKNOWN
+
+        reasons = [
+            f"STOCK_CONTEXT_{name.value}",
+            f"BACKGROUND_REGIME_{background_regime.value}",
+        ]
         if bool(flags["balanced_non_directional"]):
             reasons.append("BALANCED_NON_DIRECTIONAL_CONFIRMED")
         if bool(flags["rotational_context"]):
@@ -1213,6 +1294,8 @@ class AuctionStateEngine:
             symbol=evidence.symbol,
             snapshot_time=evidence.snapshot_time,
             name=name,
+            background_regime=background_regime,
+            current_auction_state=selected_state,
             directional_bias=directional_bias,
             balanced_non_directional=bool(flags["balanced_non_directional"]),
             compression_active=bool(flags["compression_ready"]),
@@ -1227,6 +1310,13 @@ class AuctionStateEngine:
             hma_spread_atr=evidence.trend.hma_spread_atr,
             atr_state=evidence.compression.atr_state,
             atr_contraction_ratio=evidence.compression.atr_contraction_ratio,
+            background_range_id=(str(range_id_raw) if range_id_raw else None),
+            background_range_low=range_low,
+            background_range_high=range_high,
+            background_range_position=range_position,
+            background_range_outside_atr=range_outside_atr,
+            background_range_classification=range_classification,
+            background_structure_flip_count=structure_flip_count,
             exhaustion_active=memory.exhaustion_active,
             exhausted_side=memory.exhaustion_side,
             exhaustion_started_at=memory.exhaustion_started_at,
@@ -1241,6 +1331,7 @@ class AuctionStateEngine:
                 "balance_confirmation_bars": int(flags["stock_context_balance_bars"]),
                 "current_leg_distance_atr": flags["current_leg_distance_atr"],
                 "current_leg_current_distance_atr": flags["current_leg_current_distance_atr"],
+                "inside_background_range": inside_background_range,
             },
             config_version=self.version,
         )
@@ -1979,6 +2070,10 @@ class AuctionStateEngine:
                 evidence.snapshot_time,
                 "CONFIRMED_OPPOSITE_REVERSAL",
             )
+            # A confirmed control transfer consumes the old exhausted move.
+            # The new leg must build its own age and extension before it can
+            # establish a fresh exhaustion episode.
+            self._clear_exhaustion_context(memory)
             if side in (DirectionalBias.UP, DirectionalBias.DOWN):
                 self._establish_trend(memory, evidence, side, anchor_from_bar=True)
             memory.trend_failure_age_bars = 0
@@ -2621,6 +2716,20 @@ def _required_raw_section(
     if not isinstance(section, Mapping):
         raise ValueError(f"Evidence raw_facts.{key} must be a mapping")
     return section
+
+
+def _optional_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid numeric Auction fact")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected numeric Auction fact, got {value!r}") from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"Auction numeric fact must be finite, got {value!r}")
+    return number
 
 
 def _strict_int(value: Any, path: str) -> int:

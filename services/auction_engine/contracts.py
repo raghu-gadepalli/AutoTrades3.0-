@@ -107,6 +107,18 @@ class StockContextName(StringEnum):
     REVERSAL = "REVERSAL"
 
 
+class BackgroundRegimeName(StringEnum):
+    """Slow stock environment, independent of the current local Auction event."""
+
+    UNKNOWN = "UNKNOWN"
+    BALANCED = "BALANCED"
+    COMPRESSION = "COMPRESSION"
+    ROTATIONAL = "ROTATIONAL"
+    EARLY_EXPANSION = "EARLY_EXPANSION"
+    DIRECTIONAL = "DIRECTIONAL"
+    MATURE_EXTENSION = "MATURE_EXTENSION"
+
+
 class AdvisorAction(StringEnum):
     NO_ACTION = "NO_ACTION"
     ALLOW = "ALLOW"
@@ -820,6 +832,8 @@ class StockContext(ContractModel):
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
     name: StockContextName
+    background_regime: BackgroundRegimeName = BackgroundRegimeName.UNKNOWN
+    current_auction_state: AuctionStateName = AuctionStateName.UNKNOWN
     directional_bias: DirectionalBias = DirectionalBias.UNKNOWN
     balanced_non_directional: bool = False
     compression_active: bool = False
@@ -834,6 +848,13 @@ class StockContext(ContractModel):
     hma_spread_atr: Optional[float] = Field(default=None, ge=0.0)
     atr_state: str = "UNKNOWN"
     atr_contraction_ratio: Optional[float] = Field(default=None, ge=0.0)
+    background_range_id: Optional[str] = None
+    background_range_low: Optional[float] = None
+    background_range_high: Optional[float] = None
+    background_range_position: Optional[float] = None
+    background_range_outside_atr: Optional[float] = None
+    background_range_classification: str = "UNKNOWN"
+    background_structure_flip_count: int = Field(default=0, ge=0)
     exhaustion_active: bool = False
     exhausted_side: DirectionalBias = DirectionalBias.UNKNOWN
     exhaustion_started_at: Optional[datetime] = None
@@ -844,11 +865,24 @@ class StockContext(ContractModel):
 
     @model_validator(mode="after")
     def _validate_stock_context(self) -> "StockContext":
+        if (self.background_range_low is None) != (self.background_range_high is None):
+            raise ValueError("Background range low/high must be provided together")
+        if (
+            self.background_range_low is not None
+            and self.background_range_high is not None
+            and self.background_range_high <= self.background_range_low
+        ):
+            raise ValueError("Background range high must exceed background range low")
         if self.exhaustion_active:
             if self.exhausted_side not in (DirectionalBias.UP, DirectionalBias.DOWN):
                 raise ValueError("Active exhaustion context requires UP or DOWN exhausted_side")
             if self.exhaustion_started_at is None:
                 raise ValueError("Active exhaustion context requires exhaustion_started_at")
+            if (
+                self.exhaustion_expires_at is not None
+                and self.exhaustion_expires_at < self.snapshot_time
+            ):
+                raise ValueError("Active exhaustion context cannot already be expired")
         return self
 
 
@@ -1083,7 +1117,7 @@ def _normalise_key_part(value: Any) -> str:
 
 __all__ = [
     "TradeSide", "BoundarySide", "DirectionalBias", "QualityStatus",
-    "EvidencePolarity", "AuctionStateName", "StockContextName", "AdvisorAction",
+    "EvidencePolarity", "AuctionStateName", "StockContextName", "BackgroundRegimeName", "AdvisorAction",
     "BoundaryEpisodeStatus",
     "BoundaryResolution", "SetupFamily", "CandidateEligibility", "CandidateRole",
     "ContextAlignment", "ManagerAction", "LocalDecisionAction",

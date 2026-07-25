@@ -507,6 +507,8 @@ class OpportunityProjection(StrictBaseModel):
 
 class StockContextProjection(StrictBaseModel):
     name: str
+    background_regime: str
+    current_auction_state: str
     directional_bias: str
     balanced_non_directional: bool
     compression_active: bool
@@ -521,6 +523,13 @@ class StockContextProjection(StrictBaseModel):
     hma_spread_atr: Optional[float]
     atr_state: str
     atr_contraction_ratio: Optional[float]
+    background_range_id: Optional[str]
+    background_range_low: Optional[float]
+    background_range_high: Optional[float]
+    background_range_position: Optional[float]
+    background_range_outside_atr: Optional[float]
+    background_range_classification: str
+    background_structure_flip_count: int = Field(ge=0)
     exhaustion_active: bool
     exhausted_side: str
     exhaustion_started_at: Optional[datetime]

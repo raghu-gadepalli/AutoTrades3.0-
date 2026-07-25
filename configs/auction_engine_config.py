@@ -251,11 +251,14 @@ class AuctionStatePolicyConfig(BaseModel):
     stock_context_directional_efficiency_min: float = Field(default=0.45, ge=0.0, le=1.0)
     stock_context_balance_confirmation_bars: int = Field(default=2, ge=1)
     stock_context_early_expansion_displacement_atr: float = Field(default=0.35, ge=0.0)
+    stock_context_background_rotation_flip_count: int = Field(default=3, ge=1)
+    stock_context_background_range_tolerance_atr: float = Field(default=0.15, ge=0.0)
 
     # Exhaustion is persistent market context independent of whether an
     # EXHAUSTION_REVERSAL candidate has enough VWAP room to become a trade.
     exhaustion_context_enabled: bool = True
     exhaustion_context_min_extension_atr: float = Field(default=1.50, ge=0.0)
+    exhaustion_context_min_leg_age_bars: int = Field(default=3, ge=1)
     exhaustion_context_progress_decay_min: float = Field(default=0.35, ge=0.0, le=1.0)
     exhaustion_context_max_bars: int = Field(default=6, ge=1)
     exhaustion_context_clear_confirmation_bars: int = Field(default=2, ge=1)

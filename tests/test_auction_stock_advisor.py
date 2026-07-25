@@ -34,22 +34,30 @@ class AuctionStockAdvisorTests(unittest.TestCase):
     def _snapshot(
         self,
         *,
+        family: str = "ACCEPTED_BREAKOUT",
+        subtype: str = "CONTINUATION_ACCEPTANCE",
         side: str = "SELL",
         entry: float = 99.1,
         low: float = 99.0,
         high: float = 101.0,
         state: str = "ORDERLY_DOWNTREND",
         context_name: str = "ROTATIONAL",
+        background_regime: str = "ROTATIONAL",
         rotational: bool = True,
         fresh_expansion: bool = False,
         exhaustion_active: bool = False,
         exhausted_side: str = "UNKNOWN",
+        exhaustion_expires_at=None,
         switches: int = 0,
+        background_low: float | None = None,
+        background_high: float | None = None,
     ) -> SimpleNamespace:
+        background_low = low if background_low is None else background_low
+        background_high = high if background_high is None else background_high
         candidate = SimpleNamespace(
             candidate_id=f"CANDIDATE:{side}",
-            family="ACCEPTED_BREAKOUT",
-            subtype="CONTINUATION_ACCEPTANCE",
+            family=family,
+            subtype=subtype,
             side=side,
             auction_state=state,
             entry_price=entry,
@@ -65,12 +73,20 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         )
         context = SimpleNamespace(
             name=context_name,
+            background_regime=background_regime,
+            current_auction_state=state,
             reason_codes=[],
             rotational=rotational,
             fresh_expansion_confirmed=fresh_expansion,
             directional_efficiency=0.70 if fresh_expansion else 0.20,
             exhaustion_active=exhaustion_active,
             exhausted_side=exhausted_side,
+            exhaustion_expires_at=exhaustion_expires_at,
+            background_range_id="RANGE:1",
+            background_range_low=background_low,
+            background_range_high=background_high,
+            background_range_classification="BALANCE_QUALIFIED",
+            background_structure_flip_count=4,
         )
         return SimpleNamespace(
             symbol="TEST",
@@ -90,6 +106,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             rotational=False,
             exhaustion_active=True,
             exhausted_side="DOWN",
+            exhaustion_expires_at=self.ts + timedelta(minutes=3),
         )
         result = StockAdvisor(self._policy("SHADOW")).evaluate(snapshot)
         self.assertEqual(AdvisorAction.BLOCK, result.action)
@@ -103,6 +120,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             rotational=False,
             exhaustion_active=True,
             exhausted_side="DOWN",
+            exhaustion_expires_at=self.ts + timedelta(minutes=3),
         )
         result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
         self.assertEqual(AdvisorAction.BLOCK, result.action)
@@ -112,7 +130,10 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         snapshot = self._snapshot(side="SELL", entry=99.1, switches=1)
         result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
         self.assertEqual(AdvisorAction.BLOCK, result.action)
-        self.assertIn("ADVISOR_BLOCK_ROTATIONAL_RANGE_EDGE", result.reason_codes)
+        self.assertIn(
+            "ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE",
+            result.reason_codes,
+        )
         self.assertIn("ADVISOR_BLOCK_SELL_NEAR_RANGE_LOW", result.reason_codes)
 
     def test_confirmed_price_led_expansion_is_allowed(self) -> None:
@@ -121,6 +142,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             entry=98.6,
             state="FRESH_EXPANSION",
             context_name="EARLY_EXPANSION",
+            background_regime="EARLY_EXPANSION",
             rotational=False,
             fresh_expansion=True,
         )
@@ -128,6 +150,74 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         self.assertEqual(AdvisorAction.ALLOW, result.action)
         self.assertIn("ADVISOR_ALLOW_CONFIRMED_PRICE_LED_EXPANSION", result.reason_codes)
         self.assertFalse(result.diagnostics["time_of_day_gate_applied"])
+
+    def test_reversal_is_not_blocked_by_same_side_exhaustion(self) -> None:
+        snapshot = self._snapshot(
+            family="REVERSAL",
+            subtype="NORMAL_REVERSAL",
+            side="BUY",
+            entry=101.4,
+            state="REVERSAL",
+            context_name="REVERSAL",
+            background_regime="DIRECTIONAL",
+            rotational=False,
+            exhaustion_active=True,
+            exhausted_side="UP",
+            exhaustion_expires_at=self.ts + timedelta(minutes=3),
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertFalse(result.diagnostics["exhaustion_family_applicable"])
+
+    def test_expired_exhaustion_does_not_block_continuation(self) -> None:
+        snapshot = self._snapshot(
+            side="SELL",
+            context_name="MATURE_EXTENSION",
+            background_regime="DIRECTIONAL",
+            rotational=False,
+            exhaustion_active=True,
+            exhausted_side="DOWN",
+            exhaustion_expires_at=self.ts - timedelta(minutes=3),
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertFalse(result.diagnostics["exhaustion_context_current"])
+
+    def test_current_reversal_inside_rotational_background_is_blocked(self) -> None:
+        snapshot = self._snapshot(
+            family="REVERSAL",
+            subtype="NORMAL_REVERSAL",
+            side="BUY",
+            entry=100.8,
+            state="REVERSAL",
+            context_name="REVERSAL",
+            background_regime="ROTATIONAL",
+            rotational=False,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.BLOCK, result.action)
+        self.assertIn(
+            "ADVISOR_BLOCK_ROTATIONAL_INSIDE_BACKGROUND_RANGE",
+            result.reason_codes,
+        )
+
+    def test_confirmed_reversal_outside_background_range_is_allowed(self) -> None:
+        snapshot = self._snapshot(
+            family="REVERSAL",
+            subtype="NORMAL_REVERSAL",
+            side="BUY",
+            entry=101.4,
+            state="REVERSAL",
+            context_name="REVERSAL",
+            background_regime="ROTATIONAL",
+            rotational=True,
+        )
+        result = StockAdvisor(self._policy("ENFORCE")).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertIn(
+            "ADVISOR_ALLOW_CONFIRMED_REVERSAL_OUTSIDE_BACKGROUND_RANGE",
+            result.reason_codes,
+        )
 
     def test_advisor_applies_only_to_new_signal_deployment(self) -> None:
         snapshot = self._snapshot(side="SELL")

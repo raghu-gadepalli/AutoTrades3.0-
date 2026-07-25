@@ -207,6 +207,8 @@ def _state_projection(state) -> AuctionStateProjection:
 def _stock_context_projection(context) -> StockContextProjection:
     return StockContextProjection(
         name=context.name.value,
+        background_regime=context.background_regime.value,
+        current_auction_state=context.current_auction_state.value,
         directional_bias=context.directional_bias.value,
         balanced_non_directional=context.balanced_non_directional,
         compression_active=context.compression_active,
@@ -221,6 +223,13 @@ def _stock_context_projection(context) -> StockContextProjection:
         hma_spread_atr=context.hma_spread_atr,
         atr_state=context.atr_state,
         atr_contraction_ratio=context.atr_contraction_ratio,
+        background_range_id=context.background_range_id,
+        background_range_low=context.background_range_low,
+        background_range_high=context.background_range_high,
+        background_range_position=context.background_range_position,
+        background_range_outside_atr=context.background_range_outside_atr,
+        background_range_classification=context.background_range_classification,
+        background_structure_flip_count=context.background_structure_flip_count,
         exhaustion_active=context.exhaustion_active,
         exhausted_side=context.exhausted_side.value,
         exhaustion_started_at=context.exhaustion_started_at,
