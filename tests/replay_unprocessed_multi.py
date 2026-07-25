@@ -72,7 +72,7 @@ from services.trade.monitor.trade_monitor import TradeMonitor
 # False -> generate/update signals only.
 # True  -> additionally run trade generation, entry, monitor and exit once per
 #          snapshot cadence.
-GENERATE_TRADES: bool = False
+GENERATE_TRADES: bool = True
 
 # The backtest is intended to be run for one user at a time. This value is only
 # passed to the normal TradeGenerator; executor and monitor keep their normal
