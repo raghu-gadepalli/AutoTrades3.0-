@@ -37,7 +37,7 @@ class StockAdvisorPolicyConfig(BaseModel):
     model_config = STRICT_CONFIG
 
     enabled: bool = True
-    config_version: str = "STOCK_ADVISOR_V3_RULE_ACTIONS"
+    config_version: str = "STOCK_ADVISOR_V4_CURRENT_DEPLOYMENT"
 
     # Same-direction continuation after a current exhaustion episode. Opposite
     # exhaustion reversals are not affected by this rule.
@@ -63,19 +63,13 @@ class StockAdvisorPolicyConfig(BaseModel):
     extreme_near_atr: float = Field(default=0.20, ge=0.0)
     extreme_min_prior_move_atr: float = Field(default=1.25, ge=0.0)
 
-    # A conservative exception for a genuinely accepted range escape. A mere
-    # breakout initiation/probe is intentionally not enough.
-    strong_confirmation_families: Tuple[str, ...] = ("ACCEPTED_BREAKOUT",)
-    strong_confirmation_min_outside_atr: float = Field(default=0.15, ge=0.0)
-    strong_confirmation_states_buy: Tuple[str, ...] = (
-        "FRESH_EXPANSION",
-        "ORDERLY_UPTREND",
-        "REACCELERATION",
-    )
-    strong_confirmation_states_sell: Tuple[str, ...] = (
-        "FRESH_EXPANSION",
-        "ORDERLY_DOWNTREND",
-        "REACCELERATION",
+    # Accepted Breakout is a current deployment claim, not a historical one.
+    # A previously confirmed candidate may remain in the opportunity ledger, but
+    # it cannot create a signal unless the current completed-candle close is still
+    # beyond the same accepted boundary and that range remains tradable.
+    accepted_breakout_current_context_action: AdvisorRuleAction = "BLOCK"
+    accepted_breakout_current_context_families: Tuple[str, ...] = (
+        "ACCEPTED_BREAKOUT",
     )
 
     # Counter-path deployment against a persistent day-so-far path. These

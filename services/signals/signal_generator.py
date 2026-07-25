@@ -1374,7 +1374,9 @@ def _criteria_json(
         "setup_subtype": _current_subtype(instruction),
         "side": _current_side(instruction),
         "eligibility": _current_eligibility(instruction),
-        "entry_price": decision.entry_price,
+        "entry_price": _deployment_entry_price(snapshot),
+        "entry_price_source": "SNAPSHOT_CLOSE",
+        "candidate_entry_price": decision.entry_price,
         "stop_anchor_price": decision.stop_anchor_price,
         "stop_anchor_type": decision.stop_anchor_type,
         "target_basis": decision.target_basis,
@@ -1405,6 +1407,9 @@ def _create_meta_json(
             "setup_subtype": identity.setup_subtype,
             "side": identity.side,
             "created_snapshot_time": snapshot.snapshot_time,
+            "candidate_entry_price": instruction.decision.entry_price,
+            "deployment_entry_price": _deployment_entry_price(snapshot),
+            "deployment_entry_price_source": "SNAPSHOT_CLOSE",
         },
         "entry_criteria_json": criteria_json,
         "current_criteria_json": criteria_json,
@@ -1531,6 +1536,20 @@ def _lifecycle_signature(record: Dict[str, Any]) -> Tuple[Any, ...]:
     return tuple(record[key] for key in required)
 
 
+def _deployment_entry_price(snapshot: SnapshotSchema) -> float:
+    """Return the actual signal deployment price for this completed candle.
+
+    Auction candidate.entry_price is the historical trigger/confirmation price.
+    Once Advisor deployment has delayed creation, it must never be reused as the
+    current signal entry. The persisted signal and downstream setup handoff use
+    the current completed-candle close instead.
+    """
+    price = float(snapshot.close)
+    if price <= 0:
+        raise ValueError("snapshot.close must be positive for signal deployment")
+    return price
+
+
 def _entry_setup_levels(
     snapshot: SnapshotSchema,
     instruction: AuctionSignalInstruction,
@@ -1553,7 +1572,9 @@ def _entry_setup_levels(
         "opportunity_key": identity.opportunity_key,
         "boundary_event_key": identity.boundary_event_key,
         "snapshot_time": snapshot.snapshot_time,
-        "entry_price": decision.entry_price,
+        "entry_price": _deployment_entry_price(snapshot),
+        "entry_price_source": "SNAPSHOT_CLOSE",
+        "candidate_entry_price": decision.entry_price,
         "initial_stop_reference_price": decision.stop_anchor_price,
         "reference_price": decision.stop_anchor_price,
         "reference_source": decision.stop_anchor_type,
@@ -1967,7 +1988,9 @@ def _latest_auction_evaluation(
         "current_setup_family": _current_family(instruction),
         "current_setup_subtype": _current_subtype(instruction),
         "current_side": _current_side(instruction),
-        "entry_price": instruction.decision.entry_price,
+        "entry_price": _deployment_entry_price(snapshot),
+        "entry_price_source": "SNAPSHOT_CLOSE",
+        "candidate_entry_price": instruction.decision.entry_price,
         "stop_anchor_price": instruction.decision.stop_anchor_price,
         "stop_anchor_type": instruction.decision.stop_anchor_type,
         "target_basis": instruction.decision.target_basis,

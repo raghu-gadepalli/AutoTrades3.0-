@@ -140,8 +140,33 @@ class StockAdvisor:
             ),
         }
 
-        strong_confirmation = self._strong_confirmation(selected, context, atr)
-        diagnostics["strong_confirmation"] = strong_confirmation
+        deployment_price = float(snapshot.close)
+        if deployment_price <= 0:
+            raise _AdvisorInputError("snapshot.close must be positive")
+        diagnostics["candidate_entry_price"] = float(selected.entry_price)
+        diagnostics["deployment_entry_price"] = deployment_price
+        diagnostics["deployment_entry_price_source"] = "SNAPSHOT_CLOSE"
+
+        accepted_breakout_current_context_applicable = family in self._normalised_set(
+            self.policy.accepted_breakout_current_context_families
+        )
+        accepted_breakout_range_context_valid = self._accepted_range_is_tradable(
+            context
+        )
+        accepted_breakout_currently_outside = self._deployment_is_outside_range_for_side(
+            selected.side,
+            deployment_price,
+            context,
+        )
+        diagnostics["accepted_breakout_current_context_applicable"] = (
+            accepted_breakout_current_context_applicable
+        )
+        diagnostics["accepted_breakout_range_context_valid"] = (
+            accepted_breakout_range_context_valid
+        )
+        diagnostics["accepted_breakout_currently_outside_range"] = (
+            accepted_breakout_currently_outside
+        )
 
         exhaustion_current = self._exhaustion_is_current(snapshot, context)
         exhaustion_family_applicable = family in self._normalised_set(
@@ -162,23 +187,24 @@ class StockAdvisor:
             self.policy.inside_range_exempt_families,
             self.policy.inside_range_exempt_subtypes,
         )
-        candidate_inside_accepted_range = self._candidate_inside_accepted_range(
-            selected,
+        deployment_inside_accepted_range = self._deployment_inside_accepted_range(
+            deployment_price,
             context,
             atr,
         )
-        diagnostics["candidate_inside_accepted_range"] = candidate_inside_accepted_range
+        diagnostics["deployment_inside_accepted_range"] = deployment_inside_accepted_range
         inside_range_condition = bool(
-            candidate_inside_accepted_range
+            deployment_inside_accepted_range
             and not inside_range_exempt
-            and not strong_confirmation
         )
         diagnostics["inside_range_exempt"] = inside_range_exempt
         diagnostics["inside_range_condition"] = inside_range_condition
 
-        extreme_chase = bool(
-            self._is_extreme_chase(selected, context, atr)
-            and not strong_confirmation
+        extreme_chase = self._is_extreme_chase(
+            selected.side,
+            deployment_price,
+            context,
+            atr,
         )
         diagnostics["extreme_chase"] = extreme_chase
 
@@ -190,13 +216,15 @@ class StockAdvisor:
         )
         against_session_path = bool(
             not session_path_exempt
-            and not strong_confirmation
             and self._against_persistent_session_path(selected, context)
         )
         diagnostics["session_path_exempt"] = session_path_exempt
         diagnostics["against_persistent_session_path"] = against_session_path
 
         configured_rule_actions = {
+            "accepted_breakout_current_context": (
+                self.policy.accepted_breakout_current_context_action
+            ),
             "same_direction_exhaustion": self.policy.same_direction_exhaustion_action,
             "inside_accepted_range": self.policy.inside_accepted_range_action,
             "extreme_chase": self.policy.extreme_chase_action,
@@ -219,6 +247,20 @@ class StockAdvisor:
             })
             reasons.append(reason_code)
             action = self._stronger_action(action, rule_action)
+
+        if accepted_breakout_current_context_applicable:
+            if not accepted_breakout_range_context_valid:
+                apply_rule(
+                    "accepted_breakout_current_context",
+                    self.policy.accepted_breakout_current_context_action,
+                    "ACCEPTED_BREAKOUT_RANGE_CONTEXT_INVALID",
+                )
+            elif not accepted_breakout_currently_outside:
+                apply_rule(
+                    "accepted_breakout_current_context",
+                    self.policy.accepted_breakout_current_context_action,
+                    "ACCEPTED_BREAKOUT_NOT_CURRENTLY_OUTSIDE_RANGE",
+                )
 
         if same_direction_exhaustion:
             apply_rule(
@@ -254,11 +296,7 @@ class StockAdvisor:
             )
 
         if not triggered_rules:
-            reasons.append(
-                "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE"
-                if strong_confirmation
-                else "ADVISOR_ALLOW_SIMPLE_DEPLOYMENT_CONTEXT"
-            )
+            reasons.append("ADVISOR_ALLOW_SIMPLE_DEPLOYMENT_CONTEXT")
 
         diagnostics["triggered_rules"] = triggered_rules
         diagnostics["advisor_action"] = action.value
@@ -356,9 +394,41 @@ class StockAdvisor:
             config_version=self.policy.config_version,
         )
 
-    def _candidate_inside_accepted_range(
+    @staticmethod
+    def _accepted_range_is_tradable(
+        context: StockContextProjection,
+    ) -> bool:
+        return bool(
+            context.accepted_range_id is not None
+            and context.accepted_range_low is not None
+            and context.accepted_range_high is not None
+            and float(context.accepted_range_high) > float(context.accepted_range_low)
+            and not context.accepted_range_provisional
+            and context.accepted_range_breakout_eligible
+        )
+
+    @staticmethod
+    def _deployment_is_outside_range_for_side(
+        side: str,
+        deployment_price: float,
+        context: StockContextProjection,
+    ) -> bool:
+        if (
+            context.accepted_range_low is None
+            or context.accepted_range_high is None
+        ):
+            return False
+        if side == "BUY":
+            return deployment_price > float(context.accepted_range_high)
+        if side == "SELL":
+            return deployment_price < float(context.accepted_range_low)
+        raise _AdvisorInputError(
+            f"Unsupported Advisor candidate side: {side}"
+        )
+
+    def _deployment_inside_accepted_range(
         self,
-        candidate: CandidateProjection,
+        deployment_price: float,
         context: StockContextProjection,
         atr: float,
     ) -> bool:
@@ -368,68 +438,41 @@ class StockAdvisor:
         ):
             return False
         tolerance = atr * self.policy.accepted_range_tolerance_atr
-        entry = float(candidate.entry_price)
         return bool(
             float(context.accepted_range_low) - tolerance
-            <= entry
+            <= deployment_price
             <= float(context.accepted_range_high) + tolerance
         )
 
-    def _strong_confirmation(
-        self,
-        candidate: CandidateProjection,
-        context: StockContextProjection,
-        atr: float,
-    ) -> bool:
-        if candidate.family.strip().upper() not in self._normalised_set(
-            self.policy.strong_confirmation_families
-        ):
-            return False
-        if context.accepted_range_provisional:
-            return False
-        if not context.accepted_range_breakout_eligible:
-            return False
-        signed_outside = self._signed_outside_accepted_range_atr(
-            candidate,
-            context,
-            atr,
-        )
-        if (
-            signed_outside is None
-            or signed_outside < self.policy.strong_confirmation_min_outside_atr
-        ):
-            return False
-        state = context.current_auction_state.strip().upper()
-        aligned = (
-            self.policy.strong_confirmation_states_buy
-            if candidate.side == "BUY"
-            else self.policy.strong_confirmation_states_sell
-        )
-        return state in self._normalised_set(aligned)
-
     def _is_extreme_chase(
         self,
-        candidate: CandidateProjection,
+        side: str,
+        deployment_price: float,
         context: StockContextProjection,
         atr: float,
     ) -> bool:
-        entry = float(candidate.entry_price)
-        if candidate.side == "BUY":
-            distance = max(0.0, float(context.session_high_price) - entry) / atr
+        if side == "BUY":
+            distance = max(
+                0.0,
+                float(context.session_high_price) - deployment_price,
+            ) / atr
             return bool(
                 distance <= self.policy.extreme_near_atr
                 and context.rise_from_session_low_atr
                 >= self.policy.extreme_min_prior_move_atr
             )
-        if candidate.side == "SELL":
-            distance = max(0.0, entry - float(context.session_low_price)) / atr
+        if side == "SELL":
+            distance = max(
+                0.0,
+                deployment_price - float(context.session_low_price),
+            ) / atr
             return bool(
                 distance <= self.policy.extreme_near_atr
                 and context.decline_from_session_high_atr
                 >= self.policy.extreme_min_prior_move_atr
             )
         raise _AdvisorInputError(
-            f"Unsupported Advisor candidate side: {candidate.side}"
+            f"Unsupported Advisor candidate side: {side}"
         )
 
     def _against_persistent_session_path(
@@ -483,31 +526,6 @@ class StockAdvisor:
         if expires_at is None:
             return True
         return snapshot.snapshot_time <= expires_at
-
-    @staticmethod
-    def _signed_outside_accepted_range_atr(
-        candidate: CandidateProjection,
-        context: StockContextProjection,
-        atr: float,
-    ) -> Optional[float]:
-        if atr <= 0:
-            return None
-        if (
-            context.accepted_range_low is None
-            or context.accepted_range_high is None
-        ):
-            return None
-        if candidate.side == "BUY":
-            return (
-                float(candidate.entry_price) - float(context.accepted_range_high)
-            ) / atr
-        if candidate.side == "SELL":
-            return (
-                float(context.accepted_range_low) - float(candidate.entry_price)
-            ) / atr
-        raise _AdvisorInputError(
-            f"Unsupported Advisor candidate side: {candidate.side}"
-        )
 
     @staticmethod
     def _is_exempt(

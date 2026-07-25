@@ -21,7 +21,11 @@ from services.auction_engine.contracts import (
 )
 from services.auction_engine.evidence import EvidenceBuilder
 from services.auction_engine.state_engine import AuctionStateEngine, _StateMemory
-from services.signals.signal_generator import _advisor_adjusted_auction_action
+from services.signals.signal_generator import (
+    AuctionSignalIdentity,
+    _advisor_adjusted_auction_action,
+    _entry_setup_levels,
+)
 from services.signals.stock_advisor import StockAdvisor
 
 
@@ -40,6 +44,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         subtype: str = "NORMAL_REVERSAL",
         side: str = "SELL",
         entry: float = 105.0,
+        close: float | None = None,
         state: str = "REVERSAL",
         accepted_low: float | None = 100.0,
         accepted_high: float | None = 110.0,
@@ -118,6 +123,7 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         return SimpleNamespace(
             symbol="TEST",
             snapshot_time=self.ts,
+            close=(entry if close is None else close),
             indicators=SimpleNamespace(atr=SimpleNamespace(value=10.0)),
             auction=SimpleNamespace(
                 decision=decision,
@@ -222,12 +228,13 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             result.reason_codes,
         )
 
-    def test_strong_accepted_breakout_can_clear_extreme_and_path_deferral(self) -> None:
+    def test_accepted_breakout_does_not_bypass_extreme_context(self) -> None:
         snapshot = self._snapshot(
             family="ACCEPTED_BREAKOUT",
             subtype="CONTINUATION_ACCEPTANCE",
             side="BUY",
             entry=111.8,
+            close=111.8,
             state="FRESH_EXPANSION",
             accepted_low=100.0,
             accepted_high=110.0,
@@ -242,11 +249,88 @@ class AuctionStockAdvisorTests(unittest.TestCase):
             high_path_ratio=0.80,
         )
         result = StockAdvisor(self._policy()).evaluate(snapshot)
-        self.assertEqual(AdvisorAction.ALLOW, result.action)
-        self.assertIn(
+        self.assertEqual(AdvisorAction.WATCH, result.action)
+        self.assertIn("ADVISOR_WATCH_BUY_NEAR_SESSION_HIGH", result.reason_codes)
+        self.assertNotIn(
             "ADVISOR_ALLOW_STRONG_ACCEPTED_RANGE_ESCAPE",
             result.reason_codes,
         )
+
+    def test_stale_accepted_breakout_inside_range_is_blocked(self) -> None:
+        snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
+            side="SELL",
+            entry=97.0,
+            close=105.0,
+            accepted_low=100.0,
+            accepted_high=110.0,
+            accepted_inside=True,
+        )
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.BLOCK, result.action)
+        self.assertIn(
+            "ADVISOR_BLOCK_ACCEPTED_BREAKOUT_NOT_CURRENTLY_OUTSIDE_RANGE",
+            result.reason_codes,
+        )
+        self.assertEqual(97.0, result.diagnostics["candidate_entry_price"])
+        self.assertEqual(105.0, result.diagnostics["deployment_entry_price"])
+        self.assertFalse(
+            result.diagnostics["accepted_breakout_currently_outside_range"]
+        )
+
+    def test_current_accepted_breakout_outside_range_follows_normal_rules(self) -> None:
+        snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
+            side="SELL",
+            entry=97.0,
+            close=97.0,
+            accepted_low=100.0,
+            accepted_high=110.0,
+            accepted_inside=False,
+            session_high=112.0,
+            session_low=80.0,
+            decline_from_high_atr=0.5,
+        )
+        result = StockAdvisor(self._policy()).evaluate(snapshot)
+        self.assertEqual(AdvisorAction.ALLOW, result.action)
+        self.assertIn("ADVISOR_ALLOW_SIMPLE_DEPLOYMENT_CONTEXT", result.reason_codes)
+        self.assertTrue(
+            result.diagnostics["accepted_breakout_currently_outside_range"]
+        )
+
+    def test_setup_levels_use_current_close_not_historical_candidate_entry(self) -> None:
+        snapshot = self._snapshot(
+            family="ACCEPTED_BREAKOUT",
+            subtype="CONTINUATION_ACCEPTANCE",
+            side="SELL",
+            entry=97.0,
+            close=95.0,
+            accepted_inside=False,
+        )
+        instruction = SimpleNamespace(
+            decision=SimpleNamespace(
+                entry_price=97.0,
+                stop_anchor_price=101.0,
+                stop_anchor_type="ACCEPTED_RANGE_LOW",
+                target_basis="OPEN_ENDED",
+                target_reference_price=None,
+            )
+        )
+        identity = AuctionSignalIdentity(
+            opportunity_key="OPPORTUNITY:1",
+            candidate_id="CANDIDATE:SELL",
+            boundary_event_key="BOUNDARY:1",
+            setup_family="ACCEPTED_BREAKOUT",
+            setup_subtype="CONTINUATION_ACCEPTANCE",
+            side="SELL",
+            created_snapshot_time=self.ts,
+        )
+        levels = _entry_setup_levels(snapshot, instruction, identity)
+        self.assertEqual(95.0, levels["entry_price"])
+        self.assertEqual("SNAPSHOT_CLOSE", levels["entry_price_source"])
+        self.assertEqual(97.0, levels["candidate_entry_price"])
 
     def test_advisor_applies_only_to_new_signal_deployment(self) -> None:
         snapshot = self._snapshot()
@@ -314,6 +398,12 @@ class AuctionStockAdvisorTests(unittest.TestCase):
         )
         self.assertEqual("LOCAL_BLOCKED", action)
         self.assertIn("SIGNAL_DEPLOYMENT_BLOCKED_BY_STOCK_ADVISOR", reasons)
+
+    def test_removed_strong_confirmation_config_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            StockAdvisorPolicyConfig(
+                strong_confirmation_min_outside_atr=0.15,
+            )
 
     def test_snapshot_contract_rejects_removed_advisor_field(self) -> None:
         payload = {
