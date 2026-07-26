@@ -1,0 +1,328 @@
+{
+  "completed_at": "2026-07-26T17:17:27.330183+05:30",
+  "config": {
+    "accepted_breakout_outside_rules": [
+      [
+        0.0,
+        -12.0,
+        "NOT_OUTSIDE"
+      ],
+      [
+        0.15,
+        -6.0,
+        "MARGINAL_ESCAPE"
+      ],
+      [
+        0.35,
+        3.0,
+        "EARLY_ESCAPE"
+      ],
+      [
+        1.2,
+        8.0,
+        "HEALTHY_ESCAPE"
+      ],
+      [
+        2.0,
+        3.0,
+        "EXTENDED_ESCAPE"
+      ],
+      [
+        Infinity,
+        -6.0,
+        "VERY_EXTENDED_ESCAPE"
+      ]
+    ],
+    "advisor_points": {
+      "ALLOW": 10.0,
+      "BLOCK": -30.0,
+      "NO_ACTION": 0.0,
+      "UNKNOWN": -2.0,
+      "WATCH": 2.0
+    },
+    "adx_rules": [
+      [
+        12.0,
+        -4.0,
+        "VERY_WEAK"
+      ],
+      [
+        18.0,
+        0.0,
+        "WEAK"
+      ],
+      [
+        25.0,
+        4.0,
+        "DEVELOPING"
+      ],
+      [
+        40.0,
+        7.0,
+        "STRONG"
+      ],
+      [
+        Infinity,
+        5.0,
+        "VERY_STRONG_POSSIBLY_MATURE"
+      ]
+    ],
+    "candidate_staleness_rules": [
+      [
+        0.25,
+        0.0,
+        "FRESH"
+      ],
+      [
+        0.5,
+        -1.0,
+        "SLIGHTLY_MOVED"
+      ],
+      [
+        1.0,
+        -4.0,
+        "STALE"
+      ],
+      [
+        Infinity,
+        -8.0,
+        "VERY_STALE"
+      ]
+    ],
+    "churn_lookback_minutes": 60,
+    "directional_extension_rules": [
+      [
+        0.5,
+        -2.0,
+        "INSUFFICIENT_DEVELOPMENT"
+      ],
+      [
+        3.0,
+        4.0,
+        "HEALTHY_DEVELOPMENT"
+      ],
+      [
+        5.0,
+        2.0,
+        "MATURE_DEVELOPMENT"
+      ],
+      [
+        7.0,
+        -2.0,
+        "EXTENDED"
+      ],
+      [
+        Infinity,
+        -7.0,
+        "VERY_EXTENDED"
+      ]
+    ],
+    "directional_ratio_rules": [
+      [
+        0.45,
+        -2.0,
+        "OPPOSING_BARS_DOMINANT"
+      ],
+      [
+        0.55,
+        0.0,
+        "MIXED"
+      ],
+      [
+        0.7,
+        2.0,
+        "DIRECTIONAL"
+      ],
+      [
+        Infinity,
+        3.0,
+        "STRONGLY_DIRECTIONAL"
+      ]
+    ],
+    "ema_envelope_score_enabled": false,
+    "path_efficiency_rules": [
+      [
+        0.15,
+        -3.0,
+        "VERY_LOW"
+      ],
+      [
+        0.3,
+        -1.0,
+        "LOW"
+      ],
+      [
+        0.6,
+        1.0,
+        "MODERATE"
+      ],
+      [
+        Infinity,
+        3.0,
+        "HIGH"
+      ]
+    ],
+    "priority_bands": [
+      [
+        80.0,
+        "A"
+      ],
+      [
+        60.0,
+        "B"
+      ],
+      [
+        30.0,
+        "C"
+      ],
+      [
+        0.0,
+        "D"
+      ]
+    ],
+    "quintile_count": 5,
+    "ranking_version": "SIGNAL_PRIORITY_V1_1_WINDOW_ALIAS_FIX",
+    "reversal_room_rules": [
+      [
+        0.25,
+        -3.0,
+        "VERY_LOW_ROOM"
+      ],
+      [
+        0.5,
+        0.0,
+        "LOW_ROOM"
+      ],
+      [
+        1.0,
+        2.0,
+        "MODERATE_ROOM"
+      ],
+      [
+        Infinity,
+        4.0,
+        "GOOD_ROOM"
+      ]
+    ],
+    "setup_base_points": {
+      "ACCEPTED_BREAKOUT": 0.0,
+      "BREAKOUT_INITIATION": 0.0,
+      "FAILED_BREAKOUT": 0.0,
+      "REVERSAL": 0.0,
+      "UNKNOWN": -5.0
+    },
+    "setup_families": [],
+    "symbols": [],
+    "test_date": "2026-07-24",
+    "test_userid": "DR1812",
+    "time_rules": [
+      [
+        "15:15:00",
+        -25.0,
+        "AFTER_CUTOFF_ZONE"
+      ],
+      [
+        "14:45:00",
+        -7.0,
+        "VERY_LATE"
+      ],
+      [
+        "14:00:00",
+        -3.0,
+        "LATE"
+      ],
+      [
+        "09:15:00",
+        0.0,
+        "NORMAL"
+      ]
+    ],
+    "top_percentiles": [
+      10,
+      20,
+      30
+    ],
+    "window_full_score_atr": {
+      "15m": 1.5,
+      "30m": 2.0,
+      "60m": 3.0
+    },
+    "window_max_points": {
+      "ACCEPTED_BREAKOUT": {
+        "15m": 4.0,
+        "30m": 4.0,
+        "60m": 3.0
+      },
+      "BREAKOUT_INITIATION": {
+        "15m": 5.0,
+        "30m": 4.0,
+        "60m": 2.0
+      },
+      "FAILED_BREAKOUT": {
+        "15m": 6.0,
+        "30m": 4.0,
+        "60m": 2.0
+      },
+      "REVERSAL": {
+        "15m": 6.0,
+        "30m": 3.0,
+        "60m": 1.0
+      },
+      "UNKNOWN": {
+        "15m": 3.0,
+        "30m": 2.0,
+        "60m": 1.0
+      }
+    }
+  },
+  "config_hash": "6fe5fe81a15dfd3c",
+  "database_access": "get_trades_db + existing ORM models",
+  "market_window_json_keys": [
+    "15m",
+    "30m",
+    "60m",
+    "sod"
+  ],
+  "output_files": {
+    "errors": "reports/test_ranking_signals_2026-07-24_20260726_171727_errors.csv",
+    "quintiles": "reports/test_ranking_signals_2026-07-24_20260726_171727_quintiles.csv",
+    "ranked": "reports/test_ranking_signals_2026-07-24_20260726_171727_ranked.csv",
+    "setups": "reports/test_ranking_signals_2026-07-24_20260726_171727_setups.csv",
+    "summary": "reports/test_ranking_signals_2026-07-24_20260726_171727_summary.json",
+    "top_percentiles": "reports/test_ranking_signals_2026-07-24_20260726_171727_top_percentiles.csv"
+  },
+  "overall": {
+    "average_pnl": 1229.336,
+    "best_package": 13624.75,
+    "flats": 1,
+    "losses": 38,
+    "median_pnl": 259.925,
+    "profit_factor": 2.139339,
+    "signals": 84,
+    "signals_with_outcome": 82,
+    "total_pnl": 100805.55,
+    "win_rate_pct": 53.0864,
+    "wins": 43,
+    "worst_package": -7371.0
+  },
+  "ranking_version": "SIGNAL_PRIORITY_V1_1_WINDOW_ALIAS_FIX",
+  "read_only": true,
+  "record_errors": 0,
+  "score_excludes": [
+    "signal_mfe",
+    "signal_mae",
+    "package_mfe",
+    "package_mae",
+    "exit_price",
+    "exit_reason",
+    "exit_time",
+    "later_signal_lifecycle",
+    "later_auction_transitions",
+    "future_snapshots",
+    "realized_pnl"
+  ],
+  "snapshot_access": "SnapshotSchema.fetch_snapshot",
+  "snapshot_dump": "SnapshotSchema.model_dump(by_alias=True)",
+  "started_at": "2026-07-26T17:17:18.496834+05:30",
+  "test_date": "2026-07-24"
+}
