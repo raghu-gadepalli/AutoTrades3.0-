@@ -1,6 +1,6 @@
 // static/js/sw.js
-// UI CSV download refresh: 2026-07-27
-const CACHE_NAME = "autotrades-p53-v2";
+// Signals P&L display refresh: 2026-07-27
+const CACHE_NAME = "autotrades-p53-v3";
 
 const PRECACHE_URLS = [
   // CSS

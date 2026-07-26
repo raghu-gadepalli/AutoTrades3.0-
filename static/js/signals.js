@@ -311,6 +311,24 @@
     `;
   }
 
+  function signalPnlCell(row) {
+    const pct = Number(row?.last_pnl);
+    const perShare = Number(row?.last_pnl_value);
+
+    if (!Number.isFinite(pct) || !Number.isFinite(perShare)) {
+      return `<div class="sig-cell-tight text-muted">—</div>`;
+    }
+
+    const cls = pct > 0 ? "dash-text-success" : (pct < 0 ? "dash-text-danger" : "text-muted");
+    const pctText = `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`;
+    const valueText = `${perShare > 0 ? "+" : (perShare < 0 ? "-" : "")}₹${Math.abs(perShare).toFixed(2)} / share`;
+
+    return `<div class="sig-cell-tight ${cls}">
+      ${escHtml(pctText)}
+      <div class="sig-sub">${escHtml(valueText)}</div>
+    </div>`;
+  }
+
   function addRow(table, row) {
     const closedTime = (row.closed_time && row.closed_time !== "N/A") ? row.closed_time : "Active";
     const closedPrice = (row.closed_price != null && row.closed_price !== "N/A") ? num(row.closed_price, 2) : "-";
@@ -336,6 +354,7 @@
         <div class="sig-sub">${escHtml(closedTime)}</div>
       </div>`,
 
+      signalPnlCell(row),
       `<div class="sig-cell-tight">${num(row.vwap, 2)}</div>`,
       `<div class="sig-cell-tight">${num(row.rsi, 2)}</div>`,
       bbBadge(row.bb_zone),
@@ -518,6 +537,7 @@
       ["Created", `${safeStr(row.first_seen_time)} / ${num(row.created_price, 2)}`],
       ["Last", `${safeStr(row.last_eval_time)} / ${num(row.last_price, 2)}`],
       ["Closed", `${closedTime} / ${closedPrice}`],
+      ["P&L", signalPnlCell(row)],
       ["Price Move", formatPriceMove(row)],
       ["Times", escHtml(times)]
     ];
