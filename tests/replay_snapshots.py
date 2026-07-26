@@ -48,7 +48,7 @@ API_KEY_OVERRIDE = ""
 ACCESS_TOKEN_OVERRIDE = ""
 
 # Number of parallel worker processes
-MAX_WORKERS = 5
+MAX_WORKERS = 3
 
 MARKET_OPEN_HHMM: Tuple[int, int] = (9, 15)
 MARKET_CLOSE_HHMM: Tuple[int, int] = (15, 30)
