@@ -1,5 +1,0 @@
-﻿setup_family,signals,signals_with_outcome,wins,losses,flats,win_rate_pct,total_pnl,average_pnl,median_pnl,profit_factor,best_package,worst_package
-ACCEPTED_BREAKOUT,16,16,9,6,1,60.0,25160.85,1572.5531,1726.0,2.396254,8635.0,-7371.0
-BREAKOUT_INITIATION,3,3,2,1,0,66.6667,4928.65,1642.8833,2124.0,5.161481,3989.0,-1184.35
-FAILED_BREAKOUT,3,3,3,0,0,100.0,18655.5,6218.5,5653.0,INF,7697.3,5305.2
-REVERSAL,62,60,29,31,0,48.3333,52060.55,867.6758,-249.175,1.751532,13624.75,-6010.15

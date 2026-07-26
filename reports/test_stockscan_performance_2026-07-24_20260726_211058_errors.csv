@@ -1,0 +1,16 @@
+﻿symbol,stage,error_type,error,traceback
+FINNIFTY,FETCH_OR_EVALUATE,ValueError,Missing instrument token,"Traceback (most recent call last):
+  File ""/var/www/autotrades/tests/test_stockscan_performance.py"", line 1333, in run
+    raise ValueError(""Missing instrument token"")
+ValueError: Missing instrument token
+"
+MIDCPNIFTY,FETCH_OR_EVALUATE,ValueError,Missing instrument token,"Traceback (most recent call last):
+  File ""/var/www/autotrades/tests/test_stockscan_performance.py"", line 1333, in run
+    raise ValueError(""Missing instrument token"")
+ValueError: Missing instrument token
+"
+NIFTYNXT50,FETCH_OR_EVALUATE,ValueError,Missing instrument token,"Traceback (most recent call last):
+  File ""/var/www/autotrades/tests/test_stockscan_performance.py"", line 1333, in run
+    raise ValueError(""Missing instrument token"")
+ValueError: Missing instrument token
+"
