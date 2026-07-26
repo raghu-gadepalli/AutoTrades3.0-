@@ -1,6 +1,6 @@
 // static/js/sw.js
-// Signals P&L display refresh: 2026-07-27
-const CACHE_NAME = "autotrades-p53-v3";
+// Signals P&L display-text correction: 2026-07-27
+const CACHE_NAME = "autotrades-p53-v5";
 
 const PRECACHE_URLS = [
   // CSS

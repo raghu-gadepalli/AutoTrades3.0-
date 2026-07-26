@@ -321,7 +321,7 @@
 
     const cls = pct > 0 ? "dash-text-success" : (pct < 0 ? "dash-text-danger" : "text-muted");
     const pctText = `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`;
-    const valueText = `${perShare > 0 ? "+" : (perShare < 0 ? "-" : "")}₹${Math.abs(perShare).toFixed(2)} / share`;
+    const valueText = `${perShare > 0 ? "+" : (perShare < 0 ? "-" : "")}₹${Math.abs(perShare).toFixed(2)}`;
 
     return `<div class="sig-cell-tight ${cls}">
       ${escHtml(pctText)}
