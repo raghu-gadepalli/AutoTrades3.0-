@@ -1,6 +1,6 @@
 // static/js/sw.js
-// UI contract refresh: 2026-07-14
-const CACHE_NAME = "autotrades-p53-v1";
+// UI CSV download refresh: 2026-07-27
+const CACHE_NAME = "autotrades-p53-v2";
 
 const PRECACHE_URLS = [
   // CSS

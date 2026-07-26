@@ -1,11 +1,13 @@
 # routes/dash.py
 
+import csv
+import io
 import json
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Blueprint, jsonify, render_template, request
+from flask import Blueprint, Response, jsonify, render_template, request
 from sqlalchemy import or_
 
 from schemas.user_trade import UserTradeSchema
@@ -19,7 +21,11 @@ from utils.account_scope import (
     userids as scope_userids,
 )
 from database.database import get_trades_db
-from models.trade_models import UserTrade as UserTradeORM, AuditLog as AuditLogORM
+from models.trade_models import (
+    AuditLog as AuditLogORM,
+    Signal as SignalORM,
+    UserTrade as UserTradeORM,
+)
 from routes.routes import login_required
 from schemas.symbol import SymbolSchema
 from schemas.signal import SignalSchema
@@ -77,6 +83,108 @@ def _safe_str(x, default=""):
         return str(x) if x is not None else default
     except Exception:
         return default
+
+
+def _csv_number(value, decimals: int = 2):
+    """Return an Excel-friendly plain numeric value for CSV output."""
+    if value is None or value == "N/A":
+        return ""
+    try:
+        return f"{float(value):.{decimals}f}"
+    except Exception:
+        return _safe_str(value, "")
+
+
+def _csv_download(filename: str, headers: list[str], rows) -> Response:
+    """Build a UTF-8 CSV download without temporary files."""
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+
+    # UTF-8 BOM keeps Excel from misreading symbols such as ₹.
+    response = Response("\ufeff" + output.getvalue(), content_type="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _download_timestamp() -> str:
+    return datetime.now(IST).strftime("%Y%m%d%H%M")
+
+
+def _order_origin_label(value) -> str:
+    origin = _safe_str(value, "UNKNOWN").strip().upper() or "UNKNOWN"
+    labels = {
+        "SIGNAL_AUTO": "Signal Auto",
+        "SIGNAL_MANUAL": "Signal Manual",
+        "WATCHLIST": "Watchlist",
+        "POSITION_ADD": "Position Add",
+        "UNKNOWN": "Unknown",
+    }
+    return labels.get(origin, origin.replace("_", " ").title())
+
+
+def _order_status_label(entry_status, exit_status) -> str:
+    es = _safe_str(entry_status, "").strip().upper()
+    xs = _safe_str(exit_status, "NONE").strip().upper() or "NONE"
+
+    if xs == "READY":
+        return "EXIT READY"
+    if xs == "SUBMITTED":
+        return "EXIT SUBMITTED"
+    if xs == "FILLED":
+        return "CLOSED"
+
+    labels = {
+        "CREATED": "DRAFT",
+        "READY": "CONFIRMED",
+        "SUBMITTED": "SUBMITTED",
+        "FILLED": "FILLED",
+        "CANCELLED": "CANCELLED",
+        "REJECTED": "REJECTED",
+        "INVALID": "INVALID",
+    }
+    return labels.get(es, es or "—")
+
+
+def _all_signal_ui_rows() -> list[dict]:
+    """Load every signal in UI order without sorting wide JSON rows in MySQL."""
+    batch_size = 250
+    output: list[dict] = []
+
+    with get_trades_db() as db:
+        ordered_ids = [
+            int(row_id)
+            for (row_id,) in (
+                db.query(SignalORM.id)
+                .order_by(SignalORM.last_eval_time.desc(), SignalORM.id.desc())
+                .all()
+            )
+        ]
+
+        for start in range(0, len(ordered_ids), batch_size):
+            batch_ids = ordered_ids[start:start + batch_size]
+            fetched = db.query(SignalORM).filter(SignalORM.id.in_(batch_ids)).all()
+            by_id = {int(row.id): row for row in fetched}
+
+            for row_id in batch_ids:
+                orm_row = by_id.get(row_id)
+                if orm_row is None:
+                    logger.error("signals_download missing ORM row | signal_db_id=%s", row_id)
+                    continue
+                try:
+                    output.append(SignalSchema.model_validate(orm_row).to_ui_row())
+                except Exception:
+                    logger.exception(
+                        "signals_download row conversion failed; continuing | signal_db_id=%s signal_id=%s symbol=%s",
+                        row_id,
+                        getattr(orm_row, "signal_id", None),
+                        getattr(orm_row, "symbol", None),
+                    )
+
+    return output
 
 
 def _status(tr) -> tuple[str, str]:
@@ -1723,6 +1831,70 @@ def signals_data():
     return jsonify({"status": "success", "data": data})
 
 
+@dash_bp.route("/signals/download")
+@login_required
+def signals_download():
+    """Download every signal visible to the current actor as a compact CSV."""
+    actor = get_current_userid()
+    if not actor:
+        return jsonify({"status": "error", "reason": "not_authenticated"}), 401
+
+    try:
+        rows = _all_signal_ui_rows()
+
+        if not is_operator(actor):
+            user = UserSchema.fetch_user(actor)
+            if not user:
+                return jsonify({"status": "error", "reason": "user_not_found"}), 404
+            rows = [row for row in rows if user.allowed_symbols(_safe_str(row.get("symbol"), ""))]
+
+        headers = [
+            "Side",
+            "Symbol",
+            "Setup",
+            "Stage",
+            "Status",
+            "Created Price",
+            "Created Time",
+            "Last Price",
+            "Last Time",
+            "Closed Price",
+            "Closed Time",
+            "VWAP",
+            "RSI",
+            "BB",
+        ]
+
+        csv_rows = (
+            [
+                _safe_str(row.get("side"), ""),
+                _safe_str(row.get("symbol"), ""),
+                _safe_str(row.get("setup"), ""),
+                _safe_str(row.get("stage"), ""),
+                _safe_str(row.get("status"), ""),
+                _csv_number(row.get("created_price")),
+                _safe_str(row.get("first_seen_time"), ""),
+                _csv_number(row.get("last_price")),
+                _safe_str(row.get("last_eval_time"), ""),
+                _csv_number(row.get("closed_price")),
+                _safe_str(row.get("closed_time"), ""),
+                _csv_number(row.get("vwap")),
+                _csv_number(row.get("rsi")),
+                _safe_str(row.get("bb_zone"), ""),
+            ]
+            for row in rows
+        )
+
+        return _csv_download(
+            f"signals_{_download_timestamp()}.csv",
+            headers,
+            csv_rows,
+        )
+    except Exception as exc:
+        logger.exception("signals_download failed: %s", exc)
+        return jsonify({"status": "error", "reason": "signals_download_failed"}), 500
+
+
 # =============================================================================
 # ORDERS
 # =============================================================================
@@ -1796,6 +1968,103 @@ def orders_data():
     except Exception as e:
         logger.exception("orders_data failed bucket=%s: %s", bucket, e)
         return jsonify({"status": "error", "reason": "orders_data_failed"}), 500
+
+
+@dash_bp.route("/orders/download")
+@login_required
+def orders_download():
+    """Download all managed trade rows for the current/selected user scope."""
+    actor = get_current_userid()
+    if not actor:
+        return jsonify({"status": "error", "reason": "not_authenticated"}), 401
+
+    requested_userids = _requested_userids_from_query()
+    visible_userids = _fetch_managed_userids(actor)
+
+    if is_operator(actor) and requested_userids:
+        visible_by_key = {userid.upper(): userid for userid in visible_userids}
+        userids = [
+            visible_by_key[userid.upper()]
+            for userid in requested_userids
+            if userid.upper() in visible_by_key
+        ]
+    else:
+        userids = visible_userids
+
+    headers = [
+        "User",
+        "Entry Plan",
+        "Origin",
+        "Symbol",
+        "Type",
+        "Side",
+        "Entry",
+        "Qty",
+        "Last",
+        "P&L",
+        "Status",
+    ]
+
+    if not userids:
+        return _csv_download(
+            f"user_trades_{_download_timestamp()}.csv",
+            headers,
+            [],
+        )
+
+    try:
+        with get_trades_db() as db:
+            rows = (
+                db.query(UserTradeORM)
+                .filter(UserTradeORM.userid.in_(userids))
+                .order_by(UserTradeORM.userid.asc(), UserTradeORM.id.desc())
+                .all()
+            )
+
+        ui_rows = []
+        for trade in rows:
+            try:
+                ui_rows.append(_to_orders_row(trade))
+            except Exception:
+                logger.exception(
+                    "orders_download row conversion failed; continuing | trade_id=%s userid=%s symbol=%s",
+                    getattr(trade, "id", None),
+                    getattr(trade, "userid", None),
+                    getattr(trade, "symbol", None),
+                )
+
+        csv_rows = (
+            [
+                _safe_str(row.get("userid"), ""),
+                _safe_str(row.get("entry_plan_time") or row.get("date"), ""),
+                _order_origin_label(row.get("origin")),
+                _safe_str(row.get("symbol"), ""),
+                " ".join(
+                    part
+                    for part in (
+                        f"{_safe_str(row.get('instrument_type'), '')} / {_safe_str(row.get('product'), 'MIS')}",
+                        _safe_str(row.get("execution_mode"), ""),
+                    )
+                    if part.strip()
+                ).strip(),
+                _safe_str(row.get("trade_type"), ""),
+                _csv_number(row.get("entry_price")),
+                _safe_int(row.get("quantity"), 0),
+                _csv_number(row.get("last_price")),
+                _csv_number(row.get("pnl_value")) if row.get("pnl_available") is True else "",
+                _order_status_label(row.get("entry_status"), row.get("exit_status")),
+            ]
+            for row in ui_rows
+        )
+
+        return _csv_download(
+            f"user_trades_{_download_timestamp()}.csv",
+            headers,
+            csv_rows,
+        )
+    except Exception as exc:
+        logger.exception("orders_download failed userids=%s: %s", userids, exc)
+        return jsonify({"status": "error", "reason": "orders_download_failed"}), 500
 
 
 # =============================================================================

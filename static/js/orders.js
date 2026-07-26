@@ -38,6 +38,24 @@
     return value || "ALL";
   }
 
+  function updateOrdersDownloadLink() {
+    const link = document.getElementById("or-download");
+    if (!link) return;
+
+    const baseUrl = String(link.dataset.baseUrl || link.getAttribute("href") || "").trim();
+    if (!baseUrl) return;
+
+    const url = new URL(baseUrl, window.location.origin);
+    const userid = selectedUserFilter();
+
+    url.searchParams.delete("userid");
+    if (showUsers() && userid !== "ALL") {
+      url.searchParams.set("userid", userid);
+    }
+
+    link.href = `${url.pathname}${url.search}`;
+  }
+
   function orderGroupState(bucket = CURRENT_BUCKET) {
     const key = bucket === "executed" ? "executed" : "draft";
     if (!orderCollapsedGroups[key]) {
@@ -444,6 +462,8 @@
     const userFilter = selectedUserFilter();
     const modeFilter = selectedModeFilter();
 
+    updateOrdersDownloadLink();
+
     NORM = ALL_NORM.filter(function (row) {
       const userOk = userFilter === "ALL" || upper(row.userid) === userFilter;
       const modeOk = modeFilter === "ALL" || upper(row.execution_mode, "VIRTUAL") === modeFilter;
@@ -577,6 +597,8 @@
   });
 
   $(function () {
+    updateOrdersDownloadLink();
+
     DT = $("#orders-table").DataTable({
       responsive: true,
       autoWidth: false,

@@ -43,6 +43,14 @@
             <option value="200">Show 200</option>
             <option value="-1" selected>Show all</option>
           </select>
+
+          <a id="or-download"
+             class="btn btn-outline-primary btn-sm"
+             href="{{ url_for('dash.orders_download') }}"
+             data-base-url="{{ url_for('dash.orders_download') }}"
+             title="Download all managed trades for the selected user as CSV">
+            <i class="bi bi-download me-1"></i>Download CSV
+          </a>
         </div>
       </div>
     </div>
@@ -240,5 +248,5 @@
   };
 </script>
 <script src="{{ url_for('static', filename='js/trade_edit.js') }}" defer></script>
-<script src="{{ url_for('static', filename='js/orders.js', v='20260724-real-entry-guard') }}" defer></script>
+<script src="{{ url_for('static', filename='js/orders.js', v='20260727-csv-download') }}" defer></script>
 {% endblock %}
