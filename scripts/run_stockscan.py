@@ -59,11 +59,11 @@ def wait_for_run_time() -> bool:
 
 
 def _log_scan_summary(now_ist: datetime, res: dict):
-    stats = res.get("stats") or {}
-    selected = res.get("selected") or []
-    selected_whitelist = res.get("selected_whitelist") or []
-    selected_dynamic = res.get("selected_dynamic") or []
-    update_result = res.get("update_result") or {}
+    stats = res["stats"]
+    selected = res["selected"]
+    selected_whitelist = res["selected_whitelist"]
+    selected_dynamic = res["selected_dynamic"]
+    update_result = res["update_result"]
 
     logger.info(
         "Stockscan @ %s | selected=%d whitelist=%d dynamic=%d universe=%d candidates=%d missing=%d invalid=%d activated_db=%s",
@@ -71,11 +71,11 @@ def _log_scan_summary(now_ist: datetime, res: dict):
         len(selected),
         len(selected_whitelist),
         len(selected_dynamic),
-        int(stats.get("universe", 0)),
-        int(stats.get("candidates", 0)),
-        int(stats.get("missing_candle", 0)),
-        int(stats.get("invalid_candle", 0)),
-        update_result.get("activated_count"),
+        int(stats["universe"]),
+        int(stats["candidates"]),
+        int(stats["missing_candle"]),
+        int(stats["invalid_candle"]),
+        int(update_result["activated_count"]),
     )
 
     if selected_whitelist:
@@ -83,18 +83,18 @@ def _log_scan_summary(now_ist: datetime, res: dict):
     if selected_dynamic:
         logger.info("Stockscan selected dynamic: %s", ", ".join(selected_dynamic))
 
-    top_candidates = (res.get("candidates") or [])[:20]
+    top_candidates = res["candidates"][:20]
     for row in top_candidates:
         logger.debug(
             "candidate %-14s score=%.3f dir=%s gap=%.3f day=%.3f bar=%.3f range=%.3f turnover_lakh=%.1f",
-            row.get("symbol"),
-            float(row.get("score") or 0.0),
-            row.get("direction"),
-            float(row.get("gap_pct") or 0.0),
-            float(row.get("day_move_pct") or 0.0),
-            float(row.get("candle_move_pct") or 0.0),
-            float(row.get("candle_range_pct") or 0.0),
-            float(row.get("turnover_lakh") or 0.0),
+            row["symbol"],
+            float(row["score"]),
+            row["direction"],
+            float(row["gap_pct"]),
+            float(row["day_move_pct"]),
+            float(row["candle_move_pct"]),
+            float(row["candle_range_pct"]),
+            float(row["turnover_lakh"]),
         )
 
 

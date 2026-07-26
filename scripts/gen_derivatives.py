@@ -154,7 +154,7 @@ def _is_skipped_result(result: Optional[dict]) -> bool:
     """
     if not isinstance(result, dict):
         return True
-    return result.get("raw") is None and result.get("derived") is None
+    return result["raw"] is None and result["derived"] is None
 
 
 # ----------------------------

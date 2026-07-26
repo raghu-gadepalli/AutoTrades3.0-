@@ -20,13 +20,13 @@ from services.event_router import dispatch_event
 from utils.run_control import allow_run_today
 
 #  CONFIG
-conf = SERVICE_CONFIG.event.model_dump()
-IST            = ZoneInfo("Asia/Kolkata")
-START_TIME     = dtime.fromisoformat(conf["window_start"])           # "HH:MM:SS"
-END_TIME       = dtime.fromisoformat(conf["window_end"])             # "HH:MM:SS"
-POLL_INTERVAL  = int(conf["retry_interval_seconds"])
-ERROR_BACKOFF  = int((conf.get("extras") or {}).get("error_backoff_seconds", 5))
-LOG_FILE       = conf["log_file"]
+conf = SERVICE_CONFIG.event
+IST            = ZoneInfo(SERVICE_CONFIG.tz)
+START_TIME     = dtime.fromisoformat(conf.window_start)
+END_TIME       = dtime.fromisoformat(conf.window_end)
+POLL_INTERVAL  = int(conf.retry_interval_seconds)
+ERROR_BACKOFF  = int(conf.extras.error_backoff_seconds)
+LOG_FILE       = conf.log_file
 
 logger: Optional[logging.Logger] = None
 

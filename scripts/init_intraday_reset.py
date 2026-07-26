@@ -9,12 +9,7 @@ Init-day intraday reset (consistent logging like other runners)
 - Reset user logins (logged_in=0, logged_time=NULL)
 
 Config: SERVICE_CONFIG.init_reset
-    {
-        "log_file": "/var/www/autotrades/scripts/init_intraday_reset.log",
-        "archive_before_truncate": true,
-        "reset_eq_flags": true,
-        "reset_user_logins": true
-    }
+All reset behavior and table scope are explicitly defined by InitResetConfig.
 """
 
 import os
@@ -56,14 +51,15 @@ from schemas.symbol import SymbolSchema
 TZ = SERVICE_CONFIG.tz
 IST = ZoneInfo(TZ)
 
-CONF = SERVICE_CONFIG.init_reset.model_dump()
+CONF = SERVICE_CONFIG.init_reset
 
-LOG_FILE = CONF.get("log_file", "/var/www/autotrades/scripts/init_intraday_reset.log")
-ARCHIVE_BEFORE_TRUNCATE = bool(CONF.get("archive_before_truncate", True))
-RESET_EQ_FLAGS = bool(CONF.get("reset_eq_flags", True))
-RESET_USER_LOGS = bool(CONF.get("reset_user_logins", True))
-ARCHIVE_AUDITLOG = bool(CONF.get("archive_auditlog", True))
-AUTOLOGIN_VIRTUAL_USERS = list(CONF.get("virtual_autologin_userids", ["ADMIN"]) or [])
+LOG_FILE = CONF.log_file
+ARCHIVE_BEFORE_TRUNCATE = bool(CONF.archive_before_truncate)
+RESET_EQ_FLAGS = bool(CONF.reset_eq_flags)
+RESET_USER_LOGS = bool(CONF.reset_user_logins)
+ARCHIVE_AUDITLOG = bool(CONF.archive_auditlog)
+AUTOLOGIN_VIRTUAL_USERS = list(CONF.virtual_autologin_userids)
+INTRADAY_TABLES = frozenset(CONF.intraday_tables)
 
 logger: logging.Logger | None = None
 
@@ -83,24 +79,12 @@ def _engine_db_for_model(session, model):
 
 
 def _select_intraday_tables(session):
-    """Pick mapped tables considered intraday (by table.info['intraday'] or default set)."""
-    default_intraday_tables = {
-        "user_trades",
-        "signals",
-        "snapshots",
-        "candles",
-        "derivativeschain",
-        "oms_funds_history",
-        "oms_positions_history",
-        "oms_orders_history",
-    }
+    """Pick only the intraday tables explicitly declared in InitResetConfig."""
     selected = []  # list of (engine, db_name, table_name, fq_name)
 
     for mapper in Base.registry.mappers:
         table = mapper.local_table
-        flag = table.info.get("intraday") if hasattr(table, "info") else None
-        include = flag if flag is not None else (table.name in default_intraday_tables)
-        if not include:
+        if table.name not in INTRADAY_TABLES:
             continue
 
         model_cls = mapper.class_
@@ -413,10 +397,10 @@ def reset_eq_processing_flags() -> int:
     )
     logger.info(
         "Reset daily selection flags | reset=%d whitelist_active=%d",
-        int(result.get("reset_count", 0)),
-        int(result.get("whitelist_active_count", 0)),
+        int(result["reset_count"]),
+        int(result["whitelist_active_count"]),
     )
-    return int(result.get("reset_count", 0))
+    return int(result["reset_count"])
 
 
 # ---------------------------

@@ -33,16 +33,15 @@ from utils.datetime_utils import IST
 # ----------------------------
 # CONFIG
 # ----------------------------
-conf = BROKER_CONFIG.reconcile.model_dump()
+conf = BROKER_CONFIG.reconcile
 
-START_TIME = dtime.fromisoformat(conf["window_start"])
-END_TIME = dtime.fromisoformat(conf["window_end"])
-RETRY_INTERVAL = int(conf.get("retry_interval_seconds", 60))
-LOG_FILE = conf["log_file"]
+START_TIME = dtime.fromisoformat(conf.window_start)
+END_TIME = dtime.fromisoformat(conf.window_end)
+RETRY_INTERVAL = int(conf.retry_interval_seconds)
+LOG_FILE = conf.log_file
 
-extras = conf.get("extras", {}) or {}
-MAX_WORKERS = int(extras.get("max_workers", 5) or 5)
-LIMIT_USERS = int(extras.get("limit_users", 100) or 100)
+MAX_WORKERS = int(conf.extras.max_workers)
+LIMIT_USERS = int(conf.extras.limit_users)
 
 logger: Optional[logging.Logger] = None
 

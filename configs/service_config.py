@@ -44,11 +44,32 @@ class EventServiceConfig(BaseModel):
 
 class InitResetConfig(BaseModel):
     log_file: str = "/var/www/autotrades/scripts/init_intraday_reset.log"
+
+    archive_before_truncate: bool = True
+    archive_auditlog: bool = True
+    reset_eq_flags: bool = True
+    reset_user_logins: bool = True
+
+    virtual_autologin_userids: list[str] = Field(default_factory=lambda: ["ADMIN", "TCQ489"])
+
+    # Explicit reset scope. The reset runner must not infer table ownership or
+    # silently fall back to a hard-coded list when configuration is incomplete.
+    intraday_tables: list[str] = Field(default_factory=lambda: [
+        "user_trades",
+        "signals",
+        "snapshots",
+        "candles",
+        "derivativeschain",
+        "oms_funds_history",
+        "oms_positions_history",
+        "oms_orders_history",
+        "auditlog",
+    ])
+
+    # Retained for compatibility with the existing configuration surface.
     restart_identity: bool = True
     use_cascade: bool = False
     deactivate_types: list[str] = Field(default_factory=lambda: ["FUT", "CE", "PE"])
-    reset_eq_flags: bool = True
-    reset_user_logins: bool = True
 
 
 class ServiceConfig(BaseModel):

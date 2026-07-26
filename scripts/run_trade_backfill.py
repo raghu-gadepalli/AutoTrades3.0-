@@ -40,16 +40,15 @@ logger = logging.getLogger(__name__)
 TZ = SERVICE_CONFIG.tz
 IST = ZoneInfo(TZ)
 
-CFG = BROKER_CONFIG.trade_backfill.model_dump()
-LOG_FILE = CFG.get("log_file", "/var/www/autotrades/scripts/trade_backfill.log")
-START_TIME = dtime.fromisoformat(str(CFG.get("window_start", "08:30:00")))
-END_TIME = dtime.fromisoformat(str(CFG.get("window_end", "19:30:00")))
-RETRY_INTERVAL_SECONDS = int(CFG.get("retry_interval_seconds", 30) or 30)
-EXTRAS = CFG.get("extras", {}) or {}
+CFG = BROKER_CONFIG.trade_backfill
+LOG_FILE = CFG.log_file
+START_TIME = dtime.fromisoformat(CFG.window_start)
+END_TIME = dtime.fromisoformat(CFG.window_end)
+RETRY_INTERVAL_SECONDS = int(CFG.retry_interval_seconds)
 
-LIMIT_USERS = int(EXTRAS.get("limit_users", 100) or 100)
-LIMIT_TRADES_PER_USER = int(EXTRAS.get("limit_trades_per_user", 500) or 500)
-DRY_RUN = bool(EXTRAS.get("dry_run", False))
+LIMIT_USERS = int(CFG.extras.limit_users)
+LIMIT_TRADES_PER_USER = int(CFG.extras.limit_trades_per_user)
+DRY_RUN = bool(CFG.extras.dry_run)
 
 
 def _sleep_to_next_tick(seconds: int) -> None:
@@ -143,13 +142,13 @@ def main() -> None:
                 logger.info(
                     "TradeBackfill tick done | users_found=%s users_processed=%s users_succeeded=%s "
                     "users_failed=%s trades_seen=%s trades_updated=%s errors=%s dry_run=%s",
-                    stats.get("users_found", 0),
-                    stats.get("users_processed", 0),
-                    stats.get("users_succeeded", 0),
-                    stats.get("users_failed", 0),
-                    stats.get("trades_seen", 0),
-                    stats.get("trades_updated", 0),
-                    stats.get("errors", 0),
+                    stats["users_found"],
+                    stats["users_processed"],
+                    stats["users_succeeded"],
+                    stats["users_failed"],
+                    stats["trades_seen"],
+                    stats["trades_updated"],
+                    stats["errors"],
                     DRY_RUN,
                 )
 

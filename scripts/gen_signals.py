@@ -20,13 +20,13 @@ from services.signals.signal_generator import SignalGenerator
 from utils.run_control import allow_run_today
 
 #  CONFIG
-conf = SIGNAL_CONFIG.service.model_dump()
+conf = SIGNAL_CONFIG.service
 IST = ZoneInfo("Asia/Kolkata")
 
-START_TIME      = dtime.fromisoformat(conf["window_start"])                # e.g. "09:16:00"
-END_TIME        = dtime.fromisoformat(conf["window_end"])                  # e.g. "15:30:00"
-RETRY_INTERVAL  = int(conf["retry_interval_seconds"])              # logging only
-LOG_FILE        = conf["log_file"]
+START_TIME      = dtime.fromisoformat(conf.window_start)
+END_TIME        = dtime.fromisoformat(conf.window_end)
+RETRY_INTERVAL  = int(conf.retry_interval_seconds)
+LOG_FILE        = conf.log_file
 
 logger: Optional[logging.Logger] = None
 
