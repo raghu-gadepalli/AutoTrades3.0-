@@ -81,7 +81,7 @@ REPLAY_USERID: Optional[str] = "DR1812"
 
 # Parallelism applies only to SignalGenerator work for different symbols at the
 # same snapshot cadence.
-SIGNAL_MAX_WORKERS: int = 5
+SIGNAL_MAX_WORKERS: int = 3
 
 # Log individual signal evaluations above this duration as slow.
 SLOW_SIGNAL_SECONDS: float = 5.0
