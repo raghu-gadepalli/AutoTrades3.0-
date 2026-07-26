@@ -2239,6 +2239,17 @@ def positions_data():
             summaries.append({
                 "userid": userid,
 
+                # Preserve provenance and the planned entry timestamp from the
+                # underlying trade row.  The position UI renders aggregated
+                # summaries, so omitting these fields here caused valid
+                # TRADE_GENERATOR rows to appear as Origin=Unknown and left the
+                # Entry Plan column blank.
+                "origin": ref_item["origin"],
+                "management_mode": ref_item["management_mode"],
+                "signal_id": ref_item["signal_id"],
+                "signal_reference": ref_item["signal_reference"],
+                "entry_plan_time": ref_item["entry_plan_time"],
+
                 "symbol": sym,
                 "equity_ref": equity_ref,
                 "instrument_type": instrument_type,
