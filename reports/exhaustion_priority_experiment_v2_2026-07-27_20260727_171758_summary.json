@@ -1,0 +1,111 @@
+{
+  "baseline_package_pnl_all_known": -75657.34999999996,
+  "baseline_package_pnl_chase_blocked_known": 0.0,
+  "baseline_package_pnl_range_blocked_known": -19305.950000000004,
+  "baseline_package_pnl_unchanged_known": -56351.40000000001,
+  "baseline_signals": 67,
+  "baseline_signals_blocked_as_chase": 0,
+  "baseline_signals_blocked_by_range": 16,
+  "baseline_signals_unchanged": 51,
+  "chase_block_eligible_snapshot_pct": 0.0,
+  "chase_block_eligible_snapshots": 0,
+  "config": {
+    "exhaustion": {
+      "baseline_match_window_minutes": 120.0,
+      "continuation_acceptance_atr": 0.2,
+      "enabled": true,
+      "episode_expiry_minutes": 120.0,
+      "extreme_tolerance_atr": 0.05,
+      "inactive_completion_bars": 6,
+      "large_gap_displacement_atr": 0.5,
+      "local_structure_lookback_bars": 2,
+      "minimum_confirmation_bars_after_extreme": 1,
+      "minimum_initial_vwap_room_atr": 0.75,
+      "minimum_initial_vwap_room_pct": 0.005,
+      "minimum_rearm_bars": 4,
+      "minimum_rearm_extreme_atr": 0.75,
+      "minimum_required_reason_matches": 1,
+      "normal_displacement_atr": 0.75,
+      "require_initial_vwap_room_for_confirmation": true,
+      "required_initiation_reason_codes": [
+        "CURRENT_LEG_MATURE",
+        "PRIOR_MOVE_EXTENDED"
+      ],
+      "reversal_failure_closes": 2,
+      "reversal_invalidation_atr": 0.15,
+      "strong_counter_bar_body_atr": 0.5
+    },
+    "gap": {
+      "large_gap_threshold_pct": 1.0
+    },
+    "mode": "REPORT_ONLY",
+    "outcomes": {
+      "horizon_bars": [
+        3,
+        6,
+        9,
+        20
+      ]
+    },
+    "range_abstention": {
+      "allowed_range_resolution_setups": [
+        "FAILED_BREAKOUT"
+      ],
+      "enabled": true,
+      "minimum_range_age_minutes": 12.0,
+      "require_breakout_eligible_range": true,
+      "require_non_provisional_range": true
+    },
+    "run": {
+      "batch_size": 500,
+      "excluded_symbols": [
+        "NIFTY 50",
+        "NIFTY BANK"
+      ],
+      "replay_userid": "DR1812",
+      "report_dir": "reports",
+      "report_prefix": "exhaustion_priority_experiment_v2",
+      "symbols": [],
+      "trading_day": "2026-07-27"
+    },
+    "version": "EXHAUSTION_PRIORITY_EXPERIMENT_V2"
+  },
+  "database_writes": false,
+  "episodes_confirmed": 0,
+  "episodes_detected": 0,
+  "episodes_failed": 0,
+  "errors": 292,
+  "excluded_snapshots": 250,
+  "excluded_symbols": [
+    "NIFTY 50",
+    "NIFTY BANK"
+  ],
+  "experiment_version": "EXHAUSTION_PRIORITY_EXPERIMENT_V2",
+  "failed_breakout_signals_exempted_inside_range": 1,
+  "maturity_rejected_snapshot_observations": 6078,
+  "maximum_episodes_per_symbol": 0,
+  "median_baseline_delay_minutes": null,
+  "median_episodes_per_symbol": null,
+  "mode": "REPORT_ONLY",
+  "output_files": {
+    "baseline_policy": "reports/exhaustion_priority_experiment_v2_2026-07-27_20260727_171758_baseline_signal_policy.csv",
+    "episodes": "reports/exhaustion_priority_experiment_v2_2026-07-27_20260727_171758_episodes.csv",
+    "errors": "reports/exhaustion_priority_experiment_v2_2026-07-27_20260727_171758_errors.csv",
+    "summary": "reports/exhaustion_priority_experiment_v2_2026-07-27_20260727_171758_summary.json",
+    "timeline": "reports/exhaustion_priority_experiment_v2_2026-07-27_20260727_171758_timeline.csv"
+  },
+  "production_behavior_changed": false,
+  "program": "replay_exhaustion_priority_experiment.py",
+  "range_locked_snapshot_pct": 45.78285973055587,
+  "range_locked_snapshots": 4044,
+  "rearm_rejected_snapshot_observations": 0,
+  "replay_userid": "DR1812",
+  "room_rejected_snapshot_observations": 0,
+  "same_bar_confirmations": 0,
+  "snapshots_loaded": 9125,
+  "symbols_filter": [],
+  "symbols_loaded": 73,
+  "symbols_with_episodes": 0,
+  "trading_day": "2026-07-27",
+  "unique_confirmed_with_baseline_comparison": 0
+}
