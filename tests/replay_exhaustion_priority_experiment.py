@@ -23,7 +23,7 @@ snapshot, opportunity, signal, trade, or audit record.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 import csv
 import json
@@ -48,6 +48,9 @@ from models.trade_models import UserTrade as UserTradeORM
 from schemas.snapshot import SnapshotSchema
 from tests.experiment_exhaustion_priority import (
     ExhaustionEpisode,
+    MissingExhaustionMemoryError,
+    MissingExhaustionReasonCodesError,
+    auction_exhaustion_reason_codes,
     confirmation,
     maturity_qualified,
     range_blocks_setup,
@@ -90,6 +93,9 @@ class SnapshotPolicyState:
     exhausted_side: str
     exhaustion_started_at: Optional[datetime]
     active_episode_id: Optional[str]
+    stock_context_reason_codes: Tuple[str, ...]
+    auction_exhaustion_reason_codes: Tuple[str, ...]
+    maturity_reason_source: Optional[str]
     episode_status: str
     episode_initial_room_qualified: bool
     episode_maturity_qualified: bool
@@ -111,9 +117,15 @@ class ExperimentError:
 @dataclass
 class ProcessStats:
     excluded_snapshots: int = 0
-    maturity_rejected_observations: int = 0
-    room_rejected_observations: int = 0
-    rearm_rejected_observations: int = 0
+    no_exhaustion_memory_observations: int = 0
+    missing_exhaustion_reason_codes_observations: int = 0
+    maturity_reason_not_matched_observations: int = 0
+    initial_room_not_qualified_observations: int = 0
+    rearm_not_allowed_observations: int = 0
+    confirmation_not_yet_met_observations: int = 0
+    confirmation_rejection_reason_counts: Dict[str, int] = field(
+        default_factory=dict
+    )
     range_locked_snapshots: int = 0
     chase_block_eligible_snapshots: int = 0
 
@@ -298,6 +310,8 @@ def _new_episode(
     gap_pct: float,
     sequence_number: int,
     bar_index: int,
+    stock_context_reason_codes: Tuple[str, ...],
+    auction_reason_codes: Tuple[str, ...],
 ) -> Tuple[Optional[ExhaustionEpisode], str]:
     context = snapshot.auction.stock_context
     if context is None:
@@ -307,8 +321,10 @@ def _new_episode(
     if context.exhaustion_started_at is None:
         raise ValueError("exhaustion_started_at is required when exhaustion is active")
 
-    reason_codes = tuple(str(value).strip().upper() for value in context.reason_codes)
-    mature = maturity_qualified(reason_codes=reason_codes, config=config)
+    mature = maturity_qualified(
+        reason_codes=auction_reason_codes,
+        config=config,
+    )
     if not mature:
         return None, "MATURITY_NOT_QUALIFIED"
 
@@ -346,7 +362,7 @@ def _new_episode(
     initiation_time = _naive(snapshot.snapshot_time)
     auction_started_at = _naive(context.exhaustion_started_at)
     episode_id = (
-        f"EXPERIMENT_V2:{snapshot.symbol}:{sequence_number}:"
+        f"EXPERIMENT_V2_1:{snapshot.symbol}:{sequence_number}:"
         f"{initiation_time.isoformat()}:{exhausted_side}"
     )
     large_gap = abs(gap_pct) >= config.gap.large_gap_threshold_pct
@@ -362,7 +378,10 @@ def _new_episode(
             initiation_close=float(snapshot.close),
             initiation_atr=atr,
             initiation_vwap=float(vwap),
-            initiation_reason_codes=reason_codes,
+            initiation_reason_codes=auction_reason_codes,
+            stock_context_reason_codes=stock_context_reason_codes,
+            auction_exhaustion_reason_codes=auction_reason_codes,
+            maturity_reason_source="AUCTION_STATE_MEMORY",
             maturity_qualified=mature,
             initial_extreme=extreme,
             extreme_price=extreme,
@@ -488,6 +507,30 @@ def _process_snapshots(
                 if context is None:
                     raise ValueError("auction.stock_context is required")
 
+                stock_context_reason_codes = tuple(
+                    str(value).strip().upper() for value in context.reason_codes
+                )
+                if any(not value for value in stock_context_reason_codes):
+                    raise ValueError(
+                        "auction.stock_context.reason_codes must contain only "
+                        "non-empty strings"
+                    )
+
+                auction_reason_codes: Tuple[str, ...] = ()
+                maturity_reason_source: Optional[str] = None
+                if context.exhaustion_active:
+                    try:
+                        auction_reason_codes = auction_exhaustion_reason_codes(
+                            snapshot
+                        )
+                    except MissingExhaustionMemoryError:
+                        stats.no_exhaustion_memory_observations += 1
+                        raise
+                    except MissingExhaustionReasonCodesError:
+                        stats.missing_exhaustion_reason_codes_observations += 1
+                        raise
+                    maturity_reason_source = "AUCTION_STATE_MEMORY"
+
                 if active_episode is not None:
                     context_side = str(context.exhausted_side).strip().upper()
                     same_active_context = bool(
@@ -521,6 +564,16 @@ def _process_snapshots(
                                 active_episode.confirmation_displacement_atr = (
                                     displacement_atr
                                 )
+                            else:
+                                stats.confirmation_not_yet_met_observations += 1
+                                if (
+                                    reason
+                                    not in stats.confirmation_rejection_reason_counts
+                                ):
+                                    stats.confirmation_rejection_reason_counts[
+                                        reason
+                                    ] = 0
+                                stats.confirmation_rejection_reason_counts[reason] += 1
 
                     update_failure(active_episode, snapshot, config)
 
@@ -574,20 +627,24 @@ def _process_snapshots(
                             gap_pct=symbol_gap_pct,
                             sequence_number=sequence_number,
                             bar_index=bar_index,
+                            stock_context_reason_codes=(
+                                stock_context_reason_codes
+                            ),
+                            auction_reason_codes=auction_reason_codes,
                         )
                         if candidate is not None:
                             active_episode = candidate
                             episodes.append(candidate)
                         elif reason == "MATURITY_NOT_QUALIFIED":
-                            stats.maturity_rejected_observations += 1
+                            stats.maturity_reason_not_matched_observations += 1
                         elif reason == "INITIAL_VWAP_ROOM_NOT_QUALIFIED":
-                            stats.room_rejected_observations += 1
+                            stats.initial_room_not_qualified_observations += 1
                         else:
                             raise ValueError(
                                 f"Unsupported episode-start decision: {reason}"
                             )
                     else:
-                        stats.rearm_rejected_observations += 1
+                        stats.rearm_not_allowed_observations += 1
 
                 locked = is_range_locked(snapshot, config)
                 if locked:
@@ -643,6 +700,13 @@ def _process_snapshots(
                             if active_episode is not None
                             else None
                         ),
+                        stock_context_reason_codes=(
+                            stock_context_reason_codes
+                        ),
+                        auction_exhaustion_reason_codes=(
+                            auction_reason_codes
+                        ),
+                        maturity_reason_source=maturity_reason_source,
                         episode_status=_episode_status(active_episode),
                         episode_initial_room_qualified=bool(
                             active_episode is not None
@@ -901,6 +965,13 @@ def _episode_rows(episodes: Sequence[ExhaustionEpisode]) -> List[Dict[str, objec
             "initiation_atr": episode.initiation_atr,
             "initiation_vwap": episode.initiation_vwap,
             "initiation_reason_codes": "|".join(episode.initiation_reason_codes),
+            "stock_context_reason_codes": "|".join(
+                episode.stock_context_reason_codes
+            ),
+            "auction_exhaustion_reason_codes": "|".join(
+                episode.auction_exhaustion_reason_codes
+            ),
+            "maturity_reason_source": episode.maturity_reason_source,
             "maturity_qualified": episode.maturity_qualified,
             "initial_extreme": episode.initial_extreme,
             "final_pre_confirmation_extreme": episode.extreme_price,
@@ -966,6 +1037,13 @@ def _timeline_rows(
             "exhausted_side": state.exhausted_side,
             "exhaustion_started_at": _iso(state.exhaustion_started_at),
             "active_episode_id": state.active_episode_id,
+            "stock_context_reason_codes": "|".join(
+                state.stock_context_reason_codes
+            ),
+            "auction_exhaustion_reason_codes": "|".join(
+                state.auction_exhaustion_reason_codes
+            ),
+            "maturity_reason_source": state.maturity_reason_source,
             "episode_status": state.episode_status,
             "episode_initial_room_qualified": (
                 state.episode_initial_room_qualified
@@ -1082,11 +1160,27 @@ def _summary(
         "median_episodes_per_symbol": _median(
             [float(value) for value in episode_counts]
         ),
-        "maturity_rejected_snapshot_observations": (
-            stats.maturity_rejected_observations
+        "no_exhaustion_memory_snapshot_observations": (
+            stats.no_exhaustion_memory_observations
         ),
-        "room_rejected_snapshot_observations": stats.room_rejected_observations,
-        "rearm_rejected_snapshot_observations": stats.rearm_rejected_observations,
+        "missing_exhaustion_reason_codes_snapshot_observations": (
+            stats.missing_exhaustion_reason_codes_observations
+        ),
+        "maturity_reason_not_matched_snapshot_observations": (
+            stats.maturity_reason_not_matched_observations
+        ),
+        "initial_room_not_qualified_snapshot_observations": (
+            stats.initial_room_not_qualified_observations
+        ),
+        "rearm_not_allowed_snapshot_observations": (
+            stats.rearm_not_allowed_observations
+        ),
+        "confirmation_not_yet_met_snapshot_observations": (
+            stats.confirmation_not_yet_met_observations
+        ),
+        "confirmation_rejection_reason_counts": dict(
+            sorted(stats.confirmation_rejection_reason_counts.items())
+        ),
         "range_locked_snapshots": stats.range_locked_snapshots,
         "range_locked_snapshot_pct": (
             (stats.range_locked_snapshots / len(timeline)) * 100.0

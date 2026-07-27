@@ -8,6 +8,9 @@ import pytest
 from configs.auction_experiment_config import AUCTION_POLICY_EXPERIMENT_CONFIG
 from tests.experiment_exhaustion_priority import (
     ExhaustionEpisode,
+    MissingExhaustionMemoryError,
+    MissingExhaustionReasonCodesError,
+    auction_exhaustion_reason_codes,
     confirmation,
     maturity_qualified,
     range_blocks_setup,
@@ -29,6 +32,8 @@ def _snapshot(
     accepted_range_breakout_eligible: bool = False,
     accepted_range_provisional: bool = False,
     accepted_range_established_at: datetime | None = None,
+    stock_context_reason_codes: tuple[str, ...] = (),
+    auction_state_memory: dict[str, object] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         snapshot_time=ts,
@@ -51,7 +56,11 @@ def _snapshot(
                 ),
                 accepted_range_provisional=accepted_range_provisional,
                 accepted_range_established_at=accepted_range_established_at,
+                reason_codes=list(stock_context_reason_codes),
             )
+        ),
+        memory=SimpleNamespace(
+            auction=SimpleNamespace(state_memory=auction_state_memory)
         ),
     )
 
@@ -76,6 +85,9 @@ def _episode(
         initiation_atr=2.0,
         initiation_vwap=96.0 if exhausted_side == "UP" else 104.0,
         initiation_reason_codes=("CURRENT_LEG_MATURE",),
+        stock_context_reason_codes=("EXHAUSTION_CONTEXT_ACTIVE",),
+        auction_exhaustion_reason_codes=("CURRENT_LEG_MATURE",),
+        maturity_reason_source="AUCTION_STATE_MEMORY",
         maturity_qualified=maturity_is_qualified,
         initial_extreme=104.0 if exhausted_side == "UP" else 96.0,
         extreme_price=104.0 if exhausted_side == "UP" else 96.0,
@@ -100,6 +112,61 @@ def test_maturity_requires_configured_reason_code() -> None:
         reason_codes=("REJECTION_OR_FAILED_EXTREME",),
         config=AUCTION_POLICY_EXPERIMENT_CONFIG,
     ) is False
+
+
+def test_maturity_reasons_are_read_from_auction_state_memory() -> None:
+    snapshot = _snapshot(
+        ts=datetime(2026, 7, 27, 9, 45),
+        open_price=103.0,
+        high=104.0,
+        low=102.5,
+        close=103.5,
+        atr=2.0,
+        stock_context_reason_codes=(
+            "STOCK_CONTEXT_OBJECTIVE_SESSION_PATH",
+            "EXHAUSTION_CONTEXT_ACTIVE",
+        ),
+        auction_state_memory={
+            "exhaustion_reason_codes": [
+                "CURRENT_LEG_MATURE",
+                "PRIOR_MOVE_EXTENDED",
+            ]
+        },
+    )
+    reasons = auction_exhaustion_reason_codes(snapshot)
+    assert reasons == ("CURRENT_LEG_MATURE", "PRIOR_MOVE_EXTENDED")
+    assert maturity_qualified(
+        reason_codes=reasons,
+        config=AUCTION_POLICY_EXPERIMENT_CONFIG,
+    ) is True
+
+
+def test_missing_auction_state_memory_fails_strictly() -> None:
+    snapshot = _snapshot(
+        ts=datetime(2026, 7, 27, 9, 45),
+        open_price=103.0,
+        high=104.0,
+        low=102.5,
+        close=103.5,
+        atr=2.0,
+        auction_state_memory=None,
+    )
+    with pytest.raises(MissingExhaustionMemoryError):
+        auction_exhaustion_reason_codes(snapshot)
+
+
+def test_missing_exhaustion_reason_list_fails_strictly() -> None:
+    snapshot = _snapshot(
+        ts=datetime(2026, 7, 27, 9, 45),
+        open_price=103.0,
+        high=104.0,
+        low=102.5,
+        close=103.5,
+        atr=2.0,
+        auction_state_memory={},
+    )
+    with pytest.raises(MissingExhaustionReasonCodesError):
+        auction_exhaustion_reason_codes(snapshot)
 
 
 def test_same_bar_confirmation_is_rejected() -> None:
@@ -265,6 +332,23 @@ def test_reversal_failure_requires_buffered_accepted_closes() -> None:
     assert episode.reversal_failed_time == datetime(2026, 7, 27, 10, 3)
     assert episode.continuation_unlocked_time == datetime(2026, 7, 27, 10, 3)
     assert episode.completion_reason == "REVERSAL_FAILED_WITH_ACCEPTANCE"
+
+
+def test_provisional_opening_range_without_established_at_is_not_locked() -> None:
+    provisional = _snapshot(
+        ts=datetime(2026, 7, 27, 9, 18),
+        open_price=100.0,
+        high=101.0,
+        low=99.5,
+        close=100.2,
+        atr=1.0,
+        accepted_range_id="PROVISIONAL:2026-07-27",
+        accepted_range_inside=True,
+        accepted_range_breakout_eligible=False,
+        accepted_range_provisional=True,
+        accepted_range_established_at=None,
+    )
+    assert range_locked(provisional, AUCTION_POLICY_EXPERIMENT_CONFIG) is False
 
 
 def test_range_lock_requires_age_and_confirmed_range() -> None:

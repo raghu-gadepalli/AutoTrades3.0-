@@ -9,6 +9,52 @@ from typing import Dict, Optional, Sequence, Tuple
 from configs.auction_experiment_config import AuctionPolicyExperimentConfig
 
 
+class MissingExhaustionMemoryError(ValueError):
+    """Raised when active exhaustion has no Auction state memory."""
+
+
+class MissingExhaustionReasonCodesError(ValueError):
+    """Raised when active exhaustion has no strict memory reason-code list."""
+
+
+def auction_exhaustion_reason_codes(snapshot: object) -> Tuple[str, ...]:
+    """Return strict exhaustion reasons from private Auction state memory.
+
+    Public ``stock_context.reason_codes`` describe the projected stock context and
+    are intentionally not used for maturity qualification.
+    """
+
+    state_memory = snapshot.memory.auction.state_memory
+    if state_memory is None:
+        raise MissingExhaustionMemoryError(
+            "memory.auction.state_memory is required when exhaustion is active"
+        )
+    if "exhaustion_reason_codes" not in state_memory:
+        raise MissingExhaustionReasonCodesError(
+            "memory.auction.state_memory['exhaustion_reason_codes'] is required "
+            "when exhaustion is active"
+        )
+    raw = state_memory["exhaustion_reason_codes"]
+    if not isinstance(raw, list):
+        raise ValueError(
+            "memory.auction.state_memory['exhaustion_reason_codes'] must be a list"
+        )
+
+    normalized = []
+    for value in raw:
+        if not isinstance(value, str):
+            raise ValueError(
+                "Every exhaustion reason code must be a non-empty string"
+            )
+        text = value.strip().upper()
+        if not text:
+            raise ValueError(
+                "Every exhaustion reason code must be a non-empty string"
+            )
+        normalized.append(text)
+    return tuple(normalized)
+
+
 @dataclass
 class ExhaustionEpisode:
     episode_id: str
@@ -22,6 +68,9 @@ class ExhaustionEpisode:
     initiation_atr: float
     initiation_vwap: float
     initiation_reason_codes: Tuple[str, ...]
+    stock_context_reason_codes: Tuple[str, ...]
+    auction_exhaustion_reason_codes: Tuple[str, ...]
+    maturity_reason_source: str
     maturity_qualified: bool
     initial_extreme: float
     extreme_price: float
@@ -78,22 +127,23 @@ def range_locked(snapshot: object, config: AuctionPolicyExperimentConfig) -> boo
         raise ValueError("auction.stock_context is required")
     if context.accepted_range_id is None:
         return False
-    if context.accepted_range_established_at is None:
-        raise ValueError(
-            "accepted_range_established_at is required for an accepted range"
-        )
-    if not context.accepted_range_inside:
+    if (
+        config.range_abstention.require_non_provisional_range
+        and context.accepted_range_provisional
+    ):
         return False
     if (
         config.range_abstention.require_breakout_eligible_range
         and not context.accepted_range_breakout_eligible
     ):
         return False
-    if (
-        config.range_abstention.require_non_provisional_range
-        and context.accepted_range_provisional
-    ):
+    if not context.accepted_range_inside:
         return False
+    if context.accepted_range_established_at is None:
+        raise ValueError(
+            "accepted_range_established_at is required for a confirmed, "
+            "breakout-eligible accepted range"
+        )
     snapshot_time = snapshot.snapshot_time.replace(tzinfo=None)
     established_at = context.accepted_range_established_at.replace(tzinfo=None)
     range_age_minutes = (snapshot_time - established_at).total_seconds() / 60.0

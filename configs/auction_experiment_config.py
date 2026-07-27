@@ -28,7 +28,7 @@ class ExperimentRunConfig(BaseModel):
     replay_userid: str = "DR1812"
     batch_size: int = Field(default=500, ge=1)
     report_dir: str = "reports"
-    report_prefix: str = "exhaustion_priority_experiment_v2"
+    report_prefix: str = "exhaustion_priority_experiment_v2_1"
 
 
 class GapContextConfig(BaseModel):
@@ -107,8 +107,8 @@ class OutcomeConfig(BaseModel):
 class AuctionPolicyExperimentConfig(BaseModel):
     model_config = STRICT_EXPERIMENT_CONFIG
 
-    version: Literal["EXHAUSTION_PRIORITY_EXPERIMENT_V2"] = (
-        "EXHAUSTION_PRIORITY_EXPERIMENT_V2"
+    version: Literal["EXHAUSTION_PRIORITY_EXPERIMENT_V2_1"] = (
+        "EXHAUSTION_PRIORITY_EXPERIMENT_V2_1"
     )
     mode: Literal["REPORT_ONLY"] = "REPORT_ONLY"
     run: ExperimentRunConfig = Field(default_factory=ExperimentRunConfig)
