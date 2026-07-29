@@ -394,6 +394,32 @@ class TradeMonHelper:
             else:
                 raise ValueError("initial target price is invalid for trade side")
 
+        # Bought low-premium options can have an ATR-derived stop below zero
+        # because option ATR is approximated from the underlying ATR.  A
+        # negative premium is impossible, so cap only that exceptional risk
+        # distance to the configured fraction of premium and preserve the
+        # resulting smaller R multiple.  This is a generic option-premium
+        # safeguard, not a symbol-specific repair.
+        if inst_s in ("CE", "PE") and side_s == "BUY" and (stop is None or stop <= 0):
+            option_risk_cap_pct = _cfg_dec("setup_option_risk_cap_pct")
+            if option_risk_cap_pct <= 0 or option_risk_cap_pct >= 1:
+                raise ValueError(
+                    "trade_management.setup_option_risk_cap_pct must be between 0 and 1"
+                )
+            stop = entry * (Decimal("1") - option_risk_cap_pct)
+            if stop <= 0 or stop >= entry or atr_unit <= 0:
+                raise ValueError("unable to construct positive low-premium option stop")
+            stop_r = abs(entry - stop) / atr_unit
+            stop_source = "OPTION_PREMIUM_RISK_CAP"
+            stop_reason = "initial_stop_capped_to_positive_option_premium"
+
+        if target is None or stop is None or target <= 0 or stop <= 0:
+            raise ValueError("initial target and stop must be positive")
+        if side_s == "BUY" and not (stop < entry < target):
+            raise ValueError("BUY initial levels must satisfy stop < entry < target")
+        if side_s == "SELL" and not (target < entry < stop):
+            raise ValueError("SELL initial levels must satisfy target < entry < stop")
+
         return {
             "version": 2,
             "mode": str(_cfg("mode")),
