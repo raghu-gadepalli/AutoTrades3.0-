@@ -18,22 +18,24 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 from schemas.snapshot import SnapshotSchema
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineConfig
+from enums.auction_engine import (
+    BoundarySide,
+    ContextAlignment,
+    DirectionalBias,
+    EvidencePolarity,
+    QualityStatus,
+)
 from services.auction_engine.contracts import (
     BarEvidence,
     BoundaryObservation,
-    BoundarySide,
     CompressionEvidence,
-    ContextAlignment,
     DerivativesContextEvidence,
-    DirectionalBias,
     EvidenceFact,
-    EvidencePolarity,
     EvidenceSnapshot,
     ExtensionEvidence,
     MarketContextEvidence,
     OpportunityEvidence,
     PriceActionEvidence,
-    QualityStatus,
     SourceQuality,
     TrendEvidence,
     stable_key,

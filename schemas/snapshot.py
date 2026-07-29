@@ -15,6 +15,11 @@ from sqlalchemy.exc import IntegrityError
 from database.database import get_trades_db
 from models.trade_models import Snapshot as SnapshotORM
 from utils.json_utils import sanitize_json
+from services.auction_engine.episode_contracts import (
+    AuctionEpisodeMemory,
+    AuctionLifecycleProjection,
+    AuctionObservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -366,20 +371,9 @@ class StructureMemoryBlock(StrictBaseModel):
     state: Dict[str, StateMemoryEntry]
 
 
-class AuctionMemoryBlock(StrictBaseModel):
-    history: List[Dict[str, Any]]
-    state_memory: Optional[Dict[str, Any]]
-    boundary_current: Optional[Dict[str, Any]]
-    boundary_last_time: Optional[datetime]
-    boundary_sequences: List[Dict[str, Any]]
-    boundary_last_terminal: Optional[Dict[str, Any]]
-    setup_initiation: Dict[str, Any]
-    setup_failed: Dict[str, Any]
-    setup_emitted_once: List[str]
-    setup_completed: List[str]
-    setup_last_time: Optional[datetime]
-    ledger_records: Dict[str, Any]
-    ledger_last_day: Optional[date]
+class AuctionMemoryBlock(AuctionEpisodeMemory):
+    """Authoritative snapshot-carried Auction Episode continuity."""
+
 
 
 class SnapshotMemoryBlock(StrictBaseModel):
@@ -390,205 +384,58 @@ class SnapshotMemoryBlock(StrictBaseModel):
 # -----------------------------
 # Compact Auction public projection
 # -----------------------------
-class AuctionStateProjection(StrictBaseModel):
-    state_key: str
-    previous: str
-    current: str
-    transition_time: datetime
-    entered_at: datetime
-    expires_at: Optional[datetime]
-    reason_codes: List[str]
-
-
-class FrozenRangeProjection(StrictBaseModel):
-    range_id: str
-    version: int = Field(ge=1)
-    source: str
-    low: float
-    high: float
-    start_time: datetime
-    end_time: Optional[datetime]
-    frozen_at: datetime
-    basis: str
-    quality: Optional[float]
-
-
-class BoundaryProjection(StrictBaseModel):
-    event_key: str
-    structural_key: str
-    attempt_id: str
-    sequence: int = Field(ge=1)
-    event_time: datetime
-    first_seen_time: datetime
-    last_seen_time: datetime
-    attempt_time: Optional[datetime]
-    boundary_id: str
-    boundary_side: str
-    boundary_source: str
-    boundary_price: float
-    breakout_side: str
-    failure_side: str
-    frozen_range: FrozenRangeProjection
-    status: str
-    resolution: str
-    accepted_time: Optional[datetime]
-    failed_time: Optional[datetime]
-    expires_at: Optional[datetime]
-    current_offset_atr: Optional[float]
-    max_outside_excursion_atr: float
-    consecutive_outside_closes: int = Field(ge=0)
-    consecutive_inside_closes: int = Field(ge=0)
-    retest_detected: bool
-    terminal: bool
-    consumed: bool
-    superseded: bool
-    terminal_reason: Optional[str]
-    superseded_by: Optional[str]
-    reason_codes: List[str]
-
-
-class CandidateProjection(StrictBaseModel):
-    candidate_id: str
-    opportunity_key: str
-    family: str
-    subtype: str
-    role: str
-    side: str
-    eligibility: str
-    blockers: List[str]
-    reason_codes: List[str]
-    event_key: str
-    event_time: datetime
-    candidate_time: datetime
-    valid_until: Optional[datetime]
-    auction_state: str
-    entry_price: float
-    stop_anchor_price: Optional[float]
-    stop_anchor_type: str
-    target_basis: str
-    target_reference_price: Optional[float]
-    room_points: Optional[float]
-    room_atr: Optional[float]
-    room_pct: Optional[float]
-    entry_distance_atr: Optional[float]
-    source_boundary_id: str
-    source_boundary_status: str
-    source_boundary_resolution: str
-    source_boundary_side: str
-    source_boundary_price: float
-    source_frozen_range_id: str
-    source_frozen_range_version: int
-    source_frozen_range_low: Optional[float] = None
-    source_frozen_range_high: Optional[float] = None
-    terminal: bool
-    consumed: bool
-    superseded: bool
-
-
-class OpportunityProjection(StrictBaseModel):
-    opportunity_key: str
-    side: str
-    lifecycle: str
-    boundary_event_key: str
-    primary_candidate_id: str
-    primary_family: str
-    primary_subtype: str
-    primary_role: str
-    primary_eligibility: str
-    candidate_ids: List[str]
-    supporting_candidate_ids: List[str]
-    selected_candidate_id: Optional[str]
-    first_observed_time: datetime
-    last_observed_time: datetime
-    eligible_time: Optional[datetime]
-    selected_time: Optional[datetime]
-    reason_codes: List[str]
-
-
-class StockContextProjection(StrictBaseModel):
-    current_auction_state: str
-    directional_bias: str
-
-    accepted_range_id: Optional[str]
-    accepted_range_source: str
-    accepted_range_low: Optional[float]
-    accepted_range_high: Optional[float]
-    accepted_range_established_at: Optional[datetime]
-    accepted_range_provisional: bool
-    accepted_range_breakout_eligible: bool
-    accepted_range_inside: bool
-    accepted_range_position: Optional[float]
-    accepted_range_outside_atr: Optional[float]
-
-    session_open_price: float
-    session_high_price: float
-    session_high_time: datetime
-    session_low_price: float
-    session_low_time: datetime
-    session_position: Optional[float]
-    distance_to_session_high_atr: float = Field(ge=0.0)
-    distance_to_session_low_atr: float = Field(ge=0.0)
-    rise_from_session_low_atr: float = Field(ge=0.0)
-    rise_from_session_low_pct: float = Field(ge=0.0)
-    decline_from_session_high_atr: float = Field(ge=0.0)
-    decline_from_session_high_pct: float = Field(ge=0.0)
-    path_from_session_low_bars: int = Field(ge=0)
-    path_from_session_low_efficiency: Optional[float]
-    path_from_session_low_directional_ratio: Optional[float]
-    path_from_session_high_bars: int = Field(ge=0)
-    path_from_session_high_efficiency: Optional[float]
-    path_from_session_high_directional_ratio: Optional[float]
-
-    exhaustion_active: bool
-    exhausted_side: str
-    exhaustion_started_at: Optional[datetime]
-    exhaustion_expires_at: Optional[datetime]
-    reason_codes: List[str]
-
-
-class AuctionDecisionProjection(StrictBaseModel):
-    action: str
-    manager_action: str
-    selected_candidate_id: Optional[str]
-    selected_opportunity_key: Optional[str]
-    family: Optional[str]
-    subtype: Optional[str]
-    side: Optional[str]
-    entry_price: Optional[float]
-    stop_anchor_price: Optional[float]
-    stop_anchor_type: Optional[str]
-    target_basis: Optional[str]
-    target_reference_price: Optional[float]
-    valid_until: Optional[datetime]
-    reason_codes: List[str]
-    manager_reason_codes: List[str] = Field(default_factory=list)
-    manager_diagnostics: Dict[str, Any] = Field(default_factory=dict)
-
-
-class AuctionChange(StrictBaseModel):
-    type: str
-    entity_key: str
-    from_: Optional[str] = Field(alias="from")
-    to: Optional[str]
+class AuctionEngineIdentityProjection(StrictBaseModel):
+    name: str
+    version: str
+    config_version: str
+    config_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 class AuctionSnapshotBlock(StrictBaseModel):
     status: str
     continuity_mode: str
     previous_snapshot_time: Optional[datetime]
-    state: Optional[AuctionStateProjection]
-    stock_context: Optional[StockContextProjection] = None
-    boundary: Optional[BoundaryProjection]
-    candidates: List[CandidateProjection]
-    opportunities: List[OpportunityProjection]
-    decision: Optional[AuctionDecisionProjection]
-    changes: List[AuctionChange]
-    error: Optional[str]
+    engine: Optional[AuctionEngineIdentityProjection]
+    observation: Optional[AuctionObservation]
+    lifecycle: Optional[AuctionLifecycleProjection]
 
     @model_validator(mode="after")
     def validate_status(self) -> "AuctionSnapshotBlock":
-        if self.status == "OK" and (self.state is None or self.decision is None):
-            raise ValueError("auction state and decision are required when status=OK")
+        if self.status == "NOT_RUN":
+            if any(
+                value is not None
+                for value in (
+                    self.engine,
+                    self.observation,
+                    self.lifecycle,
+                )
+            ):
+                raise ValueError("NOT_RUN Auction block cannot contain evaluation output")
+            return self
+        if self.status != "OK":
+            raise ValueError("Auction status must be NOT_RUN or OK")
+        if self.engine is None or self.observation is None or self.lifecycle is None:
+            raise ValueError("Authoritative Auction output is required when status=OK")
+        if self.observation.symbol != self.lifecycle.symbol:
+            raise ValueError("Auction observation/lifecycle symbol mismatch")
+        if self.observation.snapshot_time != self.lifecycle.snapshot_time:
+            raise ValueError("Auction observation/lifecycle time mismatch")
+        if self.engine.name != self.lifecycle.engine_name:
+            raise ValueError("Auction engine name mismatch")
+        if self.engine.version != self.lifecycle.engine_version:
+            raise ValueError("Auction engine version mismatch")
+        if self.engine.config_version != self.lifecycle.config_version:
+            raise ValueError("Auction config version mismatch")
+        if self.engine.config_hash != self.lifecycle.config_hash:
+            raise ValueError("Auction config hash mismatch")
+        if self.continuity_mode == "COLD_START":
+            if self.previous_snapshot_time is not None:
+                raise ValueError("COLD_START cannot reference a previous Auction snapshot")
+        elif self.continuity_mode == "INCREMENTAL_PREVIOUS_SNAPSHOT":
+            if self.previous_snapshot_time is None:
+                raise ValueError("Incremental Auction continuity requires previous_snapshot_time")
+        else:
+            raise ValueError("Unsupported Auction continuity_mode")
         return self
 
 
@@ -636,6 +483,19 @@ class SnapshotSchema(StrictBaseModel):
             raise ValueError("snapshot.close must equal snapshot.bar.close")
         if self.memory.structure.snapshot_time != self.snapshot_time:
             raise ValueError("memory.structure.snapshot_time must equal snapshot_time")
+        if self.auction.status == "OK":
+            if self.memory.auction.symbol != self.symbol.strip().upper():
+                raise ValueError("memory.auction.symbol must equal snapshot symbol")
+            if self.memory.auction.trading_day != self.snapshot_time.date():
+                raise ValueError("memory.auction.trading_day must match snapshot_time")
+            if self.memory.auction.last_snapshot_time != self.snapshot_time:
+                raise ValueError("memory.auction.last_snapshot_time must equal snapshot_time")
+            if self.auction.observation is None or self.auction.lifecycle is None:
+                raise ValueError("Validated Auction snapshot requires observation/lifecycle")
+            if self.auction.observation.symbol != self.symbol.strip().upper():
+                raise ValueError("auction.observation.symbol must equal snapshot symbol")
+            if self.auction.lifecycle.snapshot_time != self.snapshot_time:
+                raise ValueError("auction.lifecycle.snapshot_time must equal snapshot_time")
         if self.ltp is not None and (not math.isfinite(float(self.ltp)) or self.ltp <= 0):
             raise ValueError("snapshot.ltp must be positive when present")
         return self

@@ -1,52 +1,73 @@
 #!/usr/bin/env python3
-"""Offline contract smoke tests for auction-engine Phase 1.
+"""Offline contract tests for Auction Authority Refactor Stage 1.
 
-Run from the AutoTrades project root:
-
-    python -m unittest tests.test_auction_engine_contracts -v
-
-These tests do not connect to the database and do not invoke the current signal
-pipeline.
+These tests do not connect to the database or invoke signal/trade persistence.
 """
 
 from __future__ import annotations
 
 import json
 import unittest
+
+import services.auction_engine.contracts as auction_contracts_module
+import services.auction_engine.episode_contracts as lifecycle_contracts_module
 from datetime import date, datetime, timedelta
 
 from pydantic import ValidationError
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineConfig
-from services.auction_engine.contracts import (
-    AuctionState,
+from enums.auction_engine import (
+    AuctionEventType,
+    BalanceEpisodeState,
+    DirectionalBias,
+    SetupFamily,
+    StructuralPermissionResult,
+)
+from enums.auction_engine import (
     AuctionStateName,
-    BarEvidence,
-    BoundaryEpisode,
     BoundaryEpisodeStatus,
     BoundaryResolution,
     BoundarySide,
-    CandidateEligibility,
-    CandidateRole,
-    DirectionalBias,
-    EvidenceFact,
     EvidencePolarity,
+    TradeSide,
+)
+from services.auction_engine.contracts import (
+    AuctionState,
+    BarEvidence,
+    BoundaryEpisode,
+    EvidenceFact,
     EvidenceSnapshot,
     FrozenRange,
-    ManagerAction,
-    ManagerDecision,
-    SetupCandidate,
-    SetupFamily,
-    TradeSide,
     stable_key,
 )
+from services.auction_engine.episode_contracts import AuctionEvent
+from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
+from services.auction_engine.structural_permissions import StructuralPermissionMatrix
+
 
 
 class AuctionEngineConfigTests(unittest.TestCase):
-    def test_default_config_is_non_invasive(self) -> None:
-        self.assertFalse(AUCTION_ENGINE_CONFIG.engine.enabled)
-        self.assertFalse(AUCTION_ENGINE_CONFIG.engine.replace_current_signal_path)
-        self.assertFalse(AUCTION_ENGINE_CONFIG.decision.create_enabled)
+    def test_default_config_declares_authoritative_runtime_identity(self) -> None:
+        self.assertEqual(
+            AUCTION_ENGINE_CONFIG.engine.engine_name,
+            "AUTOTRADES_AUCTION_ENGINE",
+        )
+        self.assertEqual(AUCTION_ENGINE_CONFIG.engine.engine_version, "1.1.0")
+        self.assertEqual(
+            AUCTION_ENGINE_CONFIG.engine.config_version,
+            "AUCTION_AUTHORITY_REFACTOR_V3A",
+        )
+        self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG.engine, "enabled"))
+        self.assertFalse(
+            hasattr(AUCTION_ENGINE_CONFIG.engine, "replace_current_signal_path")
+        )
+        self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG.episode, "projection_only"))
+
+    def test_removed_contract_names_have_no_compatibility_aliases(self) -> None:
+        self.assertFalse(hasattr(auction_contracts_module, "AuctionStateName"))
+        self.assertFalse(hasattr(lifecycle_contracts_module, "EpisodeObservation"))
+        self.assertFalse(hasattr(lifecycle_contracts_module, "EpisodeTransition"))
+        self.assertFalse(hasattr(lifecycle_contracts_module, "EpisodeEvaluation"))
 
     def test_config_hash_is_stable_and_json_safe(self) -> None:
         first = AUCTION_ENGINE_CONFIG.stable_hash()
@@ -61,7 +82,81 @@ class AuctionEngineConfigTests(unittest.TestCase):
 
     def test_config_is_frozen(self) -> None:
         with self.assertRaises(ValidationError):
-            AUCTION_ENGINE_CONFIG.engine.enabled = True
+            AUCTION_ENGINE_CONFIG.engine.engine_version = "2.0.0"
+
+    def test_permission_matrix_is_fully_typed_and_versioned(self) -> None:
+        event_types = {
+            rule.event_type for rule in AUCTION_ENGINE_CONFIG.episode.permissions.event_rules
+        }
+        self.assertIn(
+            AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            event_types,
+        )
+        self.assertIn(AuctionEventType.BALANCE_ESCAPE_ACCEPTED, event_types)
+        self.assertIn(AuctionEventType.BALANCE_ESCAPE_FAILED, event_types)
+        self.assertIn(
+            AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED,
+            event_types,
+        )
+        self.assertIn(
+            AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED,
+            event_types,
+        )
+        permit_families = {
+            family
+            for rule in AUCTION_ENGINE_CONFIG.episode.permissions.event_rules
+            if rule.result is StructuralPermissionResult.PERMIT
+            for family in rule.setup_families
+        }
+        self.assertEqual(permit_families, set(SetupFamily))
+        self.assertEqual(
+            set(AUCTION_ENGINE_CONFIG.episode.permissions.result_precedence),
+            set(StructuralPermissionResult),
+        )
+        state_rules = AUCTION_ENGINE_CONFIG.episode.permissions.state_rules
+        self.assertTrue(
+            any(rule.balance_state is BalanceEpisodeState.LOCKED for rule in state_rules)
+        )
+
+    def test_escape_started_is_authoritative_breakout_initiation_permission(self) -> None:
+        event = AuctionEvent(
+            event_id="BAL:TEST:2026-07-20:001:NEUTRAL:100000:BALANCE_ESCAPE_STARTED:100300",
+            event_type=AuctionEventType.BALANCE_ESCAPE_STARTED,
+            episode_id="BAL:TEST:2026-07-20:001:NEUTRAL:100000",
+            symbol="TEST",
+            trading_day=date(2026, 7, 20),
+            event_time=datetime(2026, 7, 20, 10, 3),
+            direction=DirectionalBias.UP,
+            reason_codes=("MEANINGFUL_CLOSE_OUTSIDE_FROZEN_BALANCE",),
+        )
+        permissions = StructuralPermissionMatrix().evaluate(
+            balance_state=BalanceEpisodeState.ESCAPE_WATCH,
+            events=(event,),
+        )
+        by_family = {item.setup_family: item for item in permissions}
+        initiation = by_family[SetupFamily.BREAKOUT_INITIATION]
+        self.assertIs(initiation.result, StructuralPermissionResult.PERMIT)
+        self.assertEqual(initiation.source_event_ids, (event.event_id,))
+
+    def test_locked_balance_overrides_reversal_event_permission(self) -> None:
+        event = AuctionEvent(
+            event_id="DIR:TEST:2026-07-20:001:UP:100000:REVERSAL:100300",
+            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            episode_id="DIR:TEST:2026-07-20:001:UP:100000",
+            symbol="TEST",
+            trading_day=date(2026, 7, 20),
+            event_time=datetime(2026, 7, 20, 10, 3),
+            direction=DirectionalBias.DOWN,
+            reason_codes=("TEST_EVENT",),
+        )
+        permissions = StructuralPermissionMatrix().evaluate(
+            balance_state=BalanceEpisodeState.LOCKED,
+            events=(event,),
+        )
+        by_family = {item.setup_family: item for item in permissions}
+        reversal = by_family[SetupFamily.REVERSAL]
+        self.assertIs(reversal.result, StructuralPermissionResult.BLOCK)
+        self.assertEqual(reversal.source_event_ids, (event.event_id,))
 
 
 class AuctionEngineContractTests(unittest.TestCase):
@@ -82,44 +177,6 @@ class AuctionEngineContractTests(unittest.TestCase):
             close_position=0.80,
         )
 
-    def _candidate(self) -> SetupCandidate:
-        return SetupCandidate(
-            candidate_id="candidate-1",
-            symbol="TEST",
-            trading_day=self.ts.date(),
-            snapshot_time=self.ts,
-            candidate_time=self.ts,
-            family=SetupFamily.BREAKOUT_INITIATION,
-            subtype="FRESH_BALANCE_DEPARTURE",
-            side=TradeSide.BUY,
-            event_key="event-1",
-            event_time=self.ts - timedelta(minutes=3),
-            opportunity_key="opportunity-1",
-            boundary_thesis_key="boundary-thesis-1",
-            support_group_key="opportunity-1",
-            candidate_role=CandidateRole.EARLY_INITIATION,
-            source_boundary_event_key="event-1",
-            source_boundary_status=BoundaryEpisodeStatus.OUTSIDE_ATTEMPT,
-            source_boundary_resolution=BoundaryResolution.UNRESOLVED,
-            source_boundary_id="range-1:UPPER",
-            source_boundary_side=BoundarySide.UPPER,
-            source_boundary_source="MICRO_COMPRESSION",
-            source_boundary_price=100.0,
-            source_frozen_range_id="range-1",
-            source_frozen_range_version=1,
-            source_frozen_range_low=99.0,
-            source_frozen_range_high=100.0,
-            entry_price=101.5,
-            stop_anchor_price=100.0,
-            stop_anchor_type="FROZEN_RANGE_HIGH",
-            target_basis="EXTERNAL_ROOM",
-            room_atr=1.5,
-            entry_distance_atr=0.4,
-            freshness_minutes=3.0,
-            auction_state=AuctionStateName.FRESH_EXPANSION,
-            eligibility=CandidateEligibility.ELIGIBLE,
-            config_version=self.version,
-        )
 
     def test_stable_key_is_deterministic(self) -> None:
         a = stable_key("episode", "TEST", date(2026, 7, 20), "RANGE-1", 1, "UPPER")
@@ -204,11 +261,43 @@ class AuctionEngineContractTests(unittest.TestCase):
                 config_version=self.version,
             )
 
-    def test_eligible_candidate_cannot_have_blockers(self) -> None:
-        payload = self._candidate().model_dump(mode="python")
-        payload["blockers"] = ("NO_ROOM",)
+    def test_authoritative_candidate_requires_permit_and_event_identity(self) -> None:
+        candidate = AuthoritativeSetupCandidate(
+            auction_engine_name=AUCTION_ENGINE_CONFIG.engine.engine_name,
+            auction_engine_version=AUCTION_ENGINE_CONFIG.engine.engine_version,
+            auction_config_version=AUCTION_ENGINE_CONFIG.engine.config_version,
+            auction_config_hash=AUCTION_ENGINE_CONFIG.stable_hash(),
+            candidate_id="candidate-1",
+            opportunity_key="opportunity-1",
+            symbol="TEST",
+            trading_day=self.ts.date(),
+            snapshot_time=self.ts,
+            setup_family=SetupFamily.REVERSAL,
+            setup_subtype="STRUCTURAL_REVERSAL",
+            side=TradeSide.BUY,
+            source_event_id="event-1",
+            source_event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            source_episode_id="episode-1",
+            structural_result=StructuralPermissionResult.PERMIT,
+            entry_price=101.0,
+            stop_anchor_price=100.0,
+            stop_anchor_type="DIRECTIONAL_PROTECTION",
+            target_reference_price=102.5,
+            target_basis="ONE_POINT_FIVE_R",
+            reference_price=100.0,
+            reference_source="AUTHORITATIVE_EVENT_GEOMETRY",
+            risk_points=1.0,
+            expected_move_points=1.5,
+            expected_move_pct=1.5 / 101.0,
+            reward_risk=1.5,
+            valid_until=self.ts + timedelta(minutes=6),
+            reason_codes=("AUTHORITATIVE_EVENT_ROUTE",),
+        )
+        self.assertEqual(candidate.source_event_id, "event-1")
+        payload = candidate.model_dump(mode="python")
+        payload["structural_result"] = StructuralPermissionResult.BLOCK
         with self.assertRaises(ValidationError):
-            SetupCandidate.model_validate(payload)
+            AuthoritativeSetupCandidate.model_validate(payload)
 
     def test_auction_state_rejects_future_transition(self) -> None:
         with self.assertRaises(ValidationError):

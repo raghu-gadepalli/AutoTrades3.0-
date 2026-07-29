@@ -13,6 +13,18 @@ from typing import Any, Dict, Literal, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from enums.auction_engine import (
+    AuctionEventType,
+    AuctionStateName,
+    BalanceEpisodeState,
+    DirectionObservationSource,
+    DirectionalEfficiencySource,
+    MaturityObservationSource,
+    ReversalWatchSource,
+    SetupFamily,
+    StructuralPermissionResult,
+)
+
 
 STRICT_CONFIG = ConfigDict(
     extra="forbid",
@@ -21,30 +33,39 @@ STRICT_CONFIG = ConfigDict(
 )
 
 
+def _require_unique_nonempty(name: str, values: Tuple[Any, ...]) -> None:
+    if not values:
+        raise ValueError(f"{name} cannot be empty")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{name} cannot contain duplicates")
+
+
 class AuctionEngineRuntimeConfig(BaseModel):
     """Top-level runtime and chronology controls."""
 
     model_config = STRICT_CONFIG
 
-    enabled: bool = False
-    report_enabled: bool = True
-    observation_only: bool = True
-    strict_evaluation: bool = True
+    engine_name: str = Field(default="AUTOTRADES_AUCTION_ENGINE", min_length=1)
+    engine_version: str = Field(
+        default="1.1.0",
+        min_length=1,
+        pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$",
+    )
+    config_version: str = Field(
+        default="AUCTION_AUTHORITY_REFACTOR_V3A",
+        min_length=1,
+        pattern=r"^[A-Z0-9_]+$",
+    )
 
-    engine_name: str = "AUCTION_STATE_SIGNAL_ENGINE"
-    engine_version: str = "0.7.0"
-    config_version: str = "AUCTION_ENGINE_STRICT_LOCAL_V6_SIMPLE_SESSION_RANGE"
-
-    timezone: str = "Asia/Kolkata"
+    timezone: str = Field(default="Asia/Kolkata", min_length=1)
     snapshot_interval_minutes: float = Field(default=3.0, gt=0.0)
     earliest_evaluation_time: str = "09:15:00"
     earliest_create_time: str = "09:30:00"
     latest_create_time: str = "15:00:00"
     supported_symbol_types: Tuple[str, ...] = ("EQ",)
-
-    # Phase-1 must never alter the current signal pipeline merely because the
-    # package is importable.
-    replace_current_signal_path: bool = False
+    default_replay_excluded_symbols: Tuple[str, ...] = ("NIFTY 50", "NIFTY BANK")
+    development_database_name: str = Field(default="backtest", min_length=1)
+    protected_database_names: Tuple[str, ...] = ("autotrades",)
 
     @field_validator(
         "earliest_evaluation_time",
@@ -53,7 +74,7 @@ class AuctionEngineRuntimeConfig(BaseModel):
     )
     @classmethod
     def _validate_clock_text(cls, value: str) -> str:
-        parts = str(value or "").split(":")
+        parts = value.split(":")
         if len(parts) != 3:
             raise ValueError("Time values must use HH:MM:SS")
         try:
@@ -63,6 +84,42 @@ class AuctionEngineRuntimeConfig(BaseModel):
         if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
             raise ValueError("Invalid clock time")
         return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    @field_validator("supported_symbol_types")
+    @classmethod
+    def _validate_symbol_types(cls, value: Tuple[str, ...]) -> Tuple[str, ...]:
+        cleaned = tuple(item.strip().upper() for item in value)
+        _require_unique_nonempty("supported_symbol_types", cleaned)
+        if any(not item for item in cleaned):
+            raise ValueError("supported_symbol_types cannot contain blank values")
+        return cleaned
+
+    @field_validator("default_replay_excluded_symbols")
+    @classmethod
+    def _validate_excluded_symbols(cls, value: Tuple[str, ...]) -> Tuple[str, ...]:
+        cleaned = tuple(item.strip().upper() for item in value)
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("default_replay_excluded_symbols cannot contain duplicates")
+        if any(not item for item in cleaned):
+            raise ValueError("default_replay_excluded_symbols cannot contain blanks")
+        return cleaned
+
+    @field_validator("development_database_name")
+    @classmethod
+    def _validate_development_database_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("development_database_name cannot be blank")
+        return cleaned
+
+    @field_validator("protected_database_names")
+    @classmethod
+    def _validate_protected_database_names(cls, value: Tuple[str, ...]) -> Tuple[str, ...]:
+        cleaned = tuple(item.strip() for item in value)
+        _require_unique_nonempty("protected_database_names", cleaned)
+        if any(not item for item in cleaned):
+            raise ValueError("protected_database_names cannot contain blanks")
+        return cleaned
 
     @model_validator(mode="after")
     def _validate_time_order(self) -> "AuctionEngineRuntimeConfig":
@@ -74,10 +131,6 @@ class AuctionEngineRuntimeConfig(BaseModel):
             raise ValueError(
                 "Expected earliest_evaluation_time <= earliest_create_time "
                 "<= latest_create_time"
-            )
-        if self.enabled and self.observation_only and self.replace_current_signal_path:
-            raise ValueError(
-                "A report-only engine cannot replace the current signal path"
             )
         return self
 
@@ -578,6 +631,324 @@ class AuctionDiagnosticsConfig(BaseModel):
         return tuple(sorted(cleaned))
 
 
+class DirectionalEpisodePolicyConfig(BaseModel):
+    """Authoritative directional-episode thresholds and observation policy."""
+
+    model_config = STRICT_CONFIG
+
+    start_confirmation_bars: int = Field(default=2, ge=1)
+    opposite_completion_bars: int = Field(default=2, ge=1)
+    inactive_completion_bars: int = Field(default=6, ge=2)
+
+    reversal_watch_max_bars: int = Field(default=20, ge=2)
+    reversal_confirmation_closes: int = Field(default=1, ge=1)
+    reversal_require_rejection: bool = True
+    reversal_require_continuation_failure: bool = True
+    reversal_confirmation_level_tolerance_atr: float = Field(default=0.0, ge=0.0)
+    reversal_first_adverse_min_close_atr: float = Field(default=0.0, ge=0.0)
+    reversal_continuation_failure_bars: int = Field(default=1, ge=1)
+    trend_restoration_confirmation_bars: int = Field(default=2, ge=1)
+
+    reversal_leg_establishment_closes: int = Field(default=2, ge=1)
+    reversal_leg_min_progress_atr: float = Field(default=0.50, ge=0.0)
+    reversal_leg_failure_closes: int = Field(default=2, ge=1)
+
+    start_observation_states: Tuple[AuctionStateName, ...] = (
+        AuctionStateName.FRESH_EXPANSION,
+        AuctionStateName.ORDERLY_UPTREND,
+        AuctionStateName.ORDERLY_DOWNTREND,
+        AuctionStateName.CONTROLLED_PULLBACK,
+        AuctionStateName.RECOMPRESSION,
+        AuctionStateName.REACCELERATION,
+        AuctionStateName.MATURE_EXTENSION,
+    )
+    up_observation_states: Tuple[AuctionStateName, ...] = (
+        AuctionStateName.ORDERLY_UPTREND,
+    )
+    down_observation_states: Tuple[AuctionStateName, ...] = (
+        AuctionStateName.ORDERLY_DOWNTREND,
+    )
+    maturity_observation_states: Tuple[AuctionStateName, ...] = (
+        AuctionStateName.MATURE_EXTENSION,
+    )
+    reversal_watch_observation_states: Tuple[AuctionStateName, ...] = (
+        AuctionStateName.TREND_FAILURE,
+    )
+    start_blocking_balance_states: Tuple[BalanceEpisodeState, ...] = (
+        BalanceEpisodeState.LOCKED,
+        BalanceEpisodeState.ESCAPE_WATCH,
+    )
+
+    direction_source_precedence: Tuple[DirectionObservationSource, ...] = (
+        DirectionObservationSource.OBSERVATION_STATE,
+        DirectionObservationSource.DIRECTIONAL_BIAS,
+        DirectionObservationSource.TREND_DIRECTION,
+    )
+    maturity_sources: Tuple[MaturityObservationSource, ...] = (
+        MaturityObservationSource.CURRENT_LEG,
+        MaturityObservationSource.EXTENSION,
+        MaturityObservationSource.OBSERVATION_STATE,
+    )
+    reversal_watch_sources: Tuple[ReversalWatchSource, ...] = (
+        ReversalWatchSource.EXHAUSTION,
+        ReversalWatchSource.REJECTION,
+        ReversalWatchSource.FAILED_EXTREME,
+        ReversalWatchSource.STRUCTURAL_FAILURE,
+        ReversalWatchSource.OBSERVATION_STATE,
+    )
+
+    @model_validator(mode="after")
+    def _validate_directional_policy(self) -> "DirectionalEpisodePolicyConfig":
+        _require_unique_nonempty("start_observation_states", self.start_observation_states)
+        _require_unique_nonempty("up_observation_states", self.up_observation_states)
+        _require_unique_nonempty("down_observation_states", self.down_observation_states)
+        _require_unique_nonempty(
+            "maturity_observation_states",
+            self.maturity_observation_states,
+        )
+        _require_unique_nonempty(
+            "reversal_watch_observation_states",
+            self.reversal_watch_observation_states,
+        )
+        _require_unique_nonempty("direction_source_precedence", self.direction_source_precedence)
+        _require_unique_nonempty("maturity_sources", self.maturity_sources)
+        _require_unique_nonempty("reversal_watch_sources", self.reversal_watch_sources)
+        _require_unique_nonempty(
+            "start_blocking_balance_states",
+            self.start_blocking_balance_states,
+        )
+        overlap = set(self.up_observation_states).intersection(self.down_observation_states)
+        if overlap:
+            raise ValueError("UP and DOWN observation-state mappings cannot overlap")
+        return self
+
+
+class BalanceEpisodePolicyConfig(BaseModel):
+    """Authoritative balance-episode geometry, hysteresis and escape policy."""
+
+    model_config = STRICT_CONFIG
+
+    probable_min_observations: int = Field(default=5, ge=3)
+    probable_min_contained_bars: int = Field(default=3, ge=2)
+    probable_containment_ratio_min: float = Field(default=0.60, gt=0.0, le=1.0)
+
+    lock_min_observations: int = Field(default=8, ge=4)
+    lock_min_contained_bars: int = Field(default=5, ge=3)
+    lock_containment_ratio_min: float = Field(default=0.625, gt=0.0, le=1.0)
+
+    forming_reset_bars: int = Field(default=2, ge=1)
+    efficiency_max: float = Field(default=0.35, ge=0.0, le=1.0)
+    overlap_min: float = Field(default=0.55, ge=0.0, le=1.0)
+    range_width_atr_max: float = Field(default=2.50, gt=0.0)
+    source_range_inside_tolerance_atr: float = Field(default=0.15, ge=0.0)
+    candidate_merge_overlap_min: float = Field(default=0.50, ge=0.0, le=1.0)
+    forming_excursion_tolerance_atr: float = Field(default=0.15, ge=0.0)
+
+    escape_min_atr: float = Field(default=0.15, ge=0.0)
+    escape_acceptance_closes: int = Field(default=2, ge=1)
+    failed_reentry_closes: int = Field(default=1, ge=1)
+
+    require_non_provisional_source_range: bool = True
+    require_breakout_eligible_source_range: bool = True
+    directional_efficiency_source_precedence: Tuple[
+        DirectionalEfficiencySource, ...
+    ] = (
+        DirectionalEfficiencySource.PRICE_ACTION,
+        DirectionalEfficiencySource.TREND,
+    )
+
+    @model_validator(mode="after")
+    def _validate_balance_policy(self) -> "BalanceEpisodePolicyConfig":
+        if self.lock_min_observations < self.probable_min_observations:
+            raise ValueError(
+                "Balance lock observations cannot be less than probable observations"
+            )
+        if self.lock_min_contained_bars < self.probable_min_contained_bars:
+            raise ValueError(
+                "Balance lock contained bars cannot be less than probable contained bars"
+            )
+        if self.lock_containment_ratio_min < self.probable_containment_ratio_min:
+            raise ValueError(
+                "Balance lock containment ratio cannot be below probable ratio"
+            )
+        _require_unique_nonempty(
+            "directional_efficiency_source_precedence",
+            self.directional_efficiency_source_precedence,
+        )
+        if DirectionalEfficiencySource.NONE in self.directional_efficiency_source_precedence:
+            raise ValueError(
+                "directional_efficiency_source_precedence cannot contain NONE"
+            )
+        return self
+
+
+class StructuralEventRuleConfig(BaseModel):
+    """Default setup permission created by one authoritative lifecycle event."""
+
+    model_config = STRICT_CONFIG
+
+    event_type: AuctionEventType
+    setup_families: Tuple[SetupFamily, ...]
+    result: StructuralPermissionResult
+
+    @model_validator(mode="after")
+    def _validate_event_rule(self) -> "StructuralEventRuleConfig":
+        _require_unique_nonempty("setup_families", self.setup_families)
+        return self
+
+
+class StructuralStateRuleConfig(BaseModel):
+    """Setup permission imposed by current authoritative balance state."""
+
+    model_config = STRICT_CONFIG
+
+    balance_state: BalanceEpisodeState
+    setup_families: Tuple[SetupFamily, ...]
+    result: StructuralPermissionResult
+
+    @model_validator(mode="after")
+    def _validate_state_rule(self) -> "StructuralStateRuleConfig":
+        if self.balance_state in {
+            BalanceEpisodeState.NONE,
+            BalanceEpisodeState.COMPLETED,
+        }:
+            raise ValueError("Structural state rule requires an active balance state")
+        _require_unique_nonempty("setup_families", self.setup_families)
+        return self
+
+
+class StructuralPermissionPolicyConfig(BaseModel):
+    """Central event/state-to-setup permission matrix."""
+
+    model_config = STRICT_CONFIG
+
+    result_precedence: Tuple[StructuralPermissionResult, ...] = (
+        StructuralPermissionResult.PERMIT,
+        StructuralPermissionResult.WAIT,
+        StructuralPermissionResult.BLOCK,
+    )
+    event_rules: Tuple[StructuralEventRuleConfig, ...] = (
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_CONFIRMED,
+            setup_families=(SetupFamily.REVERSAL,),
+            result=StructuralPermissionResult.WAIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            setup_families=(SetupFamily.REVERSAL,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+            setup_families=(SetupFamily.CONTINUATION,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED,
+            setup_families=(SetupFamily.CONTINUATION,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED,
+            setup_families=(SetupFamily.REACCELERATION,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.BALANCE_ESCAPE_STARTED,
+            setup_families=(SetupFamily.BREAKOUT_INITIATION,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
+            setup_families=(SetupFamily.ACCEPTED_BREAKOUT,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+        StructuralEventRuleConfig(
+            event_type=AuctionEventType.BALANCE_ESCAPE_FAILED,
+            setup_families=(SetupFamily.FAILED_BREAKOUT,),
+            result=StructuralPermissionResult.PERMIT,
+        ),
+    )
+    state_rules: Tuple[StructuralStateRuleConfig, ...] = (
+        StructuralStateRuleConfig(
+            balance_state=BalanceEpisodeState.LOCKED,
+            setup_families=(
+                SetupFamily.CONTINUATION,
+                SetupFamily.REACCELERATION,
+                SetupFamily.REVERSAL,
+            ),
+            result=StructuralPermissionResult.BLOCK,
+        ),
+        StructuralStateRuleConfig(
+            balance_state=BalanceEpisodeState.ESCAPE_WATCH,
+            setup_families=(
+                SetupFamily.CONTINUATION,
+                SetupFamily.REACCELERATION,
+                SetupFamily.REVERSAL,
+            ),
+            result=StructuralPermissionResult.BLOCK,
+        ),
+        StructuralStateRuleConfig(
+            balance_state=BalanceEpisodeState.ESCAPE_WATCH,
+            setup_families=(
+                SetupFamily.ACCEPTED_BREAKOUT,
+                SetupFamily.FAILED_BREAKOUT,
+            ),
+            result=StructuralPermissionResult.WAIT,
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_permission_policy(self) -> "StructuralPermissionPolicyConfig":
+        if set(self.result_precedence) != set(StructuralPermissionResult):
+            raise ValueError(
+                "result_precedence must contain PERMIT, WAIT and BLOCK exactly once"
+            )
+        if len(self.result_precedence) != len(set(self.result_precedence)):
+            raise ValueError("result_precedence cannot contain duplicates")
+        event_types = tuple(rule.event_type for rule in self.event_rules)
+        if len(event_types) != len(set(event_types)):
+            raise ValueError("Only one structural event rule is allowed per event type")
+        creation_families = {
+            family
+            for rule in self.event_rules
+            if rule.result is StructuralPermissionResult.PERMIT
+            for family in rule.setup_families
+        }
+        if creation_families != set(SetupFamily):
+            missing = sorted(
+                family.value for family in set(SetupFamily) - creation_families
+            )
+            raise ValueError(
+                "Every setup family requires at least one authoritative PERMIT event; "
+                f"missing={missing}"
+            )
+        state_family_keys = []
+        for rule in self.state_rules:
+            state_family_keys.extend(
+                (rule.balance_state, family) for family in rule.setup_families
+            )
+        if len(state_family_keys) != len(set(state_family_keys)):
+            raise ValueError(
+                "Only one structural state rule is allowed per balance-state/setup-family"
+            )
+        return self
+
+
+class AuctionEpisodePolicyConfig(BaseModel):
+    """Authoritative persistent directional/balance lifecycle policy."""
+
+    model_config = STRICT_CONFIG
+
+    directional: DirectionalEpisodePolicyConfig = Field(
+        default_factory=DirectionalEpisodePolicyConfig
+    )
+    balance: BalanceEpisodePolicyConfig = Field(default_factory=BalanceEpisodePolicyConfig)
+    permissions: StructuralPermissionPolicyConfig = Field(
+        default_factory=StructuralPermissionPolicyConfig
+    )
+
+
 class AuctionEngineConfig(BaseModel):
     """Resolved, immutable configuration tree for the new engine."""
 
@@ -594,14 +965,7 @@ class AuctionEngineConfig(BaseModel):
     reversal: ReversalPolicyConfig = Field(default_factory=ReversalPolicyConfig)
     decision: AuctionDecisionPolicyConfig = Field(default_factory=AuctionDecisionPolicyConfig)
     diagnostics: AuctionDiagnosticsConfig = Field(default_factory=AuctionDiagnosticsConfig)
-
-    @model_validator(mode="after")
-    def _validate_safe_phase1_defaults(self) -> "AuctionEngineConfig":
-        if self.engine.replace_current_signal_path and not self.engine.enabled:
-            raise ValueError("The current signal path cannot be replaced by a disabled engine")
-        if self.decision.create_enabled and not self.engine.enabled:
-            raise ValueError("CREATE cannot be enabled while the engine is disabled")
-        return self
+    episode: AuctionEpisodePolicyConfig = Field(default_factory=AuctionEpisodePolicyConfig)
 
     def resolved_dict(self) -> Dict[str, Any]:
         """Return the JSON-safe resolved configuration used by a replay run."""
@@ -636,6 +1000,12 @@ __all__ = [
     "ReversalPolicyConfig",
     "AuctionDecisionPolicyConfig",
     "AuctionDiagnosticsConfig",
+    "DirectionalEpisodePolicyConfig",
+    "BalanceEpisodePolicyConfig",
+    "StructuralEventRuleConfig",
+    "StructuralStateRuleConfig",
+    "StructuralPermissionPolicyConfig",
+    "AuctionEpisodePolicyConfig",
     "AuctionEngineConfig",
     "AUCTION_ENGINE_CONFIG",
 ]

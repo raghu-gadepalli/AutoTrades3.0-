@@ -51,6 +51,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
 from configs.monitor_config import MONITOR_CONFIG
 from configs.signal_config import SIGNAL_CONFIG
@@ -65,6 +66,7 @@ from schemas.snapshot import SnapshotSchema
 from schemas.user import UserSchema
 from schemas.user_trade import TradeManagementSchema, UserTradeSchema
 from services.signals.signal_generator import SignalGenerator
+from tests.replay_database_guard import require_allowed_replay_database
 from services.trade.executor import trade_executor as executor_module
 from services.trade.executor.trade_executor import TradeExecutor
 from services.trade.generator import tradegen_helper as tradegen_helper_module
@@ -167,6 +169,11 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--start-time", help="Optional inclusive HH:MM[:SS] filter")
     parser.add_argument("--end-time", help="Optional inclusive HH:MM[:SS] filter")
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument(
+        "--allowed-database",
+        default="backtest",
+        help="Exact trades database name permitted for this write-capable replay",
+    )
     parser.add_argument("--report-dir", default=DEFAULT_REPORT_DIR)
     parser.add_argument("--log-file")
     return parser.parse_args(argv)
@@ -1194,6 +1201,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_dir.mkdir(parents=True, exist_ok=True)
     log_file = args.log_file or str(report_dir / "replay_auction_signal_trade_pipeline.log")
     setup_logging(log_file=log_file)
+    database_name = require_allowed_replay_database(
+        database_uri=AppConfig.SQLALCHEMY_BINDS["trades"],
+        allowed_database=args.allowed_database,
+    )
     global logger
     logger = logging.getLogger(__name__)
 
@@ -1374,24 +1385,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     trade.exit_status.value for trade in current_trades
                 )
 
-                decision = snapshot.auction.decision
-                if decision is None:
-                    raise ValueError("snapshot.auction.decision is required")
-                auction_state = (
-                    snapshot.auction.state.current
-                    if snapshot.auction.state is not None
-                    else None
-                )
+                lifecycle_projection = snapshot.auction.lifecycle
+                if lifecycle_projection is None:
+                    raise ValueError(
+                        "snapshot authoritative Auction lifecycle is required"
+                    )
+                snapshot_event_types = [
+                    event.event_type.value for event in lifecycle_projection.events
+                ]
+                snapshot_event_ids = [
+                    event.event_id for event in lifecycle_projection.events
+                ]
+                snapshot_permissions = [
+                    f"{permission.setup_family.value}:{permission.result.value}"
+                    for permission in lifecycle_projection.permissions
+                ]
 
                 timeline_rows.append(
                     {
                         "index": index,
                         "symbol": snapshot.symbol,
                         "snapshot_time": snapshot.snapshot_time,
-                        "snapshot_auction_action": decision.action,
-                        "snapshot_auction_state": auction_state,
-                        "selected_opportunity_key": decision.selected_opportunity_key,
-                        "selected_candidate_id": decision.selected_candidate_id,
+                        "snapshot_auction_action": (
+                            ",".join(snapshot_event_types)
+                            if snapshot_event_types else "NO_EVENT"
+                        ),
+                        "snapshot_auction_state": (
+                            lifecycle_projection.directional.current_state.value
+                        ),
+                        "snapshot_balance_state": (
+                            lifecycle_projection.balance.current_state.value
+                        ),
+                        "snapshot_authoritative_event_ids": json.dumps(
+                            snapshot_event_ids
+                        ),
+                        "snapshot_permission_results": json.dumps(
+                            snapshot_permissions
+                        ),
+                        "selected_opportunity_key": signal_ctx.get(
+                            "opportunity_key"
+                        ),
+                        "selected_candidate_id": signal_ctx.get("candidate_id"),
                         "signal_action": signal_action,
                         **signal_ctx,
                         "tradegen_attempted": tradegen_attempted,
@@ -1665,6 +1699,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = sanitize_json(
         {
             "trading_day": trading_day,
+            "database_name": database_name,
+            "database_writes": True,
             "symbols": symbols,
             "userid": userid,
             "instrument_choice": instrument_choice,

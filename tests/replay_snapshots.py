@@ -24,13 +24,14 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 # ---------------------------------------------------------------------------
 # Hard-coded replay configuration
 # ---------------------------------------------------------------------------
-START = datetime(2026, 7, 24, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
-END = datetime(2026, 7, 24, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+START = datetime(2026, 7, 27, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
+END = datetime(2026, 7, 27, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
 
 # Use exactly one of these forms:
 #   ["ALL"]                         -> all symbols allowed by ACTIVE_ONLY
 #   ["MARUTI", "INFY", "ASTRAL"]  -> only the named symbols allowed by ACTIVE_ONLY
-SYMBOLS: List[str] = ["ALL"]
+SYMBOLS: List[str] = ["LT"]
+# SYMBOLS: List[str] = ["LT","PERSISTENT", "TCS", "MAXHEALTH", "PNBHOUSING", "BHEL","INDIGO"]
 SYMBOL_TYPE_FILTER = "EQ"
 
 # True  -> replay only enabled symbols whose intraday `active` flag is True.

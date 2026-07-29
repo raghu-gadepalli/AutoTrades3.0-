@@ -19,172 +19,27 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+import math
 from enum import Enum
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-class StringEnum(str, Enum):
-    """Python 3.10-compatible string enum."""
-
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return self.value
-
-
-class TradeSide(StringEnum):
-    BUY = "BUY"
-    SELL = "SELL"
-    ANY = "ANY"
-    NONE = "NONE"
-
-    @property
-    def opposite(self) -> "TradeSide":
-        if self is TradeSide.BUY:
-            return TradeSide.SELL
-        if self is TradeSide.SELL:
-            return TradeSide.BUY
-        return self
-
-
-class BoundarySide(StringEnum):
-    UPPER = "UPPER"
-    LOWER = "LOWER"
-    NONE = "NONE"
-
-
-class DirectionalBias(StringEnum):
-    UP = "UP"
-    DOWN = "DOWN"
-    NEUTRAL = "NEUTRAL"
-    MIXED = "MIXED"
-    UNKNOWN = "UNKNOWN"
-
-
-class QualityStatus(StringEnum):
-    GOOD = "GOOD"
-    PARTIAL = "PARTIAL"
-    STALE = "STALE"
-    MISSING = "MISSING"
-    INVALID = "INVALID"
-    UNKNOWN = "UNKNOWN"
-
-
-class EvidencePolarity(StringEnum):
-    SUPPORT = "SUPPORT"
-    CONTRADICT = "CONTRADICT"
-    NEUTRAL = "NEUTRAL"
-    UNKNOWN = "UNKNOWN"
-
-
-class AuctionStateName(StringEnum):
-    UNKNOWN = "UNKNOWN"
-    BALANCE = "BALANCE"
-    COMPRESSION = "COMPRESSION"
-    BOUNDARY_INTERACTION = "BOUNDARY_INTERACTION"
-    FRESH_EXPANSION = "FRESH_EXPANSION"
-    ORDERLY_UPTREND = "ORDERLY_UPTREND"
-    ORDERLY_DOWNTREND = "ORDERLY_DOWNTREND"
-    CONTROLLED_PULLBACK = "CONTROLLED_PULLBACK"
-    RECOMPRESSION = "RECOMPRESSION"
-    REACCELERATION = "REACCELERATION"
-    MATURE_EXTENSION = "MATURE_EXTENSION"
-    TREND_FAILURE = "TREND_FAILURE"
-    REVERSAL = "REVERSAL"
-    CHAOTIC_ROTATION = "CHAOTIC_ROTATION"
-
-
-class AdvisorAction(StringEnum):
-    NO_ACTION = "NO_ACTION"
-    ALLOW = "ALLOW"
-    WATCH = "WATCH"
-    BLOCK = "BLOCK"
-
-
-class BoundaryEpisodeStatus(StringEnum):
-    APPROACHING = "APPROACHING"
-    OUTSIDE_ATTEMPT = "OUTSIDE_ATTEMPT"
-    UNRESOLVED = "UNRESOLVED"
-    ACCEPTANCE_BUILDING = "ACCEPTANCE_BUILDING"
-    ACCEPTED = "ACCEPTED"
-    FAILURE_BUILDING = "FAILURE_BUILDING"
-    FAILED = "FAILED"
-    EXPIRED = "EXPIRED"
-    SUPERSEDED = "SUPERSEDED"
-    STALE = "STALE"
-
-
-class BoundaryResolution(StringEnum):
-    UNRESOLVED = "UNRESOLVED"
-    ACCEPTED = "ACCEPTED"
-    FAILED = "FAILED"
-
-
-class SetupFamily(StringEnum):
-    BREAKOUT_INITIATION = "BREAKOUT_INITIATION"
-    ACCEPTED_BREAKOUT = "ACCEPTED_BREAKOUT"
-    FAILED_BREAKOUT = "FAILED_BREAKOUT"
-    CONTINUATION = "CONTINUATION"
-    REACCELERATION = "REACCELERATION"
-    REVERSAL = "REVERSAL"
-    # Historical value retained for old reports only. New setup candidates use
-    # family REVERSAL with NORMAL_REVERSAL / EXHAUSTION_REVERSAL subtypes.
-    EXHAUSTION_REVERSAL = "EXHAUSTION_REVERSAL"
-
-
-class CandidateEligibility(StringEnum):
-    ELIGIBLE = "ELIGIBLE"
-    WATCH = "WATCH"
-    INELIGIBLE = "INELIGIBLE"
-    EXPIRED = "EXPIRED"
-    SUPERSEDED = "SUPERSEDED"
-    CONSUMED = "CONSUMED"
-
-
-class CandidateRole(StringEnum):
-    """Operational interpretation of one immutable boundary opportunity.
-
-    Multiple candidate records may legitimately describe the same underlying
-    boundary attempt.  ``opportunity_key`` / ``support_group_key`` are the
-    authoritative de-duplication identities; this role explains where each
-    interpretation sits in that shared lifecycle.
-    """
-
-    EARLY_INITIATION = "EARLY_INITIATION"
-    ACCEPTED_RESOLUTION_ENTRY = "ACCEPTED_RESOLUTION_ENTRY"
-    CONTINUATION_INTERPRETATION = "CONTINUATION_INTERPRETATION"
-    FAILED_RESOLUTION_ENTRY = "FAILED_RESOLUTION_ENTRY"
-    REVERSAL_ENTRY = "REVERSAL_ENTRY"
-
-
-class ContextAlignment(StringEnum):
-    SUPPORT = "SUPPORT"
-    CONFLICT = "CONFLICT"
-    NEUTRAL = "NEUTRAL"
-    UNKNOWN = "UNKNOWN"
-
-
-class ManagerAction(StringEnum):
-    SELECT = "SELECT"
-    DEFER = "DEFER"
-    BLOCK = "BLOCK"
-    NO_ACTION = "NO_ACTION"
-
-
-class LocalDecisionAction(StringEnum):
-    """Pure market/opportunity outcome emitted by the Auction Engine.
-
-    These values deliberately avoid signal-lifecycle verbs. A downstream
-    SignalGenerator may later translate LOCAL_CONFIRMED into CREATE, UPDATE,
-    HOLD or INVALIDATE after it loads the exact active signal state.
-    """
-
-    NO_OPPORTUNITY = "NO_LOCAL_OPPORTUNITY"
-    WATCH = "LOCAL_WATCH"
-    CONFIRMED = "LOCAL_CONFIRMED"
-    DEFER = "LOCAL_DEFER"
-    BLOCKED = "LOCAL_BLOCKED"
+from enums.auction_engine import (
+    AdvisorAction as _AdvisorAction,
+    AuctionStateName as _AuctionStateName,
+    BoundaryEpisodeStatus as _BoundaryEpisodeStatus,
+    BoundaryResolution as _BoundaryResolution,
+    BoundarySide as _BoundarySide,
+    ContextAlignment as _ContextAlignment,
+    DirectionalBias as _DirectionalBias,
+    EvidencePolarity as _EvidencePolarity,
+    QualityStatus as _QualityStatus,
+    SetupFamily as _SetupFamily,
+    TradeSide as _TradeSide,
+)
 
 
 CONTRACT_CONFIG = ConfigDict(
@@ -193,6 +48,7 @@ CONTRACT_CONFIG = ConfigDict(
     validate_default=True,
     arbitrary_types_allowed=True,
     use_enum_values=False,
+    allow_inf_nan=False,
 )
 
 
@@ -207,15 +63,43 @@ class ContractModel(BaseModel):
         return self.model_dump(mode="json", exclude_none=exclude_none)
 
     def stable_hash(self) -> str:
-        """Return a deterministic content hash for diagnostics and tests."""
+        """Return a deterministic hash of the strict persisted representation.
 
+        MySQL JSON may normalise signed zero while serialising numeric values.
+        Hash the semantic JSON value rather than Python's incidental ``-0.0``
+        spelling, and reject every non-finite number instead of allowing the
+        general snapshot sanitiser to convert it silently to ``null``.
+        """
+
+        canonical = _canonical_storage_value(
+            self.to_storage_dict(exclude_none=False)
+        )
         payload = json.dumps(
-            self.to_storage_dict(exclude_none=False),
+            canonical,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
+            allow_nan=False,
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_storage_value(value: Any) -> Any:
+    """Canonicalise one already JSON-shaped contract value for hashing."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Auction contract contains a non-finite number")
+        return 0.0 if value == 0.0 else value
+    if isinstance(value, dict):
+        return {str(key): _canonical_storage_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_storage_value(item) for item in value]
+    raise TypeError(
+        f"Auction contract storage value is not JSON canonical: {type(value).__name__}"
+    )
 
 
 class Reason(ContractModel):
@@ -234,7 +118,7 @@ class Reason(ContractModel):
 
 
 class SourceQuality(ContractModel):
-    status: QualityStatus = QualityStatus.UNKNOWN
+    status: _QualityStatus = _QualityStatus.UNKNOWN
     source: str = ""
     source_time: Optional[datetime] = None
     age_seconds: Optional[float] = Field(default=None, ge=0.0)
@@ -248,12 +132,12 @@ class EvidenceFact(ContractModel):
 
     code: str = Field(min_length=1)
     domain: str = Field(min_length=1)
-    polarity: EvidencePolarity = EvidencePolarity.NEUTRAL
+    polarity: _EvidencePolarity = _EvidencePolarity.NEUTRAL
     observed_at: datetime
     value: Any = None
     unit: str = ""
     source_path: str = ""
-    quality: QualityStatus = QualityStatus.UNKNOWN
+    quality: _QualityStatus = _QualityStatus.UNKNOWN
     details: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("code", mode="before")
@@ -278,7 +162,7 @@ class ConfidenceChannel(ContractModel):
 
     name: str = Field(min_length=1)
     score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    quality: QualityStatus = QualityStatus.UNKNOWN
+    quality: _QualityStatus = _QualityStatus.UNKNOWN
     supporting_fact_codes: Tuple[str, ...] = ()
     contradicting_fact_codes: Tuple[str, ...] = ()
     reason_codes: Tuple[str, ...] = ()
@@ -291,7 +175,7 @@ class BarEvidence(ContractModel):
     low: float
     close: float
     volume: Optional[float] = Field(default=None, ge=0.0)
-    direction: DirectionalBias = DirectionalBias.UNKNOWN
+    direction: _DirectionalBias = _DirectionalBias.UNKNOWN
     move_points: Optional[float] = None
     move_atr: Optional[float] = None
     body_fraction: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -311,7 +195,7 @@ class BarEvidence(ContractModel):
 
 
 class PriceActionEvidence(ContractModel):
-    direction: DirectionalBias = DirectionalBias.UNKNOWN
+    direction: _DirectionalBias = _DirectionalBias.UNKNOWN
     strength: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     displacement_atr: Optional[float] = None
     directional_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -327,7 +211,7 @@ class PriceActionEvidence(ContractModel):
 
 class BoundaryObservation(ContractModel):
     boundary_id: str = Field(min_length=1)
-    boundary_side: BoundarySide
+    boundary_side: _BoundarySide
     boundary_source: str = Field(min_length=1)
     boundary_price: float = Field(gt=0.0)
     observed_at: datetime
@@ -369,16 +253,16 @@ class BoundaryObservation(ContractModel):
 
 
 class TrendEvidence(ContractModel):
-    direction: DirectionalBias = DirectionalBias.UNKNOWN
+    direction: _DirectionalBias = _DirectionalBias.UNKNOWN
     directional_efficiency: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     vwap_side: str = "UNKNOWN"
     vwap_distance_atr: Optional[float] = None
     open_control: str = "UNKNOWN"
-    value_migration: DirectionalBias = DirectionalBias.UNKNOWN
+    value_migration: _DirectionalBias = _DirectionalBias.UNKNOWN
     swing_progression: str = "UNKNOWN"
     hma_order: str = "UNKNOWN"
     hma_spread_atr: Optional[float] = None
-    hma_change: DirectionalBias = DirectionalBias.UNKNOWN
+    hma_change: _DirectionalBias = _DirectionalBias.UNKNOWN
     ema_slow: Optional[float] = Field(default=None, gt=0.0)
     ema_ref: Optional[float] = Field(default=None, gt=0.0)
     ema_slow_ref_spread_atr: Optional[float] = Field(default=None, ge=0.0)
@@ -445,12 +329,12 @@ class OpportunityEvidence(ContractModel):
 
 
 class MarketContextEvidence(ContractModel):
-    index_alignment: ContextAlignment = ContextAlignment.UNKNOWN
-    bank_index_alignment: ContextAlignment = ContextAlignment.UNKNOWN
-    sector_alignment: ContextAlignment = ContextAlignment.UNKNOWN
-    vix_alignment: ContextAlignment = ContextAlignment.UNKNOWN
+    index_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
+    bank_index_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
+    sector_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
+    vix_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
     regime: str = "UNKNOWN"
-    preferred_direction: DirectionalBias = DirectionalBias.UNKNOWN
+    preferred_direction: _DirectionalBias = _DirectionalBias.UNKNOWN
     reason_codes: Tuple[str, ...] = ()
     quality: SourceQuality = Field(default_factory=SourceQuality)
 
@@ -458,10 +342,10 @@ class MarketContextEvidence(ContractModel):
 class DerivativesContextEvidence(ContractModel):
     # Absolute directional interpretation from the current derivatives schema.
     # Candidate-relative interpretation is not part of this factual evidence block.
-    futures_bias: DirectionalBias = DirectionalBias.UNKNOWN
-    options_bias: DirectionalBias = DirectionalBias.UNKNOWN
-    futures_alignment: ContextAlignment = ContextAlignment.UNKNOWN
-    options_alignment: ContextAlignment = ContextAlignment.UNKNOWN
+    futures_bias: _DirectionalBias = _DirectionalBias.UNKNOWN
+    options_bias: _DirectionalBias = _DirectionalBias.UNKNOWN
+    futures_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
+    options_alignment: _ContextAlignment = _ContextAlignment.UNKNOWN
     futures_window: Optional[str] = None
     futures_status: Optional[str] = None
     futures_label: Optional[str] = None
@@ -561,8 +445,8 @@ class AuctionState(ContractModel):
     state_key: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
-    previous_state: AuctionStateName
-    current_state: AuctionStateName
+    previous_state: _AuctionStateName
+    current_state: _AuctionStateName
     transition_time: datetime
     entered_at: datetime
     expires_at: Optional[datetime] = None
@@ -623,14 +507,14 @@ class BoundaryEpisode(ContractModel):
     last_outside_time: Optional[datetime] = None
     first_reentry_time: Optional[datetime] = None
     boundary_id: str = Field(min_length=1)
-    boundary_side: BoundarySide
+    boundary_side: _BoundarySide
     boundary_source: str = Field(min_length=1)
     boundary_price: float = Field(gt=0.0)
-    breakout_side: TradeSide
-    failure_side: TradeSide
+    breakout_side: _TradeSide
+    failure_side: _TradeSide
     frozen_range: FrozenRange
-    status: BoundaryEpisodeStatus = BoundaryEpisodeStatus.UNRESOLVED
-    resolution: BoundaryResolution = BoundaryResolution.UNRESOLVED
+    status: _BoundaryEpisodeStatus = _BoundaryEpisodeStatus.UNRESOLVED
+    resolution: _BoundaryResolution = _BoundaryResolution.UNRESOLVED
     acceptance_building_since: Optional[datetime] = None
     failure_building_since: Optional[datetime] = None
     accepted_time: Optional[datetime] = None
@@ -661,7 +545,7 @@ class BoundaryEpisode(ContractModel):
 
     @model_validator(mode="after")
     def _validate_episode(self) -> "BoundaryEpisode":
-        if self.breakout_side not in (TradeSide.BUY, TradeSide.SELL):
+        if self.breakout_side not in (_TradeSide.BUY, _TradeSide.SELL):
             raise ValueError("BoundaryEpisode.breakout_side must be BUY or SELL")
         if self.failure_side is not self.breakout_side.opposite:
             raise ValueError("failure_side must be the opposite of breakout_side")
@@ -683,124 +567,22 @@ class BoundaryEpisode(ContractModel):
         ):
             if ts is not None and ts > self.snapshot_time:
                 raise ValueError(f"{label} cannot be after snapshot_time")
-        if self.status is BoundaryEpisodeStatus.ACCEPTED:
-            if self.resolution is not BoundaryResolution.ACCEPTED or self.accepted_time is None:
+        if self.status is _BoundaryEpisodeStatus.ACCEPTED:
+            if self.resolution is not _BoundaryResolution.ACCEPTED or self.accepted_time is None:
                 raise ValueError("ACCEPTED status requires ACCEPTED resolution and accepted_time")
-        if self.status is BoundaryEpisodeStatus.FAILED:
-            if self.resolution is not BoundaryResolution.FAILED or self.failed_time is None:
+        if self.status is _BoundaryEpisodeStatus.FAILED:
+            if self.resolution is not _BoundaryResolution.FAILED or self.failed_time is None:
                 raise ValueError("FAILED status requires FAILED resolution and failed_time")
-        if self.resolution is BoundaryResolution.ACCEPTED and self.accepted_time is None:
+        if self.resolution is _BoundaryResolution.ACCEPTED and self.accepted_time is None:
             raise ValueError("ACCEPTED resolution requires accepted_time")
-        if self.resolution is BoundaryResolution.FAILED and self.failed_time is None:
+        if self.resolution is _BoundaryResolution.FAILED and self.failed_time is None:
             raise ValueError("FAILED resolution requires failed_time")
         if self.consumed and not self.terminal:
             raise ValueError("A consumed boundary episode must be terminal")
         if self.superseded and not self.superseded_by:
             raise ValueError("A superseded episode requires superseded_by")
-        if self.status is BoundaryEpisodeStatus.SUPERSEDED and not self.superseded:
+        if self.status is _BoundaryEpisodeStatus.SUPERSEDED and not self.superseded:
             raise ValueError("SUPERSEDED status requires superseded=True")
-        return self
-
-
-class SetupCandidate(ContractModel):
-    candidate_id: str = Field(min_length=1)
-    symbol: str = Field(min_length=1)
-    trading_day: date
-    snapshot_time: datetime
-    candidate_time: datetime
-    family: SetupFamily
-    subtype: str = Field(min_length=1)
-    side: TradeSide
-    event_key: str = Field(min_length=1)
-    event_time: datetime
-    opportunity_key: str = Field(min_length=1)
-    boundary_thesis_key: str = Field(min_length=1)
-    support_group_key: str = Field(min_length=1)
-    candidate_role: CandidateRole
-
-    # Immutable source-boundary contract.  These fields remain attached to the
-    # candidate after the boundary engine archives the source episode or moves
-    # on to a newer observed range.
-    source_boundary_event_key: str = Field(min_length=1)
-    source_boundary_status: BoundaryEpisodeStatus
-    source_boundary_resolution: BoundaryResolution
-    source_boundary_resolution_basis: Optional[str] = None
-    source_boundary_id: str = Field(min_length=1)
-    source_boundary_side: BoundarySide
-    source_boundary_source: str = Field(min_length=1)
-    source_boundary_price: float = Field(gt=0.0)
-    source_frozen_range_id: str = Field(min_length=1)
-    source_frozen_range_version: int = Field(ge=1)
-    source_frozen_range_low: float = Field(gt=0.0)
-    source_frozen_range_high: float = Field(gt=0.0)
-
-    entry_price: float = Field(gt=0.0)
-    stop_anchor_price: Optional[float] = Field(default=None, gt=0.0)
-    stop_anchor_type: str = "UNKNOWN"
-    target_basis: str = "UNKNOWN"
-    target_reference_price: Optional[float] = Field(default=None, gt=0.0)
-    room_points: Optional[float] = Field(default=None, ge=0.0)
-    room_atr: Optional[float] = Field(default=None, ge=0.0)
-    room_pct: Optional[float] = Field(default=None, ge=0.0)
-    entry_distance_atr: Optional[float] = Field(default=None, ge=0.0)
-    freshness_minutes: Optional[float] = Field(default=None, ge=0.0)
-    first_move_consumed: bool = False
-    auction_state: AuctionStateName
-    eligibility: CandidateEligibility
-    blockers: Tuple[str, ...] = ()
-    supporting_evidence: Tuple[EvidenceFact, ...] = ()
-    opposing_evidence: Tuple[EvidenceFact, ...] = ()
-    confidence_channels: Tuple[ConfidenceChannel, ...] = ()
-    reason_codes: Tuple[str, ...] = ()
-    terminal: bool = False
-    consumed: bool = False
-    superseded: bool = False
-    valid_until: Optional[datetime] = None
-    dynamic_watch: bool = False
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
-
-    @field_validator("subtype", mode="before")
-    @classmethod
-    def _normalise_subtype(cls, value: Any) -> str:
-        subtype = str(value or "").strip().upper()
-        if not subtype:
-            raise ValueError("Candidate subtype is required")
-        return subtype
-
-    @model_validator(mode="after")
-    def _validate_candidate(self) -> "SetupCandidate":
-        if self.side not in (TradeSide.BUY, TradeSide.SELL):
-            raise ValueError("SetupCandidate.side must be BUY or SELL")
-        if self.trading_day != self.snapshot_time.date():
-            raise ValueError("SetupCandidate.trading_day must match snapshot_time")
-        if self.candidate_time > self.snapshot_time:
-            raise ValueError("candidate_time cannot be after snapshot_time")
-        if self.event_time > self.candidate_time:
-            raise ValueError("event_time cannot be after candidate_time")
-        if self.source_boundary_event_key != self.event_key:
-            raise ValueError("source_boundary_event_key must match event_key")
-        if self.support_group_key != self.opportunity_key:
-            raise ValueError("support_group_key must match opportunity_key")
-        if self.source_frozen_range_high <= self.source_frozen_range_low:
-            raise ValueError("source frozen range high must exceed low")
-        expected_price = (
-            self.source_frozen_range_high
-            if self.source_boundary_side is BoundarySide.UPPER
-            else self.source_frozen_range_low
-        )
-        if self.source_boundary_side in (BoundarySide.UPPER, BoundarySide.LOWER):
-            tolerance = max(1e-9, abs(expected_price) * 1e-9)
-            if abs(self.source_boundary_price - expected_price) > tolerance:
-                raise ValueError("source boundary price must match its frozen range edge")
-        if self.valid_until is not None and self.valid_until < self.snapshot_time:
-            raise ValueError("An active candidate valid_until cannot precede snapshot_time")
-        if self.eligibility is CandidateEligibility.ELIGIBLE and self.blockers:
-            raise ValueError("An ELIGIBLE candidate cannot contain blockers")
-        if self.eligibility is CandidateEligibility.INELIGIBLE and not self.blockers:
-            raise ValueError("An INELIGIBLE candidate must explain at least one blocker")
-        if self.consumed and not self.terminal:
-            raise ValueError("A consumed candidate must be terminal")
         return self
 
 
@@ -814,8 +596,8 @@ class StockContext(ContractModel):
 
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
-    current_auction_state: AuctionStateName = AuctionStateName.UNKNOWN
-    directional_bias: DirectionalBias = DirectionalBias.UNKNOWN
+    current_auction_state: _AuctionStateName = _AuctionStateName.UNKNOWN
+    directional_bias: _DirectionalBias = _DirectionalBias.UNKNOWN
 
     accepted_range_id: Optional[str] = None
     accepted_range_source: str = "UNKNOWN"
@@ -848,7 +630,7 @@ class StockContext(ContractModel):
     path_from_session_high_directional_ratio: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
     exhaustion_active: bool = False
-    exhausted_side: DirectionalBias = DirectionalBias.UNKNOWN
+    exhausted_side: _DirectionalBias = _DirectionalBias.UNKNOWN
     exhaustion_started_at: Optional[datetime] = None
     exhaustion_expires_at: Optional[datetime] = None
     reason_codes: Tuple[str, ...] = ()
@@ -872,7 +654,7 @@ class StockContext(ContractModel):
         if not (self.session_low_price <= self.session_open_price <= self.session_high_price):
             raise ValueError("Session open must lie within the day-so-far range")
         if self.exhaustion_active:
-            if self.exhausted_side not in (DirectionalBias.UP, DirectionalBias.DOWN):
+            if self.exhausted_side not in (_DirectionalBias.UP, _DirectionalBias.DOWN):
                 raise ValueError("Active exhaustion context requires UP or DOWN exhausted_side")
             if self.exhaustion_started_at is None:
                 raise ValueError("Active exhaustion context requires exhaustion_started_at")
@@ -887,7 +669,7 @@ class StockContext(ContractModel):
 class AdvisorDecision(ContractModel):
     symbol: str = Field(min_length=1)
     snapshot_time: datetime
-    action: AdvisorAction
+    action: _AdvisorAction
     selected_candidate_id: Optional[str] = None
     reason_codes: Tuple[str, ...] = ()
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
@@ -895,130 +677,11 @@ class AdvisorDecision(ContractModel):
 
     @model_validator(mode="after")
     def _validate_advisor(self) -> "AdvisorDecision":
-        if self.action in {AdvisorAction.ALLOW, AdvisorAction.WATCH, AdvisorAction.BLOCK}:
+        if self.action in {_AdvisorAction.ALLOW, _AdvisorAction.WATCH, _AdvisorAction.BLOCK}:
             if not self.selected_candidate_id:
                 raise ValueError("Advisor decision requires selected_candidate_id")
-        if self.action is AdvisorAction.NO_ACTION and self.selected_candidate_id is not None:
+        if self.action is _AdvisorAction.NO_ACTION and self.selected_candidate_id is not None:
             raise ValueError("Advisor NO_ACTION must not select a candidate")
-        return self
-
-
-class ManagerDecision(ContractModel):
-    symbol: str = Field(min_length=1)
-    snapshot_time: datetime
-    action: ManagerAction
-    selected_candidate_id: Optional[str] = None
-    same_direction_support_ids: Tuple[str, ...] = ()
-    opposing_candidate_ids: Tuple[str, ...] = ()
-    material_opposition: bool = False
-    active_signal_id: Optional[str] = None
-    reason_codes: Tuple[str, ...] = ()
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_manager(self) -> "ManagerDecision":
-        if self.action is ManagerAction.SELECT and not self.selected_candidate_id:
-            raise ValueError("ManagerAction.SELECT requires selected_candidate_id")
-        if self.material_opposition and not self.opposing_candidate_ids:
-            raise ValueError("material_opposition requires opposing_candidate_ids")
-        return self
-
-
-class LocalDecision(ContractModel):
-    """Signal-agnostic local Auction Engine assessment.
-
-    The contract contains only the Setup Manager conclusion and the currently
-    selected local candidate. It has no active-signal or persistence-payload fields.
-    """
-
-    symbol: str = Field(min_length=1)
-    trading_day: date
-    snapshot_time: datetime
-    action: LocalDecisionAction
-    selected_candidate: Optional[SetupCandidate] = None
-    manager_decision: ManagerDecision
-    reason_codes: Tuple[str, ...] = ()
-    reasons: Tuple[Reason, ...] = ()
-    valid_until: Optional[datetime] = None
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_local_decision(self) -> "LocalDecision":
-        if self.trading_day != self.snapshot_time.date():
-            raise ValueError("LocalDecision.trading_day must match snapshot_time")
-        if self.manager_decision.symbol != self.symbol:
-            raise ValueError("ManagerDecision symbol must match LocalDecision symbol")
-        if self.manager_decision.snapshot_time != self.snapshot_time:
-            raise ValueError("ManagerDecision snapshot_time must match LocalDecision")
-        if self.action is LocalDecisionAction.CONFIRMED and self.selected_candidate is None:
-            raise ValueError("LOCAL_CONFIRMED requires selected_candidate")
-        if self.selected_candidate is not None:
-            if self.selected_candidate.symbol != self.symbol:
-                raise ValueError("Selected candidate symbol must match LocalDecision")
-            if self.selected_candidate.snapshot_time > self.snapshot_time:
-                raise ValueError("Selected candidate cannot come from a future snapshot")
-        if self.valid_until is not None and self.valid_until < self.snapshot_time:
-            raise ValueError("LocalDecision.valid_until cannot precede snapshot_time")
-        return self
-
-
-class StoredStateEnvelope(ContractModel):
-    namespace: str = Field(min_length=1)
-    symbol: str = Field(min_length=1)
-    trading_day: date
-    snapshot_time: datetime
-    event_key: str = Field(min_length=1)
-    side: TradeSide = TradeSide.NONE
-    state_name: str = Field(min_length=1)
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    terminal: bool = False
-    consumed: bool = False
-    superseded: bool = False
-    expires_at: Optional[datetime] = None
-    reason_codes: Tuple[str, ...] = ()
-    config_version: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_envelope(self) -> "StoredStateEnvelope":
-        if self.trading_day != self.snapshot_time.date():
-            raise ValueError("StoredStateEnvelope.trading_day must match snapshot_time")
-        if self.consumed and not self.terminal:
-            raise ValueError("A consumed state envelope must be terminal")
-        return self
-
-
-class AuctionEngineResult(ContractModel):
-    symbol: str = Field(min_length=1)
-    snapshot_time: datetime
-    evidence: EvidenceSnapshot
-    auction_state: AuctionState
-    boundary_episode: Optional[BoundaryEpisode] = None
-    candidates: Tuple[SetupCandidate, ...] = ()
-    stock_context: StockContext
-    manager_decision: ManagerDecision
-    local_decision: LocalDecision
-    diagnostics: Dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def _validate_result_alignment(self) -> "AuctionEngineResult":
-        objects = (
-            self.evidence,
-            self.auction_state,
-            self.stock_context,
-            self.manager_decision,
-            self.local_decision,
-        )
-        for obj in objects:
-            if obj.symbol != self.symbol or obj.snapshot_time != self.snapshot_time:
-                raise ValueError("AuctionEngineResult contracts must share symbol/snapshot_time")
-        if self.boundary_episode is not None:
-            if self.boundary_episode.symbol != self.symbol or self.boundary_episode.snapshot_time != self.snapshot_time:
-                raise ValueError("BoundaryEpisode must align with AuctionEngineResult")
-        for candidate in self.candidates:
-            if candidate.symbol != self.symbol or candidate.snapshot_time != self.snapshot_time:
-                raise ValueError("Every candidate must align with AuctionEngineResult")
         return self
 
 
@@ -1036,7 +699,7 @@ class RunManifest(ContractModel):
     symbol_types: Tuple[str, ...] = ("EQ",)
     symbol_count: int = Field(default=0, ge=0)
     snapshot_count: int = Field(default=0, ge=0)
-    enabled_families: Tuple[SetupFamily, ...] = ()
+    enabled_families: Tuple[_SetupFamily, ...] = ()
     notes: Tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -1053,7 +716,7 @@ class OutcomeMetrics(ContractModel):
 
     candidate_id: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
-    side: TradeSide
+    side: _TradeSide
     entry_time: datetime
     entry_price: float = Field(gt=0.0)
     measured_at: datetime
@@ -1068,7 +731,7 @@ class OutcomeMetrics(ContractModel):
 
     @model_validator(mode="after")
     def _validate_outcome(self) -> "OutcomeMetrics":
-        if self.side not in (TradeSide.BUY, TradeSide.SELL):
+        if self.side not in (_TradeSide.BUY, _TradeSide.SELL):
             raise ValueError("OutcomeMetrics.side must be BUY or SELL")
         if self.measured_at < self.entry_time:
             raise ValueError("OutcomeMetrics.measured_at cannot precede entry_time")
@@ -1101,17 +764,27 @@ def _normalise_key_part(value: Any) -> str:
 
 
 __all__ = [
-    "TradeSide", "BoundarySide", "DirectionalBias", "QualityStatus",
-    "EvidencePolarity", "AuctionStateName", "AdvisorAction",
-    "BoundaryEpisodeStatus",
-    "BoundaryResolution", "SetupFamily", "CandidateEligibility", "CandidateRole",
-    "ContextAlignment", "ManagerAction", "LocalDecisionAction",
-    "ContractModel", "Reason", "SourceQuality", "EvidenceFact", "ConfidenceChannel",
-    "BarEvidence", "PriceActionEvidence", "BoundaryObservation", "TrendEvidence",
-    "CompressionEvidence", "ExtensionEvidence", "OpportunityEvidence",
-    "MarketContextEvidence", "DerivativesContextEvidence", "EvidenceSnapshot",
-    "AuctionState", "FrozenRange", "BoundaryEpisode", "SetupCandidate",
-    "StockContext", "AdvisorDecision", "ManagerDecision", "LocalDecision",
-    "StoredStateEnvelope", "AuctionEngineResult", "RunManifest",
-    "OutcomeMetrics", "stable_key",
+    "ContractModel",
+    "Reason",
+    "SourceQuality",
+    "EvidenceFact",
+    "ConfidenceChannel",
+    "BarEvidence",
+    "PriceActionEvidence",
+    "BoundaryObservation",
+    "TrendEvidence",
+    "CompressionEvidence",
+    "ExtensionEvidence",
+    "OpportunityEvidence",
+    "MarketContextEvidence",
+    "DerivativesContextEvidence",
+    "EvidenceSnapshot",
+    "AuctionState",
+    "FrozenRange",
+    "BoundaryEpisode",
+    "StockContext",
+    "AdvisorDecision",
+    "RunManifest",
+    "OutcomeMetrics",
+    "stable_key",
 ]

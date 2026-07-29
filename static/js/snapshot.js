@@ -160,9 +160,13 @@
     const accepted = structureAccepted(data);
     const raw = structureRaw(data);
     const candidate = get(data, "structure.candidate", {}) || {};
-    const decision = get(data, "auction.decision", {}) || {};
-    const boundary = get(data, "auction.boundary", {}) || {};
-    const auctionState = get(data, "auction.state", {}) || {};
+    const auction = get(data, "auction", {}) || {};
+    const observation = auction.observation || {};
+    const lifecycle = auction.lifecycle || {};
+    const directional = lifecycle.directional || {};
+    const balance = lifecycle.balance || {};
+    const auctionEvents = Array.isArray(lifecycle.events) ? lifecycle.events : [];
+    const permissions = Array.isArray(lifecycle.permissions) ? lifecycle.permissions : [];
 
     const rangeText = (range) => {
       const r = range || {};
@@ -182,10 +186,12 @@
       ["ATR", `${num(get(data, "indicators.atr.value"))} · ${text(get(data, "indicators.atr.band"))}`],
       ["BB Zone", `${text(get(data, "indicators.bollinger.zone"))} · Pos ${num(get(data, "indicators.bollinger.position"), 3)}`],
 
-      ["Auction State", `${text(auctionState.current)} · previous ${text(auctionState.previous)}`],
-      ["Local Decision", `${text(decision.action, "NO_LOCAL_OPPORTUNITY")} · ${text(decision.family, "NONE")} · ${text(decision.side, "NONE")}`],
-      ["Boundary", `${text(boundary.status, "NONE")} · ${text(boundary.boundary_side, "NONE")} · ${num(boundary.boundary_price)}`],
-      ["Decision Reason", Array.isArray(decision.reason_codes) ? decision.reason_codes.join(", ") : "—"],
+      ["Auction Observation", `${text(observation.observation_state, "UNKNOWN")} · bias ${text(observation.directional_bias, "UNKNOWN")}`],
+      ["Directional Episode", `${text(directional.current_state, "NONE")} · ${text(directional.direction, "UNKNOWN")} · ${text(directional.episode_id, "—")}`],
+      ["Balance Episode", `${text(balance.current_state, "NONE")} · ${num(balance.frozen_low)} - ${num(balance.frozen_high)} · ${text(balance.episode_id, "—")}`],
+      ["Authoritative Events", auctionEvents.length ? auctionEvents.map(event => text(event.event_type)).join(", ") : "—"],
+      ["Setup Permissions", permissions.length ? permissions.map(item => `${text(item.setup_family)}:${text(item.result)}`).join(", ") : "—"],
+      ["Auction Continuity", `${text(auction.continuity_mode, "UNKNOWN")} · previous ${fmtDateTime(auction.previous_snapshot_time)}`],
 
       ["Accepted Structure", `${text(accepted.state, "UNKNOWN")} · frozen ${accepted.frozen === true ? "YES" : "NO"}`],
       ["Accepted Range", rangeText(accepted.range)],

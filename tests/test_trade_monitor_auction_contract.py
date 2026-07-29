@@ -19,27 +19,28 @@ from services.trade.monitor.trade_monitor import (
     _audit_trade_monitor,
     _canonical_exit_rule,
 )
-from tests.test_signal_generator_auction_snapshot import (
-    FakeFetcher,
-    FakePersister,
-    _candidate,
-    _opportunity,
-    _snapshot,
-)
+from enums.auction_engine import AuctionEventType, DirectionalBias, SetupFamily
+from tests.test_event_driven_setup_engine import _event_snapshot
+from tests.test_event_driven_signal_generator import _Advisor, _Fetcher, _Persister
 
 
 TS = datetime(2026, 7, 20, 11, 48, tzinfo=timezone.utc)
 
 
 def _signal(*, state: str = "ORDERLY_DOWNTREND"):
-    snapshot = _snapshot(
-        action="LOCAL_CONFIRMED",
-        auction_state=state,
-        opportunities=[_opportunity()],
-        candidates=[_candidate()],
+    del state  # posture comes from the authoritative directional lifecycle
+    snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        SetupFamily.REVERSAL,
+        direction=DirectionalBias.DOWN,
+        close=100.0,
+        data={"origin_price": 102.0},
     )
+    fetcher = _Fetcher()
     events = SignalAssembler(
-        fetcher=FakeFetcher(), persister=FakePersister()
+        fetcher=fetcher,
+        persister=_Persister(fetcher),
+        advisor=_Advisor(),
     ).assemble(snapshot)
     return events[0][1]
 
@@ -275,8 +276,8 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         source = (
             root / "tests" / "replay_auction_signal_trade_pipeline.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('DEFAULT_TRADING_DAY = "2026-07-20"', source)
-        self.assertIn('DEFAULT_SYMBOLS = "COFORGE"', source)
+        self.assertIn('DEFAULT_TRADING_DAY = "2026-07-24"', source)
+        self.assertIn('DEFAULT_SYMBOLS = "MARUTI"', source)
         self.assertIn('DEFAULT_USERID = "DR1812"', source)
         self.assertIn('DEFAULT_INSTRUMENT_CHOICE = "MULTI"', source)
         self.assertIn('DEFAULT_TEST_MODE = "ADAPTIVE_EXIT"', source)

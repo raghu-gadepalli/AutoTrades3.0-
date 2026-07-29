@@ -483,14 +483,15 @@
 
   function renderContextRows(row) {
     const snap = row?.snapshot || {};
-    const boundary = getPath(snap, "auction.boundary", {}) || {};
-    const decision = getPath(snap, "auction.decision", {}) || {};
+    const directional = getPath(snap, "auction.lifecycle.directional", {}) || {};
+    const balance = getPath(snap, "auction.lifecycle.balance", {}) || {};
     const rows = [
-      ["Auction Action", safeStr(row?.auction_action || decision.action)],
-      ["Auction State", safeStr(row?.auction_state || getPath(snap, "auction.state", "—"))],
+      ["Auction Action", safeStr(row?.auction_action)],
+      ["Directional Episode", `${safeStr(row?.auction_state || directional.current_state || "—")} / ${safeStr(directional.direction || "UNKNOWN")}`],
+      ["Balance Episode", `${safeStr(balance.current_state || "NONE")} / ${safeStr(balance.episode_id || "—")}`],
       ["Opportunity", safeStr(row?.opportunity_key)],
       ["Candidate", safeStr(row?.candidate_id)],
-      ["Boundary", safeStr(row?.boundary_event_key || boundary.event_key)],
+      ["Source Event", safeStr(row?.boundary_event_key)],
       ["Setup Reference", `${num(row?.setup_reference_price, 2)} / ${safeStr(row?.setup_reference_source)}`],
       ["Accepted Structure", `${safeStr(getPath(snap, "structure.accepted.state", "UNKNOWN"))} / ${safeStr(getPath(snap, "structure.accepted.side", "NEUTRAL"))}`],
       ["Raw Structure", `${safeStr(getPath(snap, "structure.raw.state", "UNKNOWN"))} / ${safeStr(getPath(snap, "structure.raw.side", "NEUTRAL"))}`],

@@ -37,7 +37,7 @@ from schemas.derivatives import DerivativesChainSchema
 
 from services.auction_engine.snapshot_adapter import (
     empty_auction_block,
-    empty_auction_memory,
+    initial_auction_memory,
     enrich_snapshot_with_auction,
 )
 
@@ -1424,7 +1424,7 @@ class SnapshotGenerator:
         }
 
         pre_auction_payload = {
-            "version": "SNAPSHOT_AUCTION_V1",
+            "version": "SNAPSHOT_AUCTION_AUTHORITY_V3A",
             "symbol": self.symbol,
             "snapshot_time": snap_time,
             "tf": "3m",
@@ -1443,7 +1443,9 @@ class SnapshotGenerator:
             "auction": empty_auction_block().model_dump(mode="python", by_alias=True),
             "memory": {
                 "structure": structure_memory,
-                "auction": empty_auction_memory().model_dump(mode="python"),
+                "auction": initial_auction_memory(
+                    self.symbol, snap_time
+                ).model_dump(mode="python"),
             },
         }
         pre_auction_snapshot = SnapshotSchema.model_validate(pre_auction_payload)
