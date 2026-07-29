@@ -99,8 +99,6 @@ def enrich_snapshot_with_auction(
         engine=AuctionEngineIdentityProjection(
             name=AUCTION_ENGINE_CONFIG.engine.engine_name,
             version=AUCTION_ENGINE_CONFIG.engine.engine_version,
-            config_version=AUCTION_ENGINE_CONFIG.engine.config_version,
-            config_hash=AUCTION_ENGINE_CONFIG.stable_hash(),
         ),
         observation=result.observation,
         lifecycle=lifecycle,

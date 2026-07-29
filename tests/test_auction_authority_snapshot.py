@@ -318,6 +318,19 @@ class AuctionAuthoritySnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "extra_forbidden"):
             SnapshotSchema.model_validate(payload)
 
+    def test_legacy_config_metadata_never_gates_snapshot_validation(self) -> None:
+        final = _finalize(self._rows()[0])
+        payload = final.model_dump(mode="python")
+        payload["auction"]["engine"]["config_version"] = "OLD_VERSION"
+        payload["auction"]["engine"]["config_hash"] = "old-hash"
+        payload["auction"]["lifecycle"]["config_version"] = "NEW_VERSION"
+        payload["auction"]["lifecycle"]["config_hash"] = "different-hash"
+
+        restored = SnapshotSchema.model_validate(payload)
+
+        self.assertEqual(restored.auction.engine.config_version, "OLD_VERSION")
+        self.assertEqual(restored.auction.lifecycle.config_version, "NEW_VERSION")
+
     def test_persisted_json_roundtrip_preserves_episode_memory(self) -> None:
         import json
 

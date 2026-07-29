@@ -24,7 +24,6 @@ from enums.auction_engine import (
 )
 from enums.enums import LifecycleStage, SignalSide, SignalStatus
 from schemas.signal import SignalSchema
-from schemas.stock_opportunity import StockOpportunitySchema
 from schemas.snapshot import SnapshotSchema
 from schemas.symbol import SymbolSchema
 from services.auction_engine.event_driven_setup_engine import (
@@ -34,6 +33,7 @@ from services.auction_engine.event_driven_setup_engine import (
 from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
 from services.signals.signal_metrics import calculate_signal_metrics
+from services.signals.stock_opportunity_store import StockOpportunityStore
 from services.signals.stock_advisor import StockAdvisor
 from utils.json_utils import sanitize_json
 
@@ -103,7 +103,7 @@ class SignalPersister:
             ltp_time=snapshot.ltp_time,
             **analytics,
         )
-        StockOpportunitySchema.create_deployed_opportunity(
+        StockOpportunityStore.deploy(
             snapshot=snapshot,
             equity_ref=equity_ref,
             candidate=candidate,
@@ -145,7 +145,7 @@ class SignalPersister:
         if persisted is None:
             raise RuntimeError(f"Signal update returned no row: {signal.signal_id}")
         if progression_candidate is not None:
-            StockOpportunitySchema.progress_opportunity(
+            StockOpportunityStore.progress(
                 snapshot=snapshot,
                 signal=persisted,
                 candidate=progression_candidate,
@@ -185,7 +185,7 @@ class SignalPersister:
         )
         if persisted is None:
             raise RuntimeError(f"Signal close returned no row: {signal.signal_id}")
-        StockOpportunitySchema.terminate_opportunity(
+        StockOpportunityStore.terminate(
             snapshot=snapshot,
             signal=persisted,
             status=status,
@@ -202,7 +202,7 @@ class SignalPersister:
         snapshot: SnapshotSchema,
         route: Any,
     ) -> None:
-        StockOpportunitySchema.complete_opportunity(
+        StockOpportunityStore.complete(
             snapshot=snapshot,
             signal=signal,
             route=route,
@@ -733,8 +733,6 @@ def _candidate_meta(
         "setup_contract_version": candidate.contract_version,
         "auction_engine_name": candidate.auction_engine_name,
         "auction_engine_version": candidate.auction_engine_version,
-        "auction_config_version": candidate.auction_config_version,
-        "auction_config_hash": candidate.auction_config_hash,
         "source_event_id": candidate.source_event_id,
         "source_event_type": candidate.source_event_type.value,
         "source_episode_id": candidate.source_episode_id,

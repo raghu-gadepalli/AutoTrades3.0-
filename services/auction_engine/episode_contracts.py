@@ -342,8 +342,10 @@ class AuctionLifecycleProjection(ContractModel):
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
     engine_name: str = Field(min_length=1)
     engine_version: str = Field(min_length=1)
-    config_version: str = Field(min_length=1)
-    config_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    # Accepted only so previously persisted snapshots remain readable.
+    # Runtime logic never compares or depends on either value.
+    config_version: Optional[str] = None
+    config_hash: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_projection(self) -> "AuctionLifecycleProjection":

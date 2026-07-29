@@ -66,7 +66,6 @@ class EvidenceBuilder:
     def __init__(self, config: AuctionEngineConfig = AUCTION_ENGINE_CONFIG) -> None:
         self.config = config
         self.cfg = config.evidence
-        self.version = config.engine.config_version
 
     def build(
         self,
@@ -135,7 +134,6 @@ class EvidenceBuilder:
             data_quality=quality,
             reason_codes=_unique(reason_codes),
             raw_facts=raw_facts,
-            config_version=self.version,
         )
 
     def _build_bar(

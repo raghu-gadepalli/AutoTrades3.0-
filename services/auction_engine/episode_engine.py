@@ -133,7 +133,6 @@ class PersistentEpisodeEngine:
         self.directional_cfg = self.cfg.directional
         self.balance_cfg = self.cfg.balance
         self.permission_matrix = StructuralPermissionMatrix(config)
-        self.config_hash = config.stable_hash()
         self._memory: Dict[str, _SymbolMemory] = {}
 
     def reset(self, symbol: Optional[str] = None) -> None:
@@ -308,8 +307,6 @@ class PersistentEpisodeEngine:
             },
             engine_name=self.config.engine.engine_name,
             engine_version=self.config.engine.engine_version,
-            config_version=self.config.engine.config_version,
-            config_hash=self.config_hash,
         )
         memory.last_snapshot_time = observation.snapshot_time
         memory.last_observation_hash = observation_hash

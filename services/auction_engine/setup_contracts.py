@@ -35,10 +35,6 @@ class AuthoritativeSetupCandidate(SetupContractModel):
     contract_version: str = Field(default=SETUP_CONTRACT_VERSION, min_length=1)
     auction_engine_name: str = Field(min_length=1)
     auction_engine_version: str = Field(min_length=1)
-    auction_config_version: str = Field(min_length=1)
-    auction_config_hash: str = Field(
-        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
-    )
     candidate_id: str = Field(min_length=1)
     opportunity_key: str = Field(min_length=1)
     symbol: str = Field(min_length=1)

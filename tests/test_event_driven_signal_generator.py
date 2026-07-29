@@ -156,7 +156,6 @@ class _Advisor:
             selected_candidate_id=candidate.candidate_id,
             reason_codes=("TEST_ADVISOR",),
             diagnostics={},
-            config_version="TEST",
         )
 
 

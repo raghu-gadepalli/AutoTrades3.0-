@@ -390,7 +390,8 @@ class EvidenceSnapshot(ContractModel):
     data_quality: SourceQuality = Field(default_factory=SourceQuality)
     reason_codes: Tuple[str, ...] = ()
     raw_facts: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
+    # Legacy metadata accepted for old persisted payloads; never used as a gate.
+    config_version: Optional[str] = None
 
     @field_validator("symbol", mode="before")
     @classmethod
@@ -454,7 +455,7 @@ class AuctionState(ContractModel):
     contradicting_evidence: Tuple[EvidenceFact, ...] = ()
     confidence_channels: Tuple[ConfidenceChannel, ...] = ()
     reason_codes: Tuple[str, ...] = ()
-    config_version: str = Field(min_length=1)
+    config_version: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_state_time(self) -> "AuctionState":
@@ -541,7 +542,7 @@ class BoundaryEpisode(ContractModel):
     superseded_by: Optional[str] = None
     emitted_resolutions: Tuple[str, ...] = ()
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
+    config_version: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_episode(self) -> "BoundaryEpisode":
@@ -635,7 +636,7 @@ class StockContext(ContractModel):
     exhaustion_expires_at: Optional[datetime] = None
     reason_codes: Tuple[str, ...] = ()
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
+    config_version: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_stock_context(self) -> "StockContext":
@@ -673,7 +674,7 @@ class AdvisorDecision(ContractModel):
     selected_candidate_id: Optional[str] = None
     reason_codes: Tuple[str, ...] = ()
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
-    config_version: str = Field(min_length=1)
+    config_version: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_advisor(self) -> "AdvisorDecision":
@@ -693,8 +694,8 @@ class RunManifest(ContractModel):
     trading_days: Tuple[date, ...]
     git_commit: str = "UNKNOWN"
     git_tag: str = ""
-    config_version: str = Field(min_length=1)
-    config_hash: str = Field(min_length=1)
+    config_version: Optional[str] = None
+    config_hash: Optional[str] = None
     database_name: str = Field(min_length=1)
     symbol_types: Tuple[str, ...] = ("EQ",)
     symbol_count: int = Field(default=0, ge=0)

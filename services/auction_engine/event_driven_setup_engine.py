@@ -149,8 +149,6 @@ class EventDrivenSetupEngine:
         candidate = AuthoritativeSetupCandidate(
             auction_engine_name=engine.name,
             auction_engine_version=engine.version,
-            auction_config_version=engine.config_version,
-            auction_config_hash=engine.config_hash,
             candidate_id=candidate_id,
             opportunity_key=opportunity_key,
             symbol=snapshot.symbol.strip().upper(),

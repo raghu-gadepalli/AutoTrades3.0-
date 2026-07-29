@@ -7,8 +7,6 @@ database persistence and reads no active signal or trade state.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any, Dict, Literal, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -51,12 +49,6 @@ class AuctionEngineRuntimeConfig(BaseModel):
         min_length=1,
         pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$",
     )
-    config_version: str = Field(
-        default="AUCTION_AUTHORITY_REFACTOR_V3A",
-        min_length=1,
-        pattern=r"^[A-Z0-9_]+$",
-    )
-
     timezone: str = Field(default="Asia/Kolkata", min_length=1)
     snapshot_interval_minutes: float = Field(default=3.0, gt=0.0)
     earliest_evaluation_time: str = "09:15:00"
@@ -952,17 +944,6 @@ class AuctionEngineConfig(BaseModel):
         """Return the JSON-safe resolved configuration used by a replay run."""
 
         return self.model_dump(mode="json")
-
-    def stable_hash(self) -> str:
-        """Return a deterministic SHA-256 hash of the resolved configuration."""
-
-        payload = json.dumps(
-            self.resolved_dict(),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
 
 
 AUCTION_ENGINE_CONFIG = AuctionEngineConfig()

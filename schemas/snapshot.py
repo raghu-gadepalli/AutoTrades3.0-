@@ -387,8 +387,9 @@ class SnapshotMemoryBlock(StrictBaseModel):
 class AuctionEngineIdentityProjection(StrictBaseModel):
     name: str
     version: str
-    config_version: str
-    config_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    # Legacy metadata accepted for old snapshots only; never used as a gate.
+    config_version: Optional[str] = None
+    config_hash: Optional[str] = None
 
 
 class AuctionSnapshotBlock(StrictBaseModel):
@@ -422,12 +423,6 @@ class AuctionSnapshotBlock(StrictBaseModel):
             raise ValueError("Auction observation/lifecycle time mismatch")
         if self.engine.name != self.lifecycle.engine_name:
             raise ValueError("Auction engine name mismatch")
-        if self.engine.version != self.lifecycle.engine_version:
-            raise ValueError("Auction engine version mismatch")
-        if self.engine.config_version != self.lifecycle.config_version:
-            raise ValueError("Auction config version mismatch")
-        if self.engine.config_hash != self.lifecycle.config_hash:
-            raise ValueError("Auction config hash mismatch")
         if self.continuity_mode == "COLD_START":
             if self.previous_snapshot_time is not None:
                 raise ValueError("COLD_START cannot reference a previous Auction snapshot")

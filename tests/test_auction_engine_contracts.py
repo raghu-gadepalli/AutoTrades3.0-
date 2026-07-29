@@ -53,10 +53,8 @@ class AuctionEngineConfigTests(unittest.TestCase):
             "AUTOTRADES_AUCTION_ENGINE",
         )
         self.assertEqual(AUCTION_ENGINE_CONFIG.engine.engine_version, "1.1.0")
-        self.assertEqual(
-            AUCTION_ENGINE_CONFIG.engine.config_version,
-            "AUCTION_AUTHORITY_REFACTOR_V3A",
-        )
+        self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG.engine, "config_version"))
+        self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG, "stable_hash"))
         self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG.engine, "enabled"))
         self.assertFalse(
             hasattr(AUCTION_ENGINE_CONFIG.engine, "replace_current_signal_path")
@@ -83,12 +81,10 @@ class AuctionEngineConfigTests(unittest.TestCase):
         self.assertFalse(hasattr(lifecycle_contracts_module, "EpisodeTransition"))
         self.assertFalse(hasattr(lifecycle_contracts_module, "EpisodeEvaluation"))
 
-    def test_config_hash_is_stable_and_json_safe(self) -> None:
-        first = AUCTION_ENGINE_CONFIG.stable_hash()
-        second = AuctionEngineConfig().stable_hash()
-        self.assertEqual(first, second)
-        self.assertEqual(len(first), 64)
-        json.dumps(AUCTION_ENGINE_CONFIG.resolved_dict(), sort_keys=True)
+    def test_resolved_config_is_json_safe_without_version_or_hash(self) -> None:
+        payload = AUCTION_ENGINE_CONFIG.resolved_dict()
+        self.assertNotIn("config_version", payload["engine"])
+        json.dumps(payload, sort_keys=True)
 
     def test_config_rejects_unknown_fields(self) -> None:
         with self.assertRaises(ValidationError):
@@ -176,7 +172,6 @@ class AuctionEngineConfigTests(unittest.TestCase):
 class AuctionEngineContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.ts = datetime(2026, 7, 20, 10, 0, 0)
-        self.version = AUCTION_ENGINE_CONFIG.engine.config_version
 
     def _bar(self) -> BarEvidence:
         return BarEvidence(
@@ -207,7 +202,6 @@ class AuctionEngineContractTests(unittest.TestCase):
             close=101.5,
             atr=1.0,
             bar=self._bar(),
-            config_version=self.version,
         )
         self.assertEqual(evidence.symbol, "TEST")
         json.dumps(evidence.to_storage_dict())
@@ -227,7 +221,6 @@ class AuctionEngineContractTests(unittest.TestCase):
                 atr=1.0,
                 bar=self._bar(),
                 price_action={"supporting_facts": [future_fact]},
-                config_version=self.version,
             )
 
     def test_frozen_range_rejects_inverted_values(self) -> None:
@@ -272,15 +265,12 @@ class AuctionEngineContractTests(unittest.TestCase):
                 frozen_range=frozen_range,
                 status=BoundaryEpisodeStatus.ACCEPTED,
                 resolution=BoundaryResolution.ACCEPTED,
-                config_version=self.version,
             )
 
     def test_authoritative_candidate_requires_permit_and_event_identity(self) -> None:
         candidate = AuthoritativeSetupCandidate(
             auction_engine_name=AUCTION_ENGINE_CONFIG.engine.engine_name,
             auction_engine_version=AUCTION_ENGINE_CONFIG.engine.engine_version,
-            auction_config_version=AUCTION_ENGINE_CONFIG.engine.config_version,
-            auction_config_hash=AUCTION_ENGINE_CONFIG.stable_hash(),
             candidate_id="candidate-1",
             opportunity_key="opportunity-1",
             symbol="TEST",
@@ -323,7 +313,6 @@ class AuctionEngineContractTests(unittest.TestCase):
                 current_state=AuctionStateName.FRESH_EXPANSION,
                 transition_time=self.ts + timedelta(minutes=3),
                 entered_at=self.ts,
-                config_version=self.version,
             )
 
 

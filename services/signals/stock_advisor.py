@@ -134,7 +134,6 @@ class StockAdvisor:
                     for configured, reason in matches
                 ],
             },
-            config_version=self.policy.config_version,
         )
 
     @staticmethod
