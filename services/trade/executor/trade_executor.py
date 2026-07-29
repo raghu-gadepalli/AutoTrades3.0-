@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
 from database.database import get_trades_db
+from models.trade_models import Snapshot as SnapshotORM
 from models.trade_models import UserTrade as UserTradeORM
 
 from enums.enums import (
@@ -37,7 +38,9 @@ from enums.enums import (
 from schemas.user_trade import UserTradeSchema
 from schemas.user import UserSchema
 from schemas.snapshot import SnapshotSchema
+from schemas.signal import SignalSchema
 from schemas.orderprofile import OrderProfileSchema
+from services.trade.monitor.signal_contract import AuctionTradeSignalContext
 from services.trade.monitor.trademon_helper import TradeMonHelper
 from services.trade.generator.tradegen_helper import TradeGenHelper
 from services.audit.auditlog import write_auditlog
@@ -79,6 +82,20 @@ MAX_ENTRY_PRICE_DRIFT_OPTION = Decimal(
 MAX_ENTRY_PRICE_DRIFT_DEFAULT = Decimal(
     str(EXECUTION_CONFIG.max_entry_price_drift_default_pct)
 )
+
+SIGNAL_LINKED_SOURCES = {
+    "AUTOGEN",
+    "TRADE_GENERATOR",
+    "MANUAL_SIGNAL",
+    "AUTOTRADES",
+}
+AUTO_SIGNAL_SOURCES = {"AUTOGEN", "TRADE_GENERATOR", "AUTOTRADES"}
+NON_SIGNAL_SOURCES = {"WATCHLIST", "POSITION_ADD", "MANUAL"}
+
+ENTRY_SIGNAL_GUARD_VALID = "VALID"
+ENTRY_SIGNAL_GUARD_INVALID = "INVALID"
+ENTRY_SIGNAL_GUARD_DEFER = "DEFER"
+ENTRY_SIGNAL_GUARD_BYPASS = "BYPASS"
 
 
 # -------------------------------------------------------------------
@@ -188,6 +205,18 @@ def _enum_str(x: Any) -> str:
 
 def _is_real(ut: UserTradeSchema) -> bool:
     return _enum_str(getattr(ut, "execution_mode", "VIRTUAL")) == "REAL"
+
+
+def _trade_source(ut: UserTradeSchema) -> str:
+    return _enum_str(getattr(ut, "source", ""))
+
+
+def _is_signal_linked_entry(ut: UserTradeSchema) -> bool:
+    source = _trade_source(ut)
+    signal_id = str(getattr(ut, "signal_id", "") or "").strip()
+    if signal_id.upper().startswith("MANUAL:") or source in NON_SIGNAL_SOURCES:
+        return False
+    return source in SIGNAL_LINKED_SOURCES
 
 
 def _entry_status(ut: UserTradeSchema) -> str:
@@ -483,6 +512,46 @@ def _next_modified_limit_price(symbol: str, side: str, old_price: Any) -> Option
         return None
 
     return _round_to_tick(target)
+
+
+def _latest_underlying_snapshot_price(
+    symbol: str,
+    *,
+    asof_time: datetime,
+) -> Tuple[Optional[Decimal], Optional[datetime], Optional[str]]:
+    """Read the latest completed underlying snapshot price as-of executor time.
+
+    Entry eligibility uses the persisted snapshot LTP first and falls back only
+    to that same snapshot's close.  It never substitutes a trade-leg price.
+    """
+    symbol0 = str(symbol or "").strip().upper()
+    asof = _to_ist_naive(asof_time)
+    if not symbol0 or asof is None:
+        return None, None, None
+
+    with get_trades_db() as db:
+        rec = (
+            db.query(SnapshotORM)
+            .filter(SnapshotORM.symbol == symbol0)
+            .filter(SnapshotORM.snapshot_time <= asof)
+            .order_by(SnapshotORM.snapshot_time.desc())
+            .first()
+        )
+
+    if rec is None:
+        return None, None, None
+
+    ltp = d(getattr(rec, "ltp", None))
+    if ltp > 0:
+        return ltp, _to_ist_naive(getattr(rec, "snapshot_time", None)), "LTP"
+
+    payload = getattr(rec, "data", None)
+    if not isinstance(payload, dict) or "close" not in payload:
+        return None, _to_ist_naive(getattr(rec, "snapshot_time", None)), None
+    close = d(payload["close"])
+    if close <= 0:
+        return None, _to_ist_naive(getattr(rec, "snapshot_time", None)), None
+    return close, _to_ist_naive(getattr(rec, "snapshot_time", None)), "CLOSE"
 
 
 # -------------------------------------------------------------------
@@ -783,8 +852,8 @@ def _safe_cancel_order(broker: ZerodhaBroker, *, order_id: str, variety: Any) ->
     if not order_id:
         return False
     try:
-        broker.svc.cancel_order(order_id=order_id, variety=variety)
-        return True
+        response = broker.svc.cancel_order(order_id=order_id, variety=variety)
+        return bool(response)
     except Exception:
         return False
 
@@ -855,6 +924,118 @@ class TradeExecutor:
             or xs in (ExitStatus.READY.value, ExitStatus.SUBMITTED.value)
         )
 
+    def _entry_signal_guard(
+        self,
+        ut: UserTradeSchema,
+    ) -> Tuple[str, Optional[SignalSchema], Optional[str]]:
+        """Return VALID/INVALID/DEFER/BYPASS for the originating signal.
+
+        Signal-linked entries must resolve the exact persisted signal.  Manual
+        watchlist/position trades are intentionally outside this lifecycle.
+        """
+        if not _is_signal_linked_entry(ut):
+            return ENTRY_SIGNAL_GUARD_BYPASS, None, None
+
+        signal_id = str(getattr(ut, "signal_id", "") or "").strip()
+        if not signal_id:
+            return (
+                ENTRY_SIGNAL_GUARD_INVALID,
+                None,
+                "ENTRY_CANCEL_SOURCE_SIGNAL_ID_MISSING",
+            )
+
+        try:
+            signal = SignalSchema.fetch_by_signal_id_strict(signal_id)
+        except Exception as exc:
+            return (
+                ENTRY_SIGNAL_GUARD_DEFER,
+                None,
+                f"ENTRY_DEFER_SIGNAL_REVALIDATION_FAILED {str(exc)[:190]}",
+            )
+
+        if signal is None:
+            return (
+                ENTRY_SIGNAL_GUARD_INVALID,
+                None,
+                "ENTRY_CANCEL_SOURCE_SIGNAL_NOT_FOUND",
+            )
+
+        status = _enum_str(getattr(signal, "status", ""))
+        if status != "OPEN":
+            return (
+                ENTRY_SIGNAL_GUARD_INVALID,
+                signal,
+                f"ENTRY_CANCEL_SIGNAL_STATUS_{status or 'UNKNOWN'}",
+            )
+
+        try:
+            context = AuctionTradeSignalContext.from_signal(signal)
+        except Exception as exc:
+            return (
+                ENTRY_SIGNAL_GUARD_DEFER,
+                signal,
+                f"ENTRY_DEFER_SIGNAL_CONTRACT_INVALID {str(exc)[:190]}",
+            )
+
+        if context.requires_exit:
+            return (
+                ENTRY_SIGNAL_GUARD_INVALID,
+                signal,
+                (
+                    "ENTRY_CANCEL_SIGNAL_EXIT_POSTURE "
+                    f"stage={context.stage} action={context.lifecycle_trade_action}"
+                ),
+            )
+
+        return ENTRY_SIGNAL_GUARD_VALID, signal, None
+
+    def _entry_profitability_defer_reason(
+        self,
+        ut: UserTradeSchema,
+        *,
+        signal: Optional[SignalSchema],
+        asof_time: datetime,
+    ) -> Optional[str]:
+        """Require strict favourable movement for automatic signal entries.
+
+        Compare signal.created_price with the latest completed underlying
+        snapshot LTP, falling back to that same snapshot's close.  Equality is
+        deliberately a WAIT, not an entry permission.
+        """
+        if signal is None or _trade_source(ut) not in AUTO_SIGNAL_SOURCES:
+            return None
+
+        created = d(getattr(signal, "created_price", None))
+        if created <= 0:
+            return "ENTRY_DEFER_SIGNAL_CREATED_PRICE_MISSING"
+
+        equity_ref = str(
+            getattr(signal, "equity_ref", None)
+            or getattr(ut, "equity_ref", None)
+            or ""
+        ).strip().upper()
+        current, snapshot_ts, price_source = _latest_underlying_snapshot_price(
+            equity_ref,
+            asof_time=asof_time,
+        )
+        if current is None or current <= 0:
+            return "ENTRY_DEFER_SNAPSHOT_PRICE_UNAVAILABLE"
+
+        side = _enum_str(getattr(signal, "side", ""))
+        favourable = (
+            (side == TradeType.BUY.value and current > created)
+            or (side == TradeType.SELL.value and current < created)
+        )
+        if favourable:
+            return None
+
+        relation = "current>created" if side == TradeType.BUY.value else "current<created"
+        return (
+            "ENTRY_DEFER_SIGNAL_NOT_STRICTLY_PROFITABLE "
+            f"side={side} created={created} current={current} "
+            f"required={relation} source={price_source} snapshot_time={snapshot_ts}"
+        )
+
     def _process_trade_for_user(
         self,
         ut: UserTradeSchema,
@@ -865,10 +1046,46 @@ class TradeExecutor:
         es = _entry_status(ut)
         xs = _exit_status(ut)
 
+        guard_state = ENTRY_SIGNAL_GUARD_BYPASS
+        guard_reason: Optional[str] = None
+        if es in (EntryStatus.READY.value, EntryStatus.SUBMITTED.value):
+            guard_state, _, guard_reason = self._entry_signal_guard(ut)
+
         if not _is_real(ut):
+            if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
+                return self._cancel_invalidated_entry_package(
+                    ut,
+                    reason=guard_reason or "ENTRY_CANCEL_SIGNAL_INVALIDATED",
+                    asof_time=asof_time,
+                    broker=None,
+                )
+            if guard_state == ENTRY_SIGNAL_GUARD_DEFER and es == EntryStatus.READY.value:
+                return self._defer_ready_entry(
+                    ut,
+                    reason=guard_reason or "ENTRY_DEFER_SIGNAL_REVALIDATION_FAILED",
+                    asof_time=asof_time,
+                )
             return self._process_virtual(ut, asof_time=asof_time)
 
-        if _try_int(getattr(user, "broker_login", 0), 0) != 1:
+        broker_login_ok = _try_int(getattr(user, "broker_login", 0), 0) == 1
+        broker = ZerodhaBroker(user) if broker_login_ok else None
+
+        if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
+            return self._cancel_invalidated_entry_package(
+                ut,
+                reason=guard_reason or "ENTRY_CANCEL_SIGNAL_INVALIDATED",
+                asof_time=asof_time,
+                broker=broker,
+            )
+
+        if guard_state == ENTRY_SIGNAL_GUARD_DEFER and es == EntryStatus.READY.value:
+            return self._defer_ready_entry(
+                ut,
+                reason=guard_reason or "ENTRY_DEFER_SIGNAL_REVALIDATION_FAILED",
+                asof_time=asof_time,
+            )
+
+        if not broker_login_ok or broker is None:
             upd: Dict[str, Any] = {
                 "exec_status": "BROKER_LOGIN_REQUIRED",
                 "exec_status_message": "Cannot execute REAL trade: broker_login!=1",
@@ -880,8 +1097,6 @@ class TradeExecutor:
                 upd["exit_status"] = ExitStatus.FAILED.value
             _persist_executor_update(ut, upd)
             return True
-
-        broker = ZerodhaBroker(user)
 
         if xs in (ExitStatus.READY.value, ExitStatus.SUBMITTED.value) and es in (
             EntryStatus.READY.value,
@@ -896,6 +1111,235 @@ class TradeExecutor:
             return self._process_entry_real_blocking(ut, broker, asof_time=asof_time)
 
         return False
+
+    def _mark_filled_entry_for_immediate_exit(
+        self,
+        ut: UserTradeSchema,
+        *,
+        reason: str,
+        asof_time: datetime,
+    ) -> bool:
+        xs = _exit_status(ut)
+        if xs in (ExitStatus.READY.value, ExitStatus.SUBMITTED.value, ExitStatus.FILLED.value):
+            return True
+        _persist_executor_update(ut, {
+            "exit_status": ExitStatus.READY.value,
+            "exit_reason": "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION",
+            "exit_rule": "trade_executor_signal_revalidation",
+            "exit_intent_time": asof_time,
+            "exit_time": asof_time,
+            "exec_status": "EXIT_READY_SIGNAL_INVALIDATED_DURING_ENTRY",
+            "exec_status_message": str(reason)[:250],
+            "exec_last_checked_at": asof_time,
+        })
+        return True
+
+    def _finalize_invalidated_broker_entry_fill(
+        self,
+        ut: UserTradeSchema,
+        *,
+        fill_price: Decimal,
+        fill_qty: int,
+        fill_time: datetime,
+        reason: str,
+    ) -> bool:
+        updates = _entry_fill_updates(
+            ut,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+            when=fill_time,
+            reconcile_message=(
+                "Broker entry filled while originating signal was invalid; "
+                f"immediate exit queued. reason={reason}"
+            ),
+        )
+        updates.update({
+            "exit_status": ExitStatus.READY.value,
+            "exit_reason": "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION",
+            "exit_rule": "trade_executor_signal_revalidation",
+            "exit_intent_time": fill_time,
+            "exit_time": fill_time,
+            "exec_status": "ENTRY_FILLED_DURING_SIGNAL_INVALIDATION",
+            "exec_status_message": str(reason)[:250],
+            "exec_last_checked_at": fill_time,
+        })
+        _persist_executor_update(ut, updates)
+        return True
+
+    def _cancel_submitted_entry_for_signal_invalidation(
+        self,
+        ut: UserTradeSchema,
+        broker: ZerodhaBroker,
+        *,
+        reason: str,
+        asof_time: datetime,
+    ) -> bool:
+        oid = str(getattr(ut, "entry_order_id", "") or "").strip()
+        if not oid:
+            _persist_executor_update(ut, {
+                "entry_status": EntryStatus.INVALID.value,
+                "exec_status": "ENTRY_CANCEL_FAILED_ORDER_ID_MISSING",
+                "exec_status_message": str(reason)[:250],
+                "exec_last_checked_at": asof_time,
+            })
+            return True
+
+        mode = "intraday" if bool(getattr(ut, "intraday_only", False)) else "carryforward"
+        op = OrderProfileSchema.fetch_order_profile(mode, getattr(ut, "instrument_type", "EQ"))
+        variety = OrderVariety.from_string(getattr(op, "order_variety", OrderVariety.REGULAR.value))
+
+        try:
+            status = broker.latest_status(oid)
+        except Exception as exc:
+            _persist_executor_update(ut, {
+                "exec_status": "ENTRY_CANCEL_STATUS_CHECK_FAILED",
+                "exec_status_message": f"{reason}; {str(exc)[:160]}"[:250],
+                "exec_last_checked_at": asof_time,
+            })
+            return True
+
+        try:
+            hist = broker.history(oid)
+        except Exception:
+            hist = []
+        avg, filled_qty = _extract_average_price_and_qty(hist)
+        fill_time = _broker_fill_time_from_history(hist) or asof_time
+
+        if status == OrderStatus.COMPLETE:
+            if avg is None or avg <= 0:
+                _persist_executor_update(ut, {
+                    "exec_status": "ENTRY_INVALIDATED_FILL_PRICE_PENDING",
+                    "exec_status_message": str(reason)[:250],
+                    "exec_last_checked_at": asof_time,
+                })
+                return True
+            return self._finalize_invalidated_broker_entry_fill(
+                ut,
+                fill_price=avg,
+                fill_qty=filled_qty or (_try_int(getattr(ut, "quantity", 0), 0) or 1),
+                fill_time=fill_time,
+                reason=reason,
+            )
+
+        if status in (OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.INVALID):
+            if filled_qty > 0:
+                if avg is None or avg <= 0:
+                    _persist_executor_update(ut, {
+                        "exec_status": "ENTRY_INVALIDATED_PARTIAL_FILL_PRICE_PENDING",
+                        "exec_status_message": str(reason)[:250],
+                        "exec_last_checked_at": asof_time,
+                    })
+                    return True
+                return self._finalize_invalidated_broker_entry_fill(
+                    ut,
+                    fill_price=avg,
+                    fill_qty=filled_qty,
+                    fill_time=fill_time,
+                    reason=reason,
+                )
+
+            terminal = (
+                EntryStatus.CANCELLED.value
+                if status == OrderStatus.CANCELLED
+                else EntryStatus.REJECTED.value
+                if status == OrderStatus.REJECTED
+                else EntryStatus.INVALID.value
+            )
+            _persist_executor_update(ut, {
+                "entry_status": terminal,
+                "executed_entry_price": None,
+                "executed_entry_qty": 0,
+                "exec_status": f"ENTRY_{status.value}_SIGNAL_INVALIDATED",
+                "exec_status_message": str(reason)[:250],
+                "exec_last_checked_at": asof_time,
+            })
+            return True
+
+        already_requested = _enum_str(getattr(ut, "exec_status", "")) == (
+            "ENTRY_CANCEL_REQUESTED_SIGNAL_INVALIDATED"
+        )
+        requested = True if already_requested else _safe_cancel_order(
+            broker,
+            order_id=oid,
+            variety=variety,
+        )
+        _persist_executor_update(ut, {
+            "exec_status": (
+                "ENTRY_CANCEL_REQUESTED_SIGNAL_INVALIDATED"
+                if requested
+                else "ENTRY_CANCEL_REQUEST_FAILED_SIGNAL_INVALIDATED"
+            ),
+            "exec_status_message": str(reason)[:250],
+            "exec_last_checked_at": asof_time,
+        })
+        return True
+
+    def _cancel_invalidated_entry_package(
+        self,
+        ut: UserTradeSchema,
+        *,
+        reason: str,
+        asof_time: datetime,
+        broker: Optional[ZerodhaBroker],
+    ) -> bool:
+        package = UserTradeSchema.fetch_active_trades_for_signal(
+            userid=str(getattr(ut, "userid", "") or ""),
+            signal_id=str(getattr(ut, "signal_id", "") or ""),
+        )
+        if not package:
+            package = [ut]
+
+        for leg in package:
+            es = _entry_status(leg)
+            if es in (EntryStatus.CREATED.value, EntryStatus.READY.value):
+                _persist_executor_update(leg, {
+                    "entry_status": EntryStatus.EXPIRED.value,
+                    "exit_status": ExitStatus.NONE.value,
+                    "exec_status": "ENTRY_EXPIRED_SIGNAL_INVALIDATED",
+                    "exec_status_message": str(reason)[:250],
+                    "exec_last_checked_at": asof_time,
+                })
+                continue
+
+            if es == EntryStatus.SUBMITTED.value:
+                if not _is_real(leg):
+                    _persist_executor_update(leg, {
+                        "entry_status": EntryStatus.CANCELLED.value,
+                        "exit_status": ExitStatus.NONE.value,
+                        "exec_status": "VIRTUAL_ENTRY_CANCELLED_SIGNAL_INVALIDATED",
+                        "exec_status_message": str(reason)[:250],
+                        "exec_last_checked_at": asof_time,
+                    })
+                elif broker is None:
+                    _persist_executor_update(leg, {
+                        "exec_status": "ENTRY_CANCEL_PENDING_BROKER_LOGIN_REQUIRED",
+                        "exec_status_message": str(reason)[:250],
+                        "exec_last_checked_at": asof_time,
+                    })
+                else:
+                    self._cancel_submitted_entry_for_signal_invalidation(
+                        leg,
+                        broker,
+                        reason=reason,
+                        asof_time=asof_time,
+                    )
+                continue
+
+            if es == EntryStatus.FILLED.value:
+                self._mark_filled_entry_for_immediate_exit(
+                    leg,
+                    reason=reason,
+                    asof_time=asof_time,
+                )
+
+        logger.info(
+            "TradeExecutor: invalidated entry package handled | userid=%s signal_id=%s reason=%s legs=%d",
+            getattr(ut, "userid", None),
+            getattr(ut, "signal_id", None),
+            reason,
+            len(package),
+        )
+        return True
 
     def _expire_entry_package(self, ut: UserTradeSchema, *, reason: str, asof_time: datetime) -> bool:
         count = UserTradeSchema.expire_ready_entries_for_signal(
@@ -940,17 +1384,26 @@ class TradeExecutor:
         candidate_time: datetime,
         asof_time: datetime,
     ) -> Optional[str]:
-        """Validate only that a READY package has an executable quote.
+        """Revalidate source signal and strict entry eligibility at execution.
 
-        TradeGenerator and the signal lifecycle own entry validity. The
-        executor deliberately does not apply intent expiry, signal stage/action
-        checks, signal staleness, target-consumed checks, setup-stop checks,
-        ATR chase checks, or quote-age expiry.
-
-        This keeps execution mechanical: a persisted READY package is filled
-        when a usable price and timestamp are available.
+        TradeGenerator remains the first eligibility gate.  Executor performs
+        the final authoritative check immediately before a virtual fill or real
+        broker submission so a stale READY package cannot execute after its
+        signal has died.
         """
-        del ut, asof_time  # policy is intentionally not re-evaluated here
+        guard_state, signal, guard_reason = self._entry_signal_guard(ut)
+        if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
+            return guard_reason or "ENTRY_CANCEL_SIGNAL_INVALIDATED"
+        if guard_state == ENTRY_SIGNAL_GUARD_DEFER:
+            return guard_reason or "ENTRY_DEFER_SIGNAL_REVALIDATION_FAILED"
+
+        profitability_reason = self._entry_profitability_defer_reason(
+            ut,
+            signal=signal,
+            asof_time=asof_time,
+        )
+        if profitability_reason:
+            return profitability_reason
 
         px = d(candidate_price)
         if px <= 0:
@@ -1028,7 +1481,12 @@ class TradeExecutor:
             if expiry_reason:
                 if expiry_reason.startswith("ENTRY_DEFER_"):
                     return self._defer_ready_entry(ut, reason=expiry_reason, asof_time=asof_time)
-                return self._expire_entry_package(ut, reason=expiry_reason, asof_time=asof_time)
+                return self._cancel_invalidated_entry_package(
+                    ut,
+                    reason=expiry_reason,
+                    asof_time=asof_time,
+                    broker=None,
+                )
             qty = _try_int(getattr(ut, "quantity", 0), 0) or 1
             updates.update(_entry_fill_updates(
                 ut,
@@ -1137,10 +1595,11 @@ class TradeExecutor:
                         reason=expiry_reason,
                         asof_time=asof_time,
                     )
-                return self._expire_entry_package(
+                return self._cancel_invalidated_entry_package(
                     ut,
                     reason=expiry_reason,
                     asof_time=asof_time,
+                    broker=broker,
                 )
 
             executable_px = _round_to_tick(d(candidate_px))
@@ -1290,13 +1749,38 @@ class TradeExecutor:
             es = _entry_status(ut)
             if es in (
                 EntryStatus.FILLED.value,
+                EntryStatus.EXPIRED.value,
                 EntryStatus.CANCELLED.value,
                 EntryStatus.REJECTED.value,
                 EntryStatus.INVALID.value,
             ):
                 return True
 
-            did_terminal = self._poll_entry_once(ut, broker)
+            now = _now_ist_naive()
+            guard_state, _, guard_reason = self._entry_signal_guard(ut)
+            allow_reprice = True
+
+            if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
+                self._cancel_invalidated_entry_package(
+                    ut,
+                    reason=guard_reason or "ENTRY_CANCEL_SIGNAL_INVALIDATED",
+                    asof_time=now,
+                    broker=broker,
+                )
+                did_terminal = False
+                allow_reprice = False
+            elif guard_state == ENTRY_SIGNAL_GUARD_DEFER:
+                _persist_executor_update(ut, {
+                    "exec_status": "ENTRY_SIGNAL_REVALIDATION_PENDING",
+                    "exec_status_message": str(guard_reason or "signal revalidation pending")[:250],
+                    "exec_last_checked_at": now,
+                })
+                # Still reconcile broker truth, but never improve/reprice the
+                # order until the source signal can be validated again.
+                did_terminal = self._poll_entry_once(ut, broker)
+                allow_reprice = False
+            else:
+                did_terminal = self._poll_entry_once(ut, broker)
 
             ut2 = UserTradeSchema.fetch_user_trade_by_id(trade_id)
             if not ut2:
@@ -1305,6 +1789,7 @@ class TradeExecutor:
             es2 = _entry_status(ut2)
             if es2 in (
                 EntryStatus.FILLED.value,
+                EntryStatus.EXPIRED.value,
                 EntryStatus.CANCELLED.value,
                 EntryStatus.REJECTED.value,
                 EntryStatus.INVALID.value,
@@ -1315,7 +1800,7 @@ class TradeExecutor:
                 UserTradeSchema.update_user_trade_by_id(trade_id, {"exec_last_checked_at": _now_ist_naive()})
                 return True
 
-            if not did_terminal and reprices_done < MAX_REPRICES_PER_PASS:
+            if allow_reprice and not did_terminal and reprices_done < MAX_REPRICES_PER_PASS:
                 if self._maybe_modify_entry_price(ut2, broker):
                     reprices_done += 1
 
@@ -1521,7 +2006,11 @@ class TradeExecutor:
         order_type = OrderType.from_string(getattr(op, "order_type", OrderType.MARKET.value))
         variety = OrderVariety.from_string(getattr(op, "order_variety", OrderVariety.REGULAR.value))
 
-        qty = int(getattr(ut, "quantity", 1) or 1)
+        qty = int(
+            getattr(ut, "executed_entry_qty", None)
+            or getattr(ut, "quantity", 1)
+            or 1
+        )
         if qty <= 0:
             _persist_executor_update(ut, {
                 "exit_status": ExitStatus.FAILED.value,
