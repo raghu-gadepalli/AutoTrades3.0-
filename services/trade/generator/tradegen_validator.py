@@ -22,8 +22,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from configs.trade_config import TRADE_CONFIG
+from database.database import get_trades_db
 from enums.enums import SignalStatus
 from schemas.signal import SignalSchema
+from models.trade_models import Snapshot as SnapshotORM
 from schemas.user import UserSchema
 from schemas.user_trade import UserTradeSchema
 from utils.datetime_utils import business_now_naive, to_ist_naive
@@ -365,13 +367,90 @@ def _user_autotrade_enabled(user: UserSchema) -> bool:
     return int(getattr(user, "autotrade", 0) or 0) == 1
 
 
+def _signal_evaluation_time(signal: SignalSchema):
+    """Return the snapshot time that TradeGenerator is currently evaluating.
+
+    SignalGenerator updates ``last_snapshot_time`` on each lifecycle pass.  Use
+    that time first so replay cannot see a later snapshot.  The remaining fields
+    are compatibility fallbacks for older persisted signals.
+    """
+    for attr in (
+        "last_snapshot_time",
+        "last_eval_time",
+        "stage_changed_time",
+        "actionable_time",
+        "qualified_time",
+        "first_seen_time",
+    ):
+        value = to_ist_naive(getattr(signal, attr, None))
+        if value is not None:
+            return value
+    return None
+
+
+def _signal_snapshot_price(signal: SignalSchema) -> Dict[str, Any]:
+    """Read the evaluation snapshot LTP, falling back to the same snapshot close.
+
+    Do not use ``signal.last_price`` for entry eligibility.  It can represent a
+    lifecycle value rather than the current TradeGenerator evaluation snapshot.
+    Reading the persisted snapshot row also preserves the normal DB-column LTP,
+    which is deliberately excluded from the snapshot JSON payload.
+    """
+    symbol = _symbol(signal)
+    evaluation_time = _signal_evaluation_time(signal)
+    if not symbol or evaluation_time is None:
+        return {
+            "current_price": None,
+            "price_source": None,
+            "price_snapshot_time": evaluation_time,
+        }
+
+    with get_trades_db() as db:
+        rec = (
+            db.query(SnapshotORM)
+            .filter(SnapshotORM.symbol == symbol)
+            .filter(SnapshotORM.snapshot_time <= evaluation_time)
+            .order_by(SnapshotORM.snapshot_time.desc())
+            .first()
+        )
+
+    if rec is None:
+        return {
+            "current_price": None,
+            "price_source": None,
+            "price_snapshot_time": evaluation_time,
+        }
+
+    snapshot_time = to_ist_naive(getattr(rec, "snapshot_time", None))
+    ltp = _optional_float(getattr(rec, "ltp", None))
+    if ltp is not None and ltp > 0:
+        return {
+            "current_price": ltp,
+            "price_source": "SNAPSHOT_LTP",
+            "price_snapshot_time": snapshot_time,
+        }
+
+    payload = getattr(rec, "data", None)
+    close = _optional_float(payload.get("close")) if isinstance(payload, dict) else None
+    if close is not None and close > 0:
+        return {
+            "current_price": close,
+            "price_source": "SNAPSHOT_CLOSE",
+            "price_snapshot_time": snapshot_time,
+        }
+
+    return {
+        "current_price": None,
+        "price_source": None,
+        "price_snapshot_time": snapshot_time,
+    }
+
+
 def _signal_entry_prices(signal: SignalSchema) -> Dict[str, Any]:
     side = _side(signal)
     created = _optional_float(getattr(signal, "created_price", None))
-    current_raw = getattr(signal, "last_price", None)
-    if current_raw is None:
-        current_raw = getattr(signal, "ltp", None)
-    current = _optional_float(current_raw)
+    snapshot_price = _signal_snapshot_price(signal)
+    current = _optional_float(snapshot_price["current_price"])
 
     directional_move_pct: Optional[float] = None
     if created is not None and created > 0 and current is not None:
@@ -385,6 +464,8 @@ def _signal_entry_prices(signal: SignalSchema) -> Dict[str, Any]:
         "created_price": created,
         "current_price": current,
         "directional_move_pct": directional_move_pct,
+        "price_source": snapshot_price["price_source"],
+        "price_snapshot_time": snapshot_price["price_snapshot_time"],
     }
 
 
@@ -453,8 +534,8 @@ def _price_entry_decision(signal: SignalSchema, *, mode: str, warnings: List[str
         "policy": "signal_entry_not_in_loss",
         **prices,
         "required_relation": (
-            "current_price >= created_price" if side == "BUY" else
-            "current_price <= created_price" if side == "SELL" else
+            "current_price > created_price" if side == "BUY" else
+            "current_price < created_price" if side == "SELL" else
             "valid BUY/SELL side required"
         ),
     }
@@ -467,10 +548,13 @@ def _price_entry_decision(signal: SignalSchema, *, mode: str, warnings: List[str
             details=details,
         )
 
-    not_in_loss = (side == "BUY" and current >= created) or (side == "SELL" and current <= created)
-    details["not_in_loss"] = bool(not_in_loss)
+    strictly_favorable = (side == "BUY" and current > created) or (side == "SELL" and current < created)
+    # Keep ``not_in_loss`` temporarily for report compatibility, but its value
+    # now represents the stricter deployment requirement.
+    details["not_in_loss"] = bool(strictly_favorable)
+    details["strictly_favorable"] = bool(strictly_favorable)
     details["at_breakeven"] = bool(current == created)
-    if not_in_loss:
+    if strictly_favorable:
         return None
     return TradeDecision.wait(
         _policy_str("signal_entry_wait_in_loss_code"),

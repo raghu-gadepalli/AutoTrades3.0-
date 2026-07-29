@@ -12,10 +12,10 @@ class TradeDefaultsConfig(BaseModel):
 class TradeDecisionPolicyConfig(BaseModel):
     # Generic signal-entry price safeguard. This is deliberately minimal and
     # applies to every originating setup. TradeGenerator may deploy an OPEN
-    # signal when the current price is at breakeven or favorable versus the
-    # signal creation price.
+    # signal only when the evaluation snapshot price is strictly favorable
+    # versus the signal creation price; equality remains DEFER.
     signal_entry_not_in_loss_enabled: bool = True
-    signal_entry_wait_in_loss_code: str = "SIGNAL_ENTRY_WAIT_NOT_IN_LOSS"
+    signal_entry_wait_in_loss_code: str = "SIGNAL_ENTRY_WAIT_NOT_STRICTLY_PROFITABLE"
     signal_entry_wait_price_missing_code: str = "SIGNAL_ENTRY_WAIT_PRICE_UNAVAILABLE"
 
     # Manual signal trades are allowed through an explicit confirmation flow.
