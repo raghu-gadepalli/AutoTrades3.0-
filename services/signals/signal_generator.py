@@ -22,9 +22,10 @@ from enums.auction_engine import (
     SetupFamily,
     TradeSide,
 )
-from enums.enums import LifecycleStage, SignalSide, SignalStatus
+from enums.enums import EntryStatus, LifecycleStage, SignalSide, SignalStatus
 from schemas.signal import SignalSchema
 from schemas.stock_opportunity import StockOpportunitySchema
+from schemas.user_trade import UserTradeSchema
 from schemas.snapshot import SnapshotSchema
 from schemas.symbol import SymbolSchema
 from services.auction_engine.event_driven_setup_engine import (
@@ -67,6 +68,24 @@ class SignalFetcher:
 
     def fetch_signal_by_id(self, signal_id: str) -> Optional[SignalSchema]:
         return SignalSchema.fetch_by_signal_id_strict(signal_id)
+
+    def has_market_deployment(self, signal_id: str) -> bool:
+        """Return True only after an entry reached the broker/virtual market.
+
+        CREATED/READY rows are still pending entry intents and must not keep an
+        otherwise completed opportunity's signal open. SUBMITTED rows are
+        treated as deployed because a broker order is already in flight. Any
+        positive executed quantity also counts, regardless of the persisted
+        entry status, so partial-fill/cancel races remain protected.
+        """
+        trades = UserTradeSchema.fetch_for_signal_id(signal_id)
+        for trade in trades:
+            executed_qty = int(trade.executed_entry_qty or 0)
+            if executed_qty > 0:
+                return True
+            if trade.entry_status in {EntryStatus.SUBMITTED, EntryStatus.FILLED}:
+                return True
+        return False
 
 
 class SignalPersister:
@@ -208,6 +227,46 @@ class SignalPersister:
             route=route,
         )
 
+    def close_completed_unfilled_signal(
+        self,
+        *,
+        signal: SignalSchema,
+        snapshot: SnapshotSchema,
+        reason: str,
+        meta_json: Dict[str, Any],
+        criteria_json: Dict[str, Any],
+        analytics: Dict[str, Any],
+    ) -> SignalSchema:
+        """Close entry eligibility after opportunity completion.
+
+        The linked stock_opportunities row has already been moved to COMPLETED,
+        so this method must not call terminate_opportunity(), whose contract is
+        reserved for INVALIDATED/REPLACED outcomes. This signal close applies
+        only when no order was submitted and no entry quantity was filled.
+        """
+        persisted = SignalSchema.close_signal(
+            signal_id=signal.signal_id,
+            stage=LifecycleStage.FORCE_EXIT,
+            status=SignalStatus.CLOSED,
+            setup=signal.setup,
+            reason=reason,
+            ts=snapshot.snapshot_time,
+            last_eval_time=snapshot.snapshot_time,
+            last_snapshot_time=snapshot.snapshot_time,
+            criteria_json=criteria_json,
+            snapshot_json=_snapshot_json(snapshot),
+            meta_json=meta_json,
+            last_price=_decimal(snapshot.close),
+            ltp=_decimal_optional(snapshot.ltp),
+            ltp_time=snapshot.ltp_time,
+            **analytics,
+        )
+        if persisted is None:
+            raise RuntimeError(
+                f"Completed unfilled signal close returned no row: {signal.signal_id}"
+            )
+        return persisted
+
 
 class SignalAssembler:
     """Translate one authoritative Auction snapshot into signal writes."""
@@ -303,11 +362,43 @@ class SignalAssembler:
                     continue
                 if progression_pending:
                     continue
+
+                completion_reason = (
+                    f"{route.source_event_type.value}_OPPORTUNITY_WINDOW_COMPLETED"
+                )
                 self.persister.complete_opportunity(
                     signal=active,
                     snapshot=snapshot,
                     route=route,
                 )
+
+                # A completion event ends entry eligibility, but it must not
+                # force-exit an order already submitted or a filled position.
+                # When nothing reached the market, synchronize the linked
+                # signal to CLOSED so it cannot remain the stale active signal
+                # for the rest of the day.
+                if not self.fetcher.has_market_deployment(active.signal_id):
+                    meta = _updated_meta(
+                        signal=active,
+                        snapshot=snapshot,
+                        identity=active_identity,
+                        stage=LifecycleStage.FORCE_EXIT,
+                        status=SignalStatus.CLOSED,
+                        signal_action="CLOSE",
+                        reason=completion_reason,
+                        auction_action="EVENT_CLOSE",
+                    )
+                    persisted = self.persister.close_completed_unfilled_signal(
+                        signal=active,
+                        snapshot=snapshot,
+                        reason=completion_reason,
+                        meta_json=meta,
+                        criteria_json=_criteria_json(snapshot, evaluations, manager),
+                        analytics=_analytics(active, snapshot),
+                    )
+                    events.append(("CLOSE", persisted))
+                    active = None
+                    break
 
         if selected is not None:
             replaces_active = active is not None
