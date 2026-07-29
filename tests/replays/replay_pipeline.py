@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tests/replay_pipeline.py
+tests/replays/replay_pipeline.py
 
 Clean, fixed-symbol, end-to-end replay/backtest runner for AutoTrades.
 
@@ -21,7 +21,7 @@ This is intentionally a simple clean-run utility:
 - no CLI arguments
 - no checkpoint/resume logic
 - no raw candle deletion; historical data is fetched from the API on demand
-- optional global clearing of auditlog, user_trades, signals and snapshots
+- optional global clearing of auditlog, user_trades, stock_opportunities, signals and snapshots
 - optional CSV exports
 
 For large-universe work, use replay_snapshots.py followed by
@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 # Allow imports from project root.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
@@ -53,6 +53,7 @@ from logconfig import setup_logging
 from models.trade_models import (
     AuditLog as AuditLogORM,
     Signal as SignalORM,
+    StockOpportunity as StockOpportunityORM,
     Snapshot as SnapshotORM,
     UserTrade as TradeORM,
 )
@@ -91,10 +92,10 @@ DATA_USER_ID = AppConfig.DATA_USER
 API_KEY_OVERRIDE = ""
 ACCESS_TOKEN_OVERRIDE = ""
 
-# True performs a clean replay by globally deleting the current auditlog,
-# user_trades, signals and snapshots rows before starting. Candles and
-# derivatives data are deliberately preserved.
-CLEAR_REPLAY_DATA: bool = True
+# False preserves the configured database state. Set True only when a clean
+# replay is required; auditlog, user_trades, stock_opportunities, signals and
+# snapshots are then cleared. Candles and derivatives data are preserved.
+CLEAR_DATA: bool = False
 
 # True writes signals, user_trades, auditlog and a one-row summary CSV.
 GENERATE_CSV_REPORTS: bool = True
@@ -227,14 +228,17 @@ def _resolve_api_credentials() -> Tuple[str, str, str]:
 
 
 def _clear_replay_data() -> None:
-    if not CLEAR_REPLAY_DATA:
-        logger.info("CLEAR_REPLAY_DATA=False; existing replay rows are preserved")
+    if not CLEAR_DATA:
+        logger.info("CLEAR_DATA=False; existing replay rows are preserved")
         return
 
     with get_trades_db() as db:
         try:
             # Delete dependent/current pipeline rows before snapshots.
             trades_deleted = int(db.query(TradeORM).delete(synchronize_session=False))
+            opportunities_deleted = int(
+                db.query(StockOpportunityORM).delete(synchronize_session=False)
+            )
             signals_deleted = int(db.query(SignalORM).delete(synchronize_session=False))
             audits_deleted = int(db.query(AuditLogORM).delete(synchronize_session=False))
             snapshots_deleted = int(db.query(SnapshotORM).delete(synchronize_session=False))
@@ -244,8 +248,10 @@ def _clear_replay_data() -> None:
             raise
 
     logger.info(
-        "Clean replay reset complete | user_trades=%d signals=%d auditlog=%d snapshots=%d",
+        "Clean replay reset complete | user_trades=%d stock_opportunities=%d "
+        "signals=%d auditlog=%d snapshots=%d",
         trades_deleted,
+        opportunities_deleted,
         signals_deleted,
         audits_deleted,
         snapshots_deleted,
@@ -546,7 +552,7 @@ def _write_csv_reports(
         "replay_userid": REPLAY_USERID,
         "data_user_id": DATA_USER_ID,
         "credential_source": credential_source,
-        "clear_replay_data": CLEAR_REPLAY_DATA,
+        "clear_data": CLEAR_DATA,
         "db_snapshots": summary["snapshots"],
         "db_processed_snapshots": summary["processed_snapshots"],
         "db_signals": summary["signals"],
@@ -703,7 +709,7 @@ def main() -> None:
         STEP_MINUTES,
         symbols,
         REPLAY_USERID,
-        CLEAR_REPLAY_DATA,
+        CLEAR_DATA,
         GENERATE_CSV_REPORTS,
         DATA_USER_ID,
         credential_source,

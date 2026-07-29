@@ -3,7 +3,7 @@
 Init-day intraday reset (consistent logging like other runners)
 
 - Archive signals & user_trades to *_history (optional)
-- Truncate intraday tables (signals, user_trades, snapshots, candles, derivativeschain)
+- Truncate intraday tables (stock_opportunities, signals, user_trades, snapshots, candles, derivativeschain)
 - Reset daily EQ selection flags (enabled remains the monthly universe gate)
 - Activate configured universe.whitelist symbols for the daily snapshot universe
 - Reset user logins (logged_in=0, logged_time=NULL)

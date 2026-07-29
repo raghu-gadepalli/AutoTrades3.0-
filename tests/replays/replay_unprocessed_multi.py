@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-"""Process all existing snapshots where ``processed = 0``.
+"""Process existing unprocessed snapshots with parallel signal generation.
 
-This is the downstream-only replay utility. It never generates snapshots and
-never clears any database table.
+This is the threaded companion to ``replay_unprocessed.py``.
 
-The processing order deliberately mirrors the live services and the original
-``replay_unprocessed`` cadence design:
+It never generates snapshots and never clears database tables. The script reads
+all rows where ``Snapshot.processed = False`` and processes them in chronological
+snapshot cadences:
 
     all unprocessed snapshots at one snapshot_time
-        -> SignalGenerator for each snapshot
+        -> SignalGenerator in parallel across symbols
         -> mark each successful snapshot processed immediately
         -> optional TradeGenerator once for the cadence
         -> optional TradeExecutor entry pass once for the cadence
         -> optional TradeMonitor pass once for the cadence
         -> optional TradeExecutor exit pass once for the cadence
 
-``Snapshot.processed`` has the same meaning as it has in the live signal
-service: signal handling for that snapshot completed successfully. It is not a
-checkpoint for the trade services. Trade generation, execution and monitoring
-continue from their own persisted signal/trade states, as they do live.
+Only signal evaluation is parallel. The downstream trade pipeline remains
+single-threaded and runs once per cadence, matching the live service order.
+
+Restart safety
+--------------
+A snapshot is marked processed inside its worker immediately after
+SignalGenerator succeeds. Failed snapshots remain unprocessed. Later snapshots
+for a symbol that failed are deferred during the current run so symbol-local
+chronology is never skipped. Restarting the script automatically retries the
+remaining rows.
 
 There are no command-line arguments, date filters, symbol filters, snapshot
-creation, or clearing options. Restarting the script simply skips snapshots
-already marked processed and continues with the remaining rows.
+creation, clearing options, or checkpoint files.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import groupby
 import json
@@ -40,7 +47,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 # Allow imports from the project root.
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -65,17 +72,40 @@ from services.trade.monitor.trade_monitor import TradeMonitor
 # False -> generate/update signals only.
 # True  -> additionally run trade generation, entry, monitor and exit once per
 #          snapshot cadence.
-GENERATE_TRADES: bool = False
+GENERATE_TRADES: bool = True
 
-# The replay is intended to be run for one backtest user at a time. Set this to
-# None only when the normal eligible-user TradeGenerator flow is desired.
+# The backtest is intended to be run for one user at a time. This value is only
+# passed to the normal TradeGenerator; executor and monitor keep their normal
+# service behavior.
 REPLAY_USERID: Optional[str] = "DR1812"
 
-LOG_FILE = "reports/replay_unprocessed.log"
+# Parallelism applies only to SignalGenerator work for different symbols at the
+# same snapshot cadence.
+SIGNAL_MAX_WORKERS: int = 3
+
+# Log individual signal evaluations above this duration as slow.
+SLOW_SIGNAL_SECONDS: float = 5.0
+
+LOG_FILE = "reports/replay_unprocessed_multi.log"
 IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 SnapshotKey = Tuple[str, datetime]
+
+
+# =============================================================================
+# Result model
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class SignalResult:
+    symbol: str
+    snapshot_time: datetime
+    action: str
+    elapsed_seconds: float
+    success: bool
+    error: Optional[str] = None
 
 
 # =============================================================================
@@ -84,7 +114,7 @@ SnapshotKey = Tuple[str, datetime]
 
 
 def _fetch_unprocessed_keys() -> List[SnapshotKey]:
-    """Return the restart queue in live chronological order."""
+    """Return the restart queue in chronological live order."""
     with get_trades_db() as db:
         rows = (
             db.query(SnapshotORM.symbol, SnapshotORM.snapshot_time)
@@ -96,17 +126,30 @@ def _fetch_unprocessed_keys() -> List[SnapshotKey]:
             .all()
         )
 
-    return [
-        (str(symbol).strip().upper(), snapshot_time)
-        for symbol, snapshot_time in rows
-        if str(symbol).strip() and isinstance(snapshot_time, datetime)
-    ]
+    seen: set[SnapshotKey] = set()
+    keys: List[SnapshotKey] = []
+    for symbol, snapshot_time in rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol or not isinstance(snapshot_time, datetime):
+            continue
+        key = (normalized_symbol, snapshot_time)
+        if key in seen:
+            logger.warning(
+                "Duplicate unprocessed snapshot key found; processing once | "
+                "symbol=%s snapshot_time=%s",
+                normalized_symbol,
+                snapshot_time,
+            )
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
 
 
 def _load_unprocessed_group(
     snapshot_time: datetime,
 ) -> Tuple[List[SnapshotSchema], set[str]]:
-    """Load one cadence and report symbols whose payload could not be loaded."""
+    """Load one cadence and return symbols whose payload could not be loaded."""
     with get_trades_db() as db:
         rows = (
             db.query(SnapshotORM)
@@ -120,8 +163,14 @@ def _load_unprocessed_group(
 
     snapshots: List[SnapshotSchema] = []
     invalid_symbols: set[str] = set()
+    seen_symbols: set[str] = set()
+
     for row in rows:
         symbol = str(row.symbol or "").strip().upper()
+        if symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+
         try:
             raw = row.data
             if isinstance(raw, str):
@@ -231,55 +280,122 @@ def _snapshot_execution_mode() -> Iterator[None]:
 
 
 # =============================================================================
-# Live-style cadence jobs
+# Parallel signal work
 # =============================================================================
+
+
+def _process_signal_snapshot(snapshot: SnapshotSchema) -> SignalResult:
+    """Evaluate and acknowledge one snapshot inside a worker thread."""
+    started = time.perf_counter()
+    try:
+        action = str(SignalGenerator(snapshot).generate() or "NO_ACTION")
+        # Restart safety: acknowledge immediately after this snapshot's signal
+        # evaluation succeeds. Trade services persist their own lifecycle.
+        _mark_processed(snapshot)
+        elapsed = time.perf_counter() - started
+        log = logger.warning if elapsed >= float(SLOW_SIGNAL_SECONDS) else logger.debug
+        log(
+            "SIGNAL_SNAPSHOT_DONE | %s @ %s | action=%s elapsed=%.3fs",
+            snapshot.symbol,
+            snapshot.snapshot_time,
+            action,
+            elapsed,
+        )
+        return SignalResult(
+            symbol=snapshot.symbol,
+            snapshot_time=snapshot.snapshot_time,
+            action=action,
+            elapsed_seconds=elapsed,
+            success=True,
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        logger.exception(
+            "Signal processing failed; snapshot remains unprocessed | symbol=%s "
+            "snapshot_time=%s",
+            snapshot.symbol,
+            snapshot.snapshot_time,
+        )
+        return SignalResult(
+            symbol=snapshot.symbol,
+            snapshot_time=snapshot.snapshot_time,
+            action="ERROR",
+            elapsed_seconds=elapsed,
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _generate_signals_for_cadence(
     snapshots: List[SnapshotSchema],
     *,
     failed_symbols: set[str],
+    executor: ThreadPoolExecutor,
     stats: Counter[str],
 ) -> int:
-    """Process and acknowledge each snapshot independently, exactly as live."""
+    """Evaluate one cadence in parallel and wait before downstream jobs."""
+    eligible = [
+        snapshot for snapshot in snapshots if snapshot.symbol not in failed_symbols
+    ]
+    stats["skipped_after_symbol_error"] += len(snapshots) - len(eligible)
+
+    if not eligible:
+        return 0
+
+    future_map: Dict[Future[SignalResult], SnapshotSchema] = {
+        executor.submit(_process_signal_snapshot, snapshot): snapshot
+        for snapshot in eligible
+    }
+
     completed = 0
-
-    for snapshot in snapshots:
-        symbol = snapshot.symbol
-        if symbol in failed_symbols:
-            stats["skipped_after_symbol_error"] += 1
-            continue
-
-        started = time.perf_counter()
+    results: List[SignalResult] = []
+    for future in as_completed(future_map):
+        snapshot = future_map[future]
         try:
-            action = str(SignalGenerator(snapshot).generate() or "NO_ACTION")
-            _mark_processed(snapshot)
+            result = future.result()
+        except Exception as exc:
+            # Defensive boundary: _process_signal_snapshot already catches its
+            # own errors, but a worker crash must not terminate later symbols.
+            logger.exception(
+                "Unexpected signal worker crash; snapshot remains unprocessed | "
+                "symbol=%s snapshot_time=%s",
+                snapshot.symbol,
+                snapshot.snapshot_time,
+            )
+            result = SignalResult(
+                symbol=snapshot.symbol,
+                snapshot_time=snapshot.snapshot_time,
+                action="WORKER_ERROR",
+                elapsed_seconds=0.0,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        results.append(result)
 
-            # Acknowledge immediately after this snapshot's signal work succeeds.
+    # Deterministic summary order even though futures complete out of order.
+    results.sort(key=lambda item: item.symbol)
+    for result in results:
+        if result.success:
             completed += 1
             stats["snapshots_processed"] += 1
-            stats[f"signal_action:{action}"] += 1
-
-            logger.info(
-                "SIGNAL_SNAPSHOT_DONE | %s @ %s | action=%s elapsed=%.3fs",
-                symbol,
-                snapshot.snapshot_time,
-                action,
-                time.perf_counter() - started,
-            )
-        except Exception:
-            # Preserve symbol-local chronological continuity. The failed row and
-            # later rows for this symbol remain unprocessed for the next run.
-            failed_symbols.add(symbol)
+            stats[f"signal_action:{result.action}"] += 1
+        else:
+            failed_symbols.add(result.symbol)
             stats["signal_errors"] += 1
-            logger.exception(
-                "Signal processing failed; snapshot remains unprocessed and later "
-                "snapshots for this symbol are deferred | symbol=%s snapshot_time=%s",
-                symbol,
-                snapshot.snapshot_time,
+            logger.error(
+                "Signal result failed; later snapshots for symbol deferred | "
+                "symbol=%s snapshot_time=%s error=%s",
+                result.symbol,
+                result.snapshot_time,
+                result.error,
             )
 
     return completed
+
+
+# =============================================================================
+# Live-style downstream cadence
+# =============================================================================
 
 
 def _run_trade_cadence(
@@ -292,7 +408,6 @@ def _run_trade_cadence(
 ) -> None:
     """Run the same downstream order once for the whole replay cadence."""
     stage_started = time.perf_counter()
-
     try:
         created = trade_generator.generate_user_trades(REPLAY_USERID) or []
         created_count = len(created) if isinstance(created, list) else int(created or 0)
@@ -309,9 +424,7 @@ def _run_trade_cadence(
 
     stage_started = time.perf_counter()
     try:
-        entry_updates = int(
-            trade_executor.execute_all(snapshot_time=snapshot_time) or 0
-        )
+        entry_updates = int(trade_executor.execute_all(snapshot_time=snapshot_time) or 0)
         stats["entry_updates"] += entry_updates
         logger.info(
             "EXECUTOR_ENTRY_DONE | snapshot_time=%s updates=%d elapsed=%.3fs",
@@ -349,9 +462,7 @@ def _run_trade_cadence(
 
     stage_started = time.perf_counter()
     try:
-        exit_updates = int(
-            trade_executor.execute_all(snapshot_time=snapshot_time) or 0
-        )
+        exit_updates = int(trade_executor.execute_all(snapshot_time=snapshot_time) or 0)
         stats["exit_updates"] += exit_updates
         logger.info(
             "EXECUTOR_EXIT_DONE | snapshot_time=%s updates=%d elapsed=%.3fs",
@@ -370,6 +481,9 @@ def _run_trade_cadence(
 
 
 def run() -> int:
+    if int(SIGNAL_MAX_WORKERS) < 1:
+        raise ValueError("SIGNAL_MAX_WORKERS must be >= 1")
+
     keys = _fetch_unprocessed_keys()
     if not keys:
         logger.info("No unprocessed snapshots found")
@@ -377,12 +491,14 @@ def run() -> int:
 
     distinct_times = len({snapshot_time for _, snapshot_time in keys})
     distinct_symbols = len({symbol for symbol, _ in keys})
+    workers = min(int(SIGNAL_MAX_WORKERS), max(1, distinct_symbols))
     logger.info(
-        "Unprocessed replay queue | snapshots=%d cadences=%d symbols=%d "
-        "first=%s last=%s generate_trades=%s userid=%s",
+        "Unprocessed threaded replay queue | snapshots=%d cadences=%d symbols=%d "
+        "workers=%d first=%s last=%s generate_trades=%s userid=%s",
         len(keys),
         distinct_times,
         distinct_symbols,
+        workers,
         keys[0][1],
         keys[-1][1],
         GENERATE_TRADES,
@@ -405,7 +521,10 @@ def run() -> int:
         with _snapshot_execution_mode(), _deterministic_replay_clock() as set_time:
             yield set_time
 
-    with replay_context() as set_replay_time:
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="replay-signal",
+    ) as signal_executor, replay_context() as set_replay_time:
         for snapshot_time, key_group in groupby(keys, key=lambda item: item[1]):
             group_keys = list(key_group)
             cadence_started = time.perf_counter()
@@ -413,17 +532,21 @@ def run() -> int:
             if set_replay_time is not None:
                 set_replay_time(snapshot_time)
 
-            # Reload the group from the DB. This naturally excludes snapshots
-            # completed by a prior partial run between queue discovery and here.
+            # Reload from DB so rows completed by a prior partial/concurrent run
+            # are naturally excluded.
             snapshots, load_failed_symbols = _load_unprocessed_group(snapshot_time)
             failed_symbols.update(load_failed_symbols)
             stats["snapshot_load_errors"] += len(load_failed_symbols)
+
             signal_count = _generate_signals_for_cadence(
                 snapshots,
                 failed_symbols=failed_symbols,
+                executor=signal_executor,
                 stats=stats,
             )
 
+            # Barrier is complete here: all signal workers for this cadence have
+            # returned and successful rows are already marked processed.
             if GENERATE_TRADES:
                 assert trade_generator is not None
                 assert trade_executor is not None
@@ -439,17 +562,18 @@ def run() -> int:
             stats["cadences_processed"] += 1
             logger.info(
                 "CADENCE_DONE | snapshot_time=%s queued=%d loaded_unprocessed=%d "
-                "signals_completed=%d elapsed=%.3fs",
+                "signals_completed=%d workers=%d elapsed=%.3fs",
                 snapshot_time,
                 len(group_keys),
                 len(snapshots),
                 signal_count,
+                workers,
                 time.perf_counter() - cadence_started,
             )
 
     remaining = _remaining_unprocessed_count()
     logger.info(
-        "Replay complete | elapsed=%.3fs stats=%s failed_symbols=%s "
+        "Threaded replay complete | elapsed=%.3fs stats=%s failed_symbols=%s "
         "remaining_unprocessed=%d",
         time.perf_counter() - started,
         dict(sorted(stats.items())),
@@ -458,8 +582,8 @@ def run() -> int:
     )
 
     # Per-snapshot failures are visible and retryable but do not terminate the
-    # remainder of the run. Return non-zero so automation can detect them.
-    return 1 if stats["signal_errors"] else 0
+    # remainder of the replay. Return non-zero so automation can detect them.
+    return 1 if stats["signal_errors"] or stats["snapshot_load_errors"] else 0
 
 
 def main() -> int:
@@ -468,22 +592,24 @@ def main() -> int:
     logger = logging.getLogger(__name__)
 
     logger.info(
-        "Starting replay_unprocessed | generate_trades=%s userid=%s "
-        "snapshot_generation=NEVER clearing=NEVER processing=LIVE_CADENCE_STYLE",
+        "Starting replay_unprocessed_multi | generate_trades=%s userid=%s "
+        "signal_workers=%d snapshot_generation=NEVER clearing=NEVER "
+        "processing=LIVE_CADENCE_THREADED",
         GENERATE_TRADES,
         REPLAY_USERID if GENERATE_TRADES else "NOT_USED",
+        SIGNAL_MAX_WORKERS,
     )
 
     try:
         return run()
     except KeyboardInterrupt:
         logger.info(
-            "Interrupted; each completed signal snapshot is already marked processed. "
-            "Restart the same script to continue."
+            "Interrupted; every completed signal snapshot is already marked "
+            "processed. Restart the same script to continue."
         )
         return 130
     except Exception:
-        logger.exception("replay_unprocessed failed during startup/preflight")
+        logger.exception("replay_unprocessed_multi failed during startup/preflight")
         return 1
 
 

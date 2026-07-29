@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 # allow imports from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from configs.scanner_config import SCANNER_CONFIG
 from logconfig import setup_logging

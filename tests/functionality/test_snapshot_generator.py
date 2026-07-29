@@ -6,9 +6,9 @@ import time
 from datetime import datetime
 
 # allow imports from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-# Shared logging setup 
+# Shared logging setup
 from logconfig import setup_logging
 setup_logging(log_file="snapshot.log")
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ from kiteconnect.exceptions import TokenException
 from schemas.snapshot import SnapshotSchema
 from services.snapshot.snapshot_generator import SnapshotGenerator
 
-# Configuration 
+# Configuration
 TOKEN        = 2955009
 SYMBOL       = "COFORGE"
 API_KEY      = "d17pao9dsc9jsp84"
@@ -56,7 +56,7 @@ def main():
         logger.warning("No snapshot returned. Check token/symbol or data range.")
         sys.exit(0)
 
-    # Verify & log the derivatives payload 
+    # Verify & log the derivatives payload
     if snap2.derivatives is None:
         logger.error("Snapshot.derivatives is None; no derivatives data was injected.")
     else:

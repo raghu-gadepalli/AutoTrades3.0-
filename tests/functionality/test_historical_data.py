@@ -4,8 +4,8 @@ from datetime import datetime
 from kiteconnect.exceptions import TokenException, InputException  # catch both
 
 # allow imports from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-#  Shared logging setup 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+#  Shared logging setup
 from logconfig import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ ACCESS_TOKEN = "bCax17Q0hqQj0An36xeGGMDHngsSEqV6"
 INSTR_TOKEN  = "779521"  # SBIN Future Token
 START_ISO    = "2025-04-07T09:15:00+05:30"
 END_ISO      = "2025-04-07T09:30:00+05:30"
-# 
+#
 
 def main():
     # Parse the ISO timestamps (with IST offset)

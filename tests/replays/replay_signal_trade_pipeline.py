@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict end-to-end replay of the Auction-driven signal/trade pipeline.
+"""Strict end-to-end replay of the signal/trade pipeline.
 
 Pipeline per persisted snapshot
 -------------------------------
@@ -29,7 +29,7 @@ Default COFORGE adaptive multi-instrument command (PowerShell)
 --------------------------------------------------
 
     $env:PYTHONPATH = "$PWD;$PWD\\tests"
-    python tests/replay_auction_signal_trade_pipeline.py
+    python tests/replays/replay_signal_trade_pipeline.py
 
 The defaults are declared near the top of this file. Every value can be
 overridden from the command line, for example ``--test-mode SIGNAL_EXIT``.
@@ -51,7 +51,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -106,7 +106,7 @@ _EXPECTED_TRADEGEN_NONFATAL = {
 def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay persisted Auction snapshots through SignalGenerator, "
+            "Replay persisted snapshots through SignalGenerator, "
             "TradeGenerator, virtual TradeExecutor, and strict TradeMonitor. "
             "All options have visible source defaults and command-line overrides."
         )
@@ -1114,7 +1114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     test_mode = str(args.test_mode).strip().upper()
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
-    log_file = args.log_file or str(report_dir / "replay_auction_signal_trade_pipeline.log")
+    log_file = args.log_file or str(report_dir / "replay_signal_trade_pipeline.log")
     setup_logging(log_file=log_file)
     database_name = _configured_database_name()
     global logger
@@ -1658,7 +1658,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-    prefix = report_dir / f"auction_trade_pipeline_replay_{trading_day}_{stamp}"
+    prefix = report_dir / f"signal_trade_pipeline_replay_{trading_day}_{stamp}"
     _write_csv(prefix.with_name(prefix.name + "_timeline.csv"), timeline_rows)
     _write_csv(
         prefix.with_name(prefix.name + "_trade_observations.csv"),

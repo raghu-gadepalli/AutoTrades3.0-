@@ -18,7 +18,7 @@ from schemas.signal import SignalSchema
 from services.auction_engine.contracts import AdvisorDecision
 from services.signals.signal_generator import SignalAssembler, _signal_id
 from services.trade.monitor.signal_contract import AuctionTradeSignalContext
-from tests.test_event_driven_setup_engine import _event_snapshot
+from tests.unit.test_event_driven_setup_engine import _event_snapshot
 
 
 class _Fetcher:

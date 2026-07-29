@@ -24,20 +24,14 @@ from enums.auction_engine import (
     StructuralPermissionResult,
 )
 from enums.auction_engine import (
-    AuctionStateName,
-    BoundaryEpisodeStatus,
-    BoundaryResolution,
     BoundarySide,
     EvidencePolarity,
     TradeSide,
 )
 from services.auction_engine.contracts import (
-    AuctionState,
     BarEvidence,
-    BoundaryEpisode,
     EvidenceFact,
     EvidenceSnapshot,
-    FrozenRange,
     stable_key,
 )
 from services.auction_engine.episode_contracts import AuctionEvent
@@ -223,49 +217,7 @@ class AuctionEngineContractTests(unittest.TestCase):
                 price_action={"supporting_facts": [future_fact]},
             )
 
-    def test_frozen_range_rejects_inverted_values(self) -> None:
-        with self.assertRaises(ValidationError):
-            FrozenRange(
-                range_id="range-1",
-                range_version=1,
-                source="INTRADAY_BALANCE",
-                low=102.0,
-                high=100.0,
-                start_time=self.ts - timedelta(minutes=30),
-                frozen_at=self.ts - timedelta(minutes=3),
-            )
 
-    def test_accepted_episode_requires_accepted_time(self) -> None:
-        frozen_range = FrozenRange(
-            range_id="range-1",
-            range_version=1,
-            source="INTRADAY_BALANCE",
-            low=98.0,
-            high=100.0,
-            start_time=self.ts - timedelta(minutes=30),
-            frozen_at=self.ts - timedelta(minutes=3),
-        )
-        with self.assertRaises(ValidationError):
-            BoundaryEpisode(
-                event_key="event-1",
-                structural_key="structure-1",
-                attempt_id="attempt-1",
-                symbol="TEST",
-                trading_day=self.ts.date(),
-                snapshot_time=self.ts,
-                event_time=self.ts - timedelta(minutes=3),
-                first_seen_time=self.ts - timedelta(minutes=3),
-                last_seen_time=self.ts,
-                boundary_id="range-1:upper",
-                boundary_side=BoundarySide.UPPER,
-                boundary_source="INTRADAY_BALANCE",
-                boundary_price=100.0,
-                breakout_side=TradeSide.BUY,
-                failure_side=TradeSide.SELL,
-                frozen_range=frozen_range,
-                status=BoundaryEpisodeStatus.ACCEPTED,
-                resolution=BoundaryResolution.ACCEPTED,
-            )
 
     def test_authoritative_candidate_requires_permit_and_event_identity(self) -> None:
         candidate = AuthoritativeSetupCandidate(
@@ -303,17 +255,6 @@ class AuctionEngineContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AuthoritativeSetupCandidate.model_validate(payload)
 
-    def test_auction_state_rejects_future_transition(self) -> None:
-        with self.assertRaises(ValidationError):
-            AuctionState(
-                state_key="state-1",
-                symbol="TEST",
-                snapshot_time=self.ts,
-                previous_state=AuctionStateName.BALANCE,
-                current_state=AuctionStateName.FRESH_EXPANSION,
-                transition_time=self.ts + timedelta(minutes=3),
-                entered_at=self.ts,
-            )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from services.auction_engine.event_driven_setup_engine import (
     EventDrivenSetupManager,
 )
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
-from tests.test_auction_authority_snapshot import _finalize, _snapshot
+from tests.unit.test_auction_authority_snapshot import _finalize, _snapshot
 
 
 TS = datetime(2026, 7, 27, 11, 0)

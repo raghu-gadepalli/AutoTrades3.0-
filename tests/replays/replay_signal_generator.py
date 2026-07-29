@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay persisted snapshots through the Auction-driven live SignalGenerator.
+"""Replay persisted snapshots through the live SignalGenerator.
 
 This harness does not run Auction again and does not mark snapshots processed.
 It reads the already validated snapshot.auction projection, calls the same
@@ -25,7 +25,7 @@ import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -58,7 +58,7 @@ DEFAULT_LOG_FILE: Optional[str] = None
 def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay stored Auction snapshots through the live SignalGenerator. "
+            "Replay stored snapshots through the live SignalGenerator. "
             "All options have visible source defaults and command-line overrides."
         )
     )
@@ -451,7 +451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     symbols = _symbols(args.symbols)
     lifecycle = SIGNAL_CONFIG.default_lifecycle.strip().upper()
     report_dir = Path(args.report_dir)
-    log_file = args.log_file or str(report_dir / "replay_auction_signal_generator.log")
+    log_file = args.log_file or str(report_dir / "replay_signal_generator.log")
     setup_logging(log_file=log_file)
     database_name = _configured_database_name()
     global logger
@@ -667,7 +667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(row["lifecycle_state"]) for row in opportunities
     )
     stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-    prefix = report_dir / f"auction_signal_replay_{trading_day}_{stamp}"
+    prefix = report_dir / f"signal_replay_{trading_day}_{stamp}"
     _write_csv(prefix.with_name(prefix.name + "_lifecycle.csv"), event_rows)
     _write_csv(prefix.with_name(prefix.name + "_evaluations.csv"), evaluation_rows)
     _write_csv(prefix.with_name(prefix.name + "_signals.csv"), signals)

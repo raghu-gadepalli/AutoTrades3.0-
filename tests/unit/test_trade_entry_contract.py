@@ -27,7 +27,7 @@ from services.trade.generator.tradegen_helper import _signal_setup_levels
 from schemas.user_trade import UserTradeSchema
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def make_user(*, userid: str = "TEST", autotrade: int = 1):

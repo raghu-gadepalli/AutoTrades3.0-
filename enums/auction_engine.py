@@ -91,23 +91,8 @@ class AdvisorAction(StringEnum):
     BLOCK = "BLOCK"
 
 
-class BoundaryEpisodeStatus(StringEnum):
-    APPROACHING = "APPROACHING"
-    OUTSIDE_ATTEMPT = "OUTSIDE_ATTEMPT"
-    UNRESOLVED = "UNRESOLVED"
-    ACCEPTANCE_BUILDING = "ACCEPTANCE_BUILDING"
-    ACCEPTED = "ACCEPTED"
-    FAILURE_BUILDING = "FAILURE_BUILDING"
-    FAILED = "FAILED"
-    EXPIRED = "EXPIRED"
-    SUPERSEDED = "SUPERSEDED"
-    STALE = "STALE"
 
 
-class BoundaryResolution(StringEnum):
-    UNRESOLVED = "UNRESOLVED"
-    ACCEPTED = "ACCEPTED"
-    FAILED = "FAILED"
 
 
 class SetupFamily(StringEnum):
@@ -221,8 +206,6 @@ __all__ = [
     "EvidencePolarity",
     "AuctionStateName",
     "AdvisorAction",
-    "BoundaryEpisodeStatus",
-    "BoundaryResolution",
     "SetupFamily",
     "ContextAlignment",
     "DirectionalEpisodeState",

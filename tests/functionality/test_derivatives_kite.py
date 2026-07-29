@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from pprint import pformat
 
 # allow imports from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from logconfig import setup_logging
 setup_logging(log_file="test_derivatives_kite.log")
@@ -24,7 +24,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # -------------------------------------------------------------------
 # HARD-CODED TEST SETTINGS
 # -------------------------------------------------------------------
-# Configuration 
+# Configuration
 TOKEN        = 2815745
 API_KEY      = "bv185n0541aaoish"
 ACCESS_TOKEN = "5Y8RLgQsikDAFbsNjEoNsCcRC3XvwWoB"

@@ -20,8 +20,8 @@ from services.trade.monitor.trade_monitor import (
     _canonical_exit_rule,
 )
 from enums.auction_engine import AuctionEventType, DirectionalBias, SetupFamily
-from tests.test_event_driven_setup_engine import _event_snapshot
-from tests.test_event_driven_signal_generator import _Advisor, _Fetcher, _Persister
+from tests.unit.test_event_driven_setup_engine import _event_snapshot
+from tests.unit.test_event_driven_signal_generator import _Advisor, _Fetcher, _Persister
 
 
 TS = datetime(2026, 7, 20, 11, 48, tzinfo=timezone.utc)
@@ -208,7 +208,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
             )
 
     def test_monitor_runtime_contains_no_dict_get_or_peer_resolver(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         monitor_dir = root / "services" / "trade" / "monitor"
         source = "\n".join(
             path.read_text(encoding="utf-8")
@@ -221,7 +221,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         self.assertNotIn("last_signal_quality", source)
 
     def test_removed_signal_helper_is_not_retained(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         self.assertFalse((root / "services" / "signals" / "signal_helper.py").exists())
 
 
@@ -262,7 +262,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         self.assertIn("management", kwargs["payload_json"])
 
     def test_trade_monitor_audit_is_strict_and_forced(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         source = (
             root / "services" / "trade" / "monitor" / "trade_monitor.py"
         ).read_text(encoding="utf-8")
@@ -271,37 +271,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         self.assertIn("strict TradeMonitor audit was not persisted", source)
         self.assertNotIn("trade monitor audit failed", source)
 
-    def test_replay_has_overridable_adaptive_multi_defaults(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (
-            root / "tests" / "replay_auction_signal_trade_pipeline.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn('DEFAULT_TRADING_DAY = "2026-07-27"', source)
-        self.assertIn(
-            'DEFAULT_SYMBOLS = "LT,BHEL,INDIGO,MAXHEALTH,PERSISTENT,'
-            'PNBHOUSING,TCS"',
-            source,
-        )
-        self.assertIn('DEFAULT_USERID = "DR1812"', source)
-        self.assertIn('DEFAULT_INSTRUMENT_CHOICE = "MULTI"', source)
-        self.assertIn('DEFAULT_TEST_MODE = "ADAPTIVE_EXIT"', source)
-        self.assertIn('DEFAULT_CLEAR_DATA = False', source)
-        self.assertIn('DEFAULT_REQUIRE_DERIVATIVES = True', source)
-        self.assertIn('"--clear-data"', source)
-        self.assertNotIn('"--allowed-database"', source)
-        self.assertIn("argparse.BooleanOptionalAction", source)
-        self.assertIn("_deterministic_replay_clock", source)
-        self.assertIn("SIGNAL_LIFECYCLE_EXIT", source)
 
-    def test_replay_separates_snapshot_signal_and_frozen_trade_state(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (
-            root / "tests" / "replay_auction_signal_trade_pipeline.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("snapshot_auction_action", source)
-        self.assertIn("signal_auction_action", source)
-        self.assertIn("current_signal_stage", source)
-        self.assertIn("trade_state_frozen_at_exit", source)
 
     def test_exit_rule_contract_rejects_oversize_values_before_sql(self):
         self.assertEqual(100, EXIT_RULE_MAX_LENGTH)
@@ -317,7 +287,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
             _canonical_exit_rule("x" * 101, context="test")
 
     def test_sibling_exit_rule_is_not_composed_from_primary_details(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         source = (
             root / "services" / "trade" / "monitor" / "trade_monitor.py"
         ).read_text(encoding="utf-8")
@@ -360,7 +330,7 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         self.assertNotIn(":", payload["exit_rule"])
 
     def test_monitor_records_item_errors_and_continues_contract(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         source = (
             root / "services" / "trade" / "monitor" / "trade_monitor.py"
         ).read_text(encoding="utf-8")
@@ -369,36 +339,10 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         self.assertIn("pass completed with item errors", source)
         self.assertNotIn("fatal trade evaluation error", source)
 
-    def test_replay_writes_validation_reports_and_returns_clean_failure_code(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (
-            root / "tests" / "replay_auction_signal_trade_pipeline.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("_validation.csv", source)
-        self.assertIn("_monitor_errors.csv", source)
-        self.assertIn('"validation_status"', source)
-        self.assertIn('return 2', source)
-        self.assertIn("REPLAY_VALIDATION_FAILED", source)
-        self.assertNotIn(
-            'raise AssertionError("SIGNAL_EXIT replay did not produce',
-            source,
-        )
 
-    def test_replay_audit_scope_covers_package_ids_and_symbols(self):
-        root = Path(__file__).resolve().parents[1]
-        source = (
-            root / "tests" / "replay_auction_signal_trade_pipeline.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("def _audit_scope_values(", source)
-        self.assertIn("signal_ids=signal_ids", source)
-        self.assertIn("trade_ids=trade_ids", source)
-        self.assertIn("instrument_symbols=package_symbols", source)
-        self.assertIn("TRADE_MONITOR_AUDIT_COUNT_MISMATCH", source)
-        self.assertIn("TRADE_EXECUTOR_AUDIT_COUNT_MISMATCH", source)
-        self.assertIn('"trade_executor_audit_rows"', source)
 
     def test_exact_signal_exit_precedes_generic_adaptive_exit(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         source = (
             root / "services" / "trade" / "monitor" / "trade_monitor.py"
         ).read_text(encoding="utf-8")

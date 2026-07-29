@@ -56,6 +56,7 @@ class InitResetConfig(BaseModel):
     # silently fall back to a hard-coded list when configuration is incomplete.
     intraday_tables: list[str] = Field(default_factory=lambda: [
         "user_trades",
+        "stock_opportunities",
         "signals",
         "snapshots",
         "candles",

@@ -10,7 +10,7 @@ from enums.auction_engine import (
 )
 from services.auction_engine.episode_engine import PersistentEpisodeEngine
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
-from tests.test_persistent_episode_engine import _observation
+from tests.unit.test_persistent_episode_engine import _observation
 
 
 def test_every_setup_family_has_creation_capable_authoritative_event() -> None:

@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Iterable, Optional
 
 # allow imports from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from logconfig import setup_logging
 setup_logging(log_file="trade_monitor_test.log")
