@@ -24,6 +24,7 @@ from enums.auction_engine import (
 )
 from enums.enums import LifecycleStage, SignalSide, SignalStatus
 from schemas.signal import SignalSchema
+from schemas.stock_opportunity import StockOpportunitySchema
 from schemas.snapshot import SnapshotSchema
 from schemas.symbol import SymbolSchema
 from services.auction_engine.event_driven_setup_engine import (
@@ -79,8 +80,10 @@ class SignalPersister:
         meta_json: Dict[str, Any],
         criteria_json: Dict[str, Any],
         analytics: Dict[str, Any],
+        evaluation_diagnostic: Optional[Dict[str, Any]],
+        replaced_opportunity_key: Optional[str] = None,
     ) -> SignalSchema:
-        return SignalSchema.create_signal(
+        signal = SignalSchema.create_signal(
             signal_id=_signal_id(candidate.opportunity_key),
             equity_ref=equity_ref,
             symbol=snapshot.symbol,
@@ -100,6 +103,15 @@ class SignalPersister:
             ltp_time=snapshot.ltp_time,
             **analytics,
         )
+        StockOpportunitySchema.create_deployed_opportunity(
+            snapshot=snapshot,
+            equity_ref=equity_ref,
+            candidate=candidate,
+            signal=signal,
+            evaluation_diagnostic=evaluation_diagnostic,
+            replaced_opportunity_key=replaced_opportunity_key,
+        )
+        return signal
 
     def update(
         self,
@@ -111,6 +123,8 @@ class SignalPersister:
         meta_json: Dict[str, Any],
         criteria_json: Dict[str, Any],
         analytics: Dict[str, Any],
+        progression_candidate: Optional[AuthoritativeSetupCandidate] = None,
+        evaluation_diagnostic: Optional[Dict[str, Any]] = None,
     ) -> SignalSchema:
         persisted = SignalSchema.update_signal(
             signal_id=signal.signal_id,
@@ -130,6 +144,13 @@ class SignalPersister:
         )
         if persisted is None:
             raise RuntimeError(f"Signal update returned no row: {signal.signal_id}")
+        if progression_candidate is not None:
+            StockOpportunitySchema.progress_opportunity(
+                snapshot=snapshot,
+                signal=persisted,
+                candidate=progression_candidate,
+                evaluation_diagnostic=evaluation_diagnostic,
+            )
         return persisted
 
     def close(
@@ -142,6 +163,8 @@ class SignalPersister:
         meta_json: Dict[str, Any],
         criteria_json: Dict[str, Any],
         analytics: Dict[str, Any],
+        terminal_route: Optional[Any] = None,
+        replacement_candidate: Optional[AuthoritativeSetupCandidate] = None,
     ) -> SignalSchema:
         persisted = SignalSchema.close_signal(
             signal_id=signal.signal_id,
@@ -162,7 +185,28 @@ class SignalPersister:
         )
         if persisted is None:
             raise RuntimeError(f"Signal close returned no row: {signal.signal_id}")
+        StockOpportunitySchema.terminate_opportunity(
+            snapshot=snapshot,
+            signal=persisted,
+            status=status,
+            reason=reason,
+            terminal_route=terminal_route,
+            replacement_candidate=replacement_candidate,
+        )
         return persisted
+
+    def complete_opportunity(
+        self,
+        *,
+        signal: SignalSchema,
+        snapshot: SnapshotSchema,
+        route: Any,
+    ) -> None:
+        StockOpportunitySchema.complete_opportunity(
+            snapshot=snapshot,
+            signal=signal,
+            route=route,
+        )
 
 
 class SignalAssembler:
@@ -217,7 +261,7 @@ class SignalAssembler:
 
         terminal = self._terminal_action(active, routes)
         if active is not None and terminal is not None:
-            status, reason = terminal
+            status, reason, terminal_route = terminal
             identity = _signal_identity(active)
             stage = LifecycleStage.FORCE_EXIT
             meta = _updated_meta(
@@ -239,9 +283,31 @@ class SignalAssembler:
                 meta_json=meta,
                 criteria_json=_criteria_json(snapshot, evaluations, manager),
                 analytics=analytics,
+                terminal_route=terminal_route,
             )
             events.append(("CLOSE", persisted))
             active = None
+
+        if active is not None:
+            active_identity = _signal_identity(active)
+            progression_pending = (
+                selected is not None
+                and _same_authoritative_lineage(active_identity, selected)
+            )
+            for route in routes:
+                if route.action is not SetupEventAction.CLOSE:
+                    continue
+                if route.setup_family.value != active_identity.setup_family:
+                    continue
+                if route.source_episode_id != active_identity.source_episode_id:
+                    continue
+                if progression_pending:
+                    continue
+                self.persister.complete_opportunity(
+                    signal=active,
+                    snapshot=snapshot,
+                    route=route,
+                )
 
         if selected is not None:
             replaces_active = active is not None
@@ -308,6 +374,11 @@ class SignalAssembler:
                             meta_json=meta,
                             criteria_json=_criteria_json(snapshot, evaluations, manager),
                             analytics=_analytics(active, snapshot),
+                            progression_candidate=selected,
+                            evaluation_diagnostic=_diagnostic_for_candidate(
+                                self.last_evaluation_diagnostics,
+                                selected.candidate_id,
+                            ),
                         )
                         events.append(("UPDATE", persisted))
                         return events
@@ -364,6 +435,7 @@ class SignalAssembler:
                 selected = None
 
         if selected is not None:
+            replaced_opportunity_key: Optional[str] = None
             if active is not None:
                 active_identity = _signal_identity(active)
                 close_meta = _updated_meta(
@@ -384,8 +456,10 @@ class SignalAssembler:
                     meta_json=close_meta,
                     criteria_json=_criteria_json(snapshot, evaluations, manager),
                     analytics=_analytics(active, snapshot),
+                    replacement_candidate=selected,
                 )
                 events.append(("REPLACE", replaced))
+                replaced_opportunity_key = active_identity.opportunity_key
                 active = None
 
             _mark_evaluation_outcome(
@@ -414,6 +488,11 @@ class SignalAssembler:
                     current_price=snapshot.close,
                     current_time=snapshot.snapshot_time,
                 ),
+                evaluation_diagnostic=_diagnostic_for_candidate(
+                    self.last_evaluation_diagnostics,
+                    selected.candidate_id,
+                ),
+                replaced_opportunity_key=replaced_opportunity_key,
             )
             events.append(("CREATE", persisted))
             return events
@@ -447,7 +526,7 @@ class SignalAssembler:
     def _terminal_action(
         active: Optional[SignalSchema],
         routes: Sequence[Any],
-    ) -> Optional[Tuple[SignalStatus, str]]:
+    ) -> Optional[Tuple[SignalStatus, str, Any]]:
         if active is None:
             return None
         identity = _signal_identity(active)
@@ -470,6 +549,7 @@ class SignalAssembler:
             return (
                 SignalStatus.INVALIDATED,
                 f"{route.source_event_type.value}_{suffix}",
+                route,
             )
         return None
 
@@ -522,7 +602,11 @@ def _evaluation_diagnostics(
             else None
         )
         if not evaluation.approved:
-            outcome = "SETUP_QUALITY_REJECTED"
+            outcome = (
+                "STRUCTURAL_PERMISSION_BLOCKED"
+                if evaluation.structural_result.value != "PERMIT"
+                else "SETUP_QUALITY_REJECTED"
+            )
         elif candidate_id == selected_id:
             outcome = "MANAGER_SELECTED"
         elif candidate_id in supporting_ids:
@@ -569,6 +653,18 @@ def _mark_evaluation_outcome(
     if advisor_action is not None:
         record["advisor_action"] = advisor_action
         record["advisor_reason_codes"] = tuple(advisor_reason_codes)
+
+
+def _diagnostic_for_candidate(
+    records: Sequence[Dict[str, Any]],
+    candidate_id: str,
+) -> Dict[str, Any]:
+    matches = [record for record in records if record.get("candidate_id") == candidate_id]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one diagnostic for candidate {candidate_id}; found {len(matches)}"
+        )
+    return dict(matches[0])
 
 
 def _signal_identity(signal: SignalSchema) -> AuctionSignalIdentity:

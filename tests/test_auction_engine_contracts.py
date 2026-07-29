@@ -62,6 +62,20 @@ class AuctionEngineConfigTests(unittest.TestCase):
             hasattr(AUCTION_ENGINE_CONFIG.engine, "replace_current_signal_path")
         )
         self.assertFalse(hasattr(AUCTION_ENGINE_CONFIG.episode, "projection_only"))
+        self.assertFalse(
+            hasattr(AUCTION_ENGINE_CONFIG.engine, "development_database_name")
+        )
+        self.assertFalse(
+            hasattr(AUCTION_ENGINE_CONFIG.engine, "protected_database_names")
+        )
+        self.assertNotIn(
+            "development_database_name",
+            AUCTION_ENGINE_CONFIG.resolved_dict()["engine"],
+        )
+        self.assertNotIn(
+            "protected_database_names",
+            AUCTION_ENGINE_CONFIG.resolved_dict()["engine"],
+        )
 
     def test_removed_contract_names_have_no_compatibility_aliases(self) -> None:
         self.assertFalse(hasattr(auction_contracts_module, "AuctionStateName"))

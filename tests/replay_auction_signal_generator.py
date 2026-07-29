@@ -5,8 +5,11 @@ This harness does not run Auction again and does not mark snapshots processed.
 It reads the already validated snapshot.auction projection, calls the same
 SignalGenerator used by scripts/gen_signals.py, and writes compact reports.
 
-It writes signal rows.  --clear-signals is explicit and limited to the selected
-symbols and DEFAULT lifecycle.
+It writes signal and stock-opportunity rows to the database selected by the
+application configuration. Source defaults are visible below and may be
+overridden from the command line. CLEAR_DATA defaults to False; when enabled,
+it clears the complete signals and stock_opportunities output tables before the
+replay starts.
 """
 from __future__ import annotations
 
@@ -26,36 +29,70 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import AppConfig
 from configs.signal_config import SIGNAL_CONFIG
-from database.database import get_trades_db
+from database.database import get_trades_db, trades_engine
 from logconfig import setup_logging
 from models.trade_models import Signal as SignalORM
+from models.trade_models import StockOpportunity as StockOpportunityORM
 from schemas.signal import SignalSchema
+from schemas.stock_opportunity import StockOpportunitySchema
 from schemas.snapshot import SnapshotSchema
 from services.signals.signal_generator import SignalGenerator
-from tests.replay_database_guard import require_allowed_replay_database
 from utils.json_utils import sanitize_json
 
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# SOURCE DEFAULTS
+# =============================================================================
+
+DEFAULT_TRADING_DAY = "2026-07-27"
+DEFAULT_SYMBOLS = "LT,BHEL,INDIGO,MAXHEALTH,PERSISTENT,PNBHOUSING,TCS"
+DEFAULT_CLEAR_DATA = False
+DEFAULT_REPORT_DIR = "reports"
+DEFAULT_BATCH_SIZE = 500
+DEFAULT_LOG_FILE: Optional[str] = None
+
 
 def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay stored Auction snapshots through the live SignalGenerator."
+        description=(
+            "Replay stored Auction snapshots through the live SignalGenerator. "
+            "All options have visible source defaults and command-line overrides."
+        )
     )
-    parser.add_argument("--date", required=True, help="Trading day YYYY-MM-DD")
-    parser.add_argument("--symbols", required=True, help="Comma-separated symbols")
-    parser.add_argument("--clear-signals", action="store_true")
     parser.add_argument(
-        "--allowed-database",
-        default="backtest",
-        help="Exact trades database name permitted for this write-capable replay",
+        "--date",
+        default=DEFAULT_TRADING_DAY,
+        help=f"Trading day YYYY-MM-DD (default: {DEFAULT_TRADING_DAY})",
     )
-    parser.add_argument("--report-dir", default="reports")
-    parser.add_argument("--batch-size", type=int, default=500)
-    parser.add_argument("--log-file")
+    parser.add_argument(
+        "--symbols",
+        default=DEFAULT_SYMBOLS,
+        help=f"Comma-separated symbols (default: {DEFAULT_SYMBOLS})",
+    )
+    parser.add_argument(
+        "--clear-data",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CLEAR_DATA,
+        help=(
+            "Clear complete signals and stock_opportunities tables before replay "
+            f"(default: {DEFAULT_CLEAR_DATA})"
+        ),
+    )
+    parser.add_argument(
+        "--report-dir",
+        default=DEFAULT_REPORT_DIR,
+        help=f"Report directory (default: {DEFAULT_REPORT_DIR})",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Snapshot fetch batch size (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     return parser.parse_args(argv)
 
 
@@ -79,18 +116,25 @@ def _write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
         writer.writerows(data)
 
 
-def _clear_signals(symbols: List[str], lifecycle: str) -> int:
+def _configured_database_name() -> str:
+    database_name = str(trades_engine.url.database or "").strip()
+    return database_name or "UNKNOWN"
+
+
+def _clear_data() -> Dict[str, int]:
+    """Clear only replay output tables; persisted snapshots remain untouched."""
     with get_trades_db() as db:
-        deleted = int(
-            db.query(SignalORM)
-            .filter(
-                SignalORM.symbol.in_(symbols),
-                SignalORM.lifecycle == lifecycle,
-            )
-            .delete(synchronize_session=False)
+        opportunities_deleted = int(
+            db.query(StockOpportunityORM).delete(synchronize_session=False)
+        )
+        signals_deleted = int(
+            db.query(SignalORM).delete(synchronize_session=False)
         )
         db.commit()
-    return deleted
+    return {
+        "signals": signals_deleted,
+        "opportunities": opportunities_deleted,
+    }
 
 
 def _load_snapshots(
@@ -118,6 +162,71 @@ def _load_snapshots(
         after_symbol = last.symbol
         if len(batch) < max(1, batch_size):
             break
+    return output
+
+
+def _opportunity_rows(
+    *,
+    trading_day: date,
+    symbols: List[str],
+) -> List[Dict[str, Any]]:
+    rows = StockOpportunitySchema.list_for_replay(
+        symbols=symbols,
+        trading_day=trading_day,
+    )
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        output.append(sanitize_json({
+            "opportunity_key": row.opportunity_key,
+            "candidate_id": row.candidate_id,
+            "latest_candidate_id": row.latest_candidate_id,
+            "symbol": row.symbol,
+            "equity_ref": row.equity_ref,
+            "trading_day": row.trading_day,
+            "setup_family": row.setup_family,
+            "current_setup_family": row.current_setup_family,
+            "setup_subtype": row.setup_subtype,
+            "side": row.side,
+            "source_event_id": row.source_event_id,
+            "source_event_type": row.source_event_type,
+            "source_episode_id": row.source_episode_id,
+            "latest_event_id": row.latest_event_id,
+            "latest_event_type": row.latest_event_type,
+            "latest_episode_id": row.latest_episode_id,
+            "lifecycle_state": row.lifecycle_state,
+            "lifecycle_reason": row.lifecycle_reason,
+            "structural_result": row.structural_result,
+            "first_seen_time": row.first_seen_time,
+            "last_eval_time": row.last_eval_time,
+            "deployed_at": row.deployed_at,
+            "progressed_at": row.progressed_at,
+            "completed_at": row.completed_at,
+            "invalidated_at": row.invalidated_at,
+            "replaced_at": row.replaced_at,
+            "entry_price": row.entry_price,
+            "reference_price": row.reference_price,
+            "stop_reference_price": row.stop_reference_price,
+            "target_reference_price": row.target_reference_price,
+            "signal_id": row.signal_id,
+            "replacement_opportunity_key": row.replacement_opportunity_key,
+            "replaced_opportunity_key": row.replaced_opportunity_key,
+            "transition_count": len(row.transition_history),
+            "candidate_interpretation_count": len(row.candidate_interpretations),
+            "authoritative_event_count": len(row.authoritative_event_lineage),
+            "transition_history": json.dumps(row.transition_history, default=str),
+            "candidate_interpretations": json.dumps(
+                row.candidate_interpretations, default=str
+            ),
+            "authoritative_event_lineage": json.dumps(
+                row.authoritative_event_lineage, default=str
+            ),
+            "latest_setup_evaluation": json.dumps(
+                row.latest_setup_evaluation, default=str
+            ),
+            "latest_advisor_evaluation": json.dumps(
+                row.latest_advisor_evaluation, default=str
+            ),
+        }))
     return output
 
 
@@ -344,14 +453,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_dir = Path(args.report_dir)
     log_file = args.log_file or str(report_dir / "replay_auction_signal_generator.log")
     setup_logging(log_file=log_file)
-    database_name = require_allowed_replay_database(
-        database_uri=AppConfig.SQLALCHEMY_BINDS["trades"],
-        allowed_database=args.allowed_database,
-    )
+    database_name = _configured_database_name()
     global logger
     logger = logging.getLogger(__name__)
 
-    cleared = _clear_signals(symbols, lifecycle) if args.clear_signals else 0
+    cleared = {"signals": 0, "opportunities": 0}
+    if args.clear_data:
+        cleared = _clear_data()
+    logger.info(
+        "Resolved replay configuration | database=%s date=%s symbols=%s "
+        "clear_data=%s batch_size=%s report_dir=%s",
+        database_name,
+        trading_day,
+        symbols,
+        bool(args.clear_data),
+        max(1, int(args.batch_size)),
+        report_dir,
+    )
     snapshots = _load_snapshots(
         trading_day=trading_day,
         symbols=symbols,
@@ -541,11 +659,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         symbols=symbols,
         lifecycle=lifecycle,
     )
+    opportunities = _opportunity_rows(
+        trading_day=trading_day,
+        symbols=symbols,
+    )
+    opportunity_state_counts = Counter(
+        str(row["lifecycle_state"]) for row in opportunities
+    )
     stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
     prefix = report_dir / f"auction_signal_replay_{trading_day}_{stamp}"
     _write_csv(prefix.with_name(prefix.name + "_lifecycle.csv"), event_rows)
     _write_csv(prefix.with_name(prefix.name + "_evaluations.csv"), evaluation_rows)
     _write_csv(prefix.with_name(prefix.name + "_signals.csv"), signals)
+    _write_csv(prefix.with_name(prefix.name + "_opportunities.csv"), opportunities)
 
     summary = sanitize_json({
         "trading_day": trading_day,
@@ -556,7 +682,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "snapshots": len(snapshots),
         "first_snapshot_time": snapshots[0].snapshot_time,
         "last_snapshot_time": snapshots[-1].snapshot_time,
-        "signals_cleared": cleared,
+        "clear_data": bool(args.clear_data),
+        "cleared": cleared,
         "signal_action_counts": dict(sorted(action_counts.items())),
         "setup_evaluation_outcome_counts": dict(sorted(evaluation_outcome_counts.items())),
         "signal_stage_observation_counts": dict(sorted(stage_counts.items())),
@@ -567,6 +694,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "downstream_trade_action_counts": dict(sorted(trade_action_counts.items())),
         "should_exit_signal_observations": should_exit_signal_count,
         "signals_persisted": len(signals),
+        "opportunities_persisted": len(opportunities),
+        "opportunity_state_counts": dict(sorted(opportunity_state_counts.items())),
         "snapshots_marked_processed": 0,
     })
     prefix.with_name(prefix.name + "_summary.json").write_text(
@@ -576,6 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_csv(prefix.with_name(prefix.name + "_summary.csv"), [{
         **summary,
         "symbols": json.dumps(summary["symbols"]),
+        "cleared": json.dumps(summary["cleared"], sort_keys=True),
         "signal_action_counts": json.dumps(summary["signal_action_counts"], sort_keys=True),
         "setup_evaluation_outcome_counts": json.dumps(
             summary["setup_evaluation_outcome_counts"], sort_keys=True
@@ -591,6 +721,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         "downstream_trade_action_counts": json.dumps(
             summary["downstream_trade_action_counts"], sort_keys=True
+        ),
+        "opportunity_state_counts": json.dumps(
+            summary["opportunity_state_counts"], sort_keys=True
         ),
     }])
 

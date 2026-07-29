@@ -529,6 +529,99 @@ class Signal(Base):
 
 
 # -----------------------------------
+# Stock opportunities (authoritative structural lifecycle)
+# -----------------------------------
+
+class StockOpportunity(Base):
+    __tablename__ = "stock_opportunities"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    opportunity_key = Column(String(64), nullable=False)
+    candidate_id = Column(String(64), nullable=False)
+    latest_candidate_id = Column(String(64), nullable=False)
+
+    symbol = Column(String(32), nullable=False)
+    equity_ref = Column(String(32), nullable=False)
+    trading_day = Column(Date, nullable=False)
+
+    setup_family = Column(String(64), nullable=False)
+    current_setup_family = Column(String(64), nullable=False)
+    setup_subtype = Column(String(64), nullable=False)
+    side = Column(String(8), nullable=False)
+
+    source_event_id = Column(String(128), nullable=False)
+    source_event_type = Column(String(64), nullable=False)
+    source_episode_id = Column(String(128), nullable=False)
+    boundary_event_key = Column(String(128), nullable=False)
+
+    latest_event_id = Column(String(128), nullable=False)
+    latest_event_type = Column(String(64), nullable=False)
+    latest_episode_id = Column(String(128), nullable=False)
+
+    lifecycle_state = Column(String(32), nullable=False)
+    lifecycle_reason = Column(String(255), nullable=False)
+    structural_result = Column(String(16), nullable=False)
+
+    first_seen_time = Column(DateTime, nullable=False)
+    last_eval_time = Column(DateTime, nullable=False)
+    deployed_at = Column(DateTime, nullable=False)
+    progressed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    invalidated_at = Column(DateTime, nullable=True)
+    replaced_at = Column(DateTime, nullable=True)
+
+    entry_price = Column(DECIMAL(16, 6), nullable=False)
+    reference_price = Column(DECIMAL(16, 6), nullable=False)
+    stop_reference_price = Column(DECIMAL(16, 6), nullable=False)
+    target_reference_price = Column(DECIMAL(16, 6), nullable=False)
+
+    signal_id = Column(String(36), nullable=False)
+    replacement_opportunity_key = Column(String(64), nullable=True)
+    replaced_opportunity_key = Column(String(64), nullable=True)
+
+    transition_history = Column(JSON, nullable=False)
+    candidate_interpretations = Column(JSON, nullable=False)
+    authoritative_event_lineage = Column(JSON, nullable=False)
+    latest_setup_evaluation = Column(JSON, nullable=True)
+    latest_advisor_evaluation = Column(JSON, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("opportunity_key", name="uq_stock_opportunity_key"),
+        UniqueConstraint("signal_id", name="uq_stock_opportunity_signal_id"),
+        Index("idx_stock_opp_symbol_day", "symbol", "trading_day"),
+        Index("idx_stock_opp_equity_day", "equity_ref", "trading_day"),
+        Index("idx_stock_opp_day_state", "trading_day", "lifecycle_state"),
+        Index(
+            "idx_stock_opp_family_side_day",
+            "setup_family",
+            "side",
+            "trading_day",
+        ),
+        Index("idx_stock_opp_episode", "source_episode_id"),
+        Index("idx_stock_opp_latest_episode", "latest_episode_id"),
+        Index("idx_stock_opp_last_eval", "last_eval_time"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<StockOpportunity {self.symbol} {self.setup_family} {self.side} "
+            f"state={self.lifecycle_state} signal_id={self.signal_id}>"
+        )
+
+
+# -----------------------------------
 # Signals History
 # -----------------------------------
 

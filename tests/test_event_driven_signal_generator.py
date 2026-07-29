@@ -46,8 +46,25 @@ class _Persister:
     def __init__(self, fetcher: _Fetcher) -> None:
         self.fetcher = fetcher
         self.created_candidate = None
+        self.created_evaluation = None
+        self.completed_routes = []
+        self.progressed_candidates = []
+        self.terminal_records = []
 
-    def create(self, *, snapshot, equity_ref, lifecycle, candidate, meta_json, criteria_json, analytics):
+    def create(
+        self,
+        *,
+        snapshot,
+        equity_ref,
+        lifecycle,
+        candidate,
+        meta_json,
+        criteria_json,
+        analytics,
+        evaluation_diagnostic,
+        replaced_opportunity_key=None,
+    ):
+        self.created_evaluation = evaluation_diagnostic
         self.created_candidate = candidate
         signal = SignalSchema.model_validate({
             "signal_id": _signal_id(candidate.opportunity_key),
@@ -73,7 +90,21 @@ class _Persister:
         self.fetcher.by_id[signal.signal_id] = signal
         return signal
 
-    def update(self, *, signal, snapshot, stage, reason, meta_json, criteria_json, analytics):
+    def update(
+        self,
+        *,
+        signal,
+        snapshot,
+        stage,
+        reason,
+        meta_json,
+        criteria_json,
+        analytics,
+        progression_candidate=None,
+        evaluation_diagnostic=None,
+    ):
+        if progression_candidate is not None:
+            self.progressed_candidates.append((progression_candidate, evaluation_diagnostic))
         updated = signal.model_copy(update={
             "stage": stage,
             "status_reason": reason,
@@ -84,7 +115,20 @@ class _Persister:
         self.fetcher.active = updated
         return updated
 
-    def close(self, *, signal, snapshot, status, reason, meta_json, criteria_json, analytics):
+    def close(
+        self,
+        *,
+        signal,
+        snapshot,
+        status,
+        reason,
+        meta_json,
+        criteria_json,
+        analytics,
+        terminal_route=None,
+        replacement_candidate=None,
+    ):
+        self.terminal_records.append((status, terminal_route, replacement_candidate))
         closed = signal.model_copy(update={
             "stage": LifecycleStage.FORCE_EXIT,
             "status": status,
@@ -95,6 +139,9 @@ class _Persister:
         })
         self.fetcher.active = None
         return closed
+
+    def complete_opportunity(self, *, signal, snapshot, route):
+        self.completed_routes.append(route)
 
 
 class _Advisor:
@@ -171,7 +218,7 @@ def test_structural_block_cannot_create_signal() -> None:
     assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
     assert assembler.assemble(snapshot) == []
     assert persister.created_candidate is None
-    assert assembler.last_evaluation_diagnostics[0]["outcome"] == "SETUP_QUALITY_REJECTED"
+    assert assembler.last_evaluation_diagnostics[0]["outcome"] == "STRUCTURAL_PERMISSION_BLOCKED"
     assert assembler.last_evaluation_diagnostics[0]["blockers"] == ("STRUCTURAL_PERMISSION_BLOCK",)
 
 
@@ -303,6 +350,9 @@ def test_directional_completion_closes_opportunity_not_deployed_signal() -> None
     assert held.stage is not LifecycleStage.FORCE_EXIT
     assert held.meta_json["management"]["should_exit_signal"] is False
     assert held.meta_json["lifecycle"]["trade_action"] == "HOLD_POSITION"
+    assert [route.source_event_type for route in persister.completed_routes] == [
+        AuctionEventType.DIRECTIONAL_COMPLETED
+    ]
 
 
 def test_balance_completion_closes_opportunity_not_deployed_signal() -> None:
@@ -331,6 +381,9 @@ def test_balance_completion_closes_opportunity_not_deployed_signal() -> None:
     assert held.signal_id == created.signal_id
     assert held.status is SignalStatus.OPEN
     assert held.meta_json["management"]["should_exit_signal"] is False
+    assert [route.source_event_type for route in persister.completed_routes] == [
+        AuctionEventType.BALANCE_COMPLETED
+    ]
 
 
 def test_same_episode_breakout_acceptance_progresses_signal_without_replacement() -> None:
@@ -366,6 +419,11 @@ def test_same_episode_breakout_acceptance_progresses_signal_without_replacement(
     assert progression["setup_family"] == SetupFamily.ACCEPTED_BREAKOUT.value
     assert progression["source_event_type"] == AuctionEventType.BALANCE_ESCAPE_ACCEPTED.value
     assert len(progressed.meta_json["authoritative_event_lineage"]) == 2
+    assert len(persister.progressed_candidates) == 1
+    assert persister.progressed_candidates[0][0].source_event_type is (
+        AuctionEventType.BALANCE_ESCAPE_ACCEPTED
+    )
+    assert persister.completed_routes == []
 
     replayed = assembler.assemble(accepted_snapshot)
     assert [item[0] for item in replayed] == ["HOLD"]
@@ -402,6 +460,10 @@ def test_structural_invalidation_still_force_exits_before_opposite_setup() -> No
     assert replacement.setup == SetupFamily.FAILED_BREAKOUT.value
     assert replacement.side is SignalSide.SELL
     assert replacement.status is SignalStatus.OPEN
+    terminal_status, terminal_route, replacement_candidate = persister.terminal_records[0]
+    assert terminal_status is SignalStatus.INVALIDATED
+    assert terminal_route.source_event_type is AuctionEventType.BALANCE_ESCAPE_FAILED
+    assert replacement_candidate is None
 
 
 def test_opposite_trend_restoration_invalidates_reversal_without_replacement() -> None:
@@ -500,3 +562,9 @@ def test_generate_events_preserves_replacement_and_creation_transitions() -> Non
     assert events[0][1].meta_json["management"]["should_exit_signal"] is True
     assert events[1][1].meta_json["lifecycle"]["trade_action"] == "CREATE_TRADE"
     assert generator.last_evaluation_diagnostics[0]["outcome"] == "CREATED_AFTER_REPLACEMENT"
+    terminal_status, terminal_route, replacement_candidate = persister.terminal_records[0]
+    assert terminal_status is SignalStatus.REPLACED
+    assert terminal_route is None
+    assert replacement_candidate.source_event_type is (
+        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED
+    )

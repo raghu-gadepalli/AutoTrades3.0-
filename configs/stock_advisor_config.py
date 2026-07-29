@@ -64,7 +64,7 @@ class StockAdvisorPolicyConfig(BaseModel):
     extreme_min_prior_move_atr: float = Field(default=1.25, ge=0.0)
 
     # Accepted Breakout is a current deployment claim, not a historical one.
-    # A previously confirmed candidate may remain in the opportunity ledger, but
+    # A previously confirmed candidate may remain in stock_opportunities, but
     # it cannot create a signal unless the current completed-candle close is still
     # beyond the same accepted boundary and that range remains tradable.
     accepted_breakout_current_context_action: AdvisorRuleAction = "BLOCK"

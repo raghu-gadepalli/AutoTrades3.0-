@@ -276,12 +276,19 @@ class StrictAuctionTradeMonitorContractTests(unittest.TestCase):
         source = (
             root / "tests" / "replay_auction_signal_trade_pipeline.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('DEFAULT_TRADING_DAY = "2026-07-24"', source)
-        self.assertIn('DEFAULT_SYMBOLS = "MARUTI"', source)
+        self.assertIn('DEFAULT_TRADING_DAY = "2026-07-27"', source)
+        self.assertIn(
+            'DEFAULT_SYMBOLS = "LT,BHEL,INDIGO,MAXHEALTH,PERSISTENT,'
+            'PNBHOUSING,TCS"',
+            source,
+        )
         self.assertIn('DEFAULT_USERID = "DR1812"', source)
         self.assertIn('DEFAULT_INSTRUMENT_CHOICE = "MULTI"', source)
         self.assertIn('DEFAULT_TEST_MODE = "ADAPTIVE_EXIT"', source)
+        self.assertIn('DEFAULT_CLEAR_DATA = False', source)
         self.assertIn('DEFAULT_REQUIRE_DERIVATIVES = True', source)
+        self.assertIn('"--clear-data"', source)
+        self.assertNotIn('"--allowed-database"', source)
         self.assertIn("argparse.BooleanOptionalAction", source)
         self.assertIn("_deterministic_replay_clock", source)
         self.assertIn("SIGNAL_LIFECYCLE_EXIT", source)

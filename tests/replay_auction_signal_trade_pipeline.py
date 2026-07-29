@@ -19,7 +19,11 @@ Safety and scope
 - Forces snapshot pricing and requires a VIRTUAL replay user.
 - Restricts executor and monitor reads to the selected userid, trading day,
   and underlying symbols so unrelated live/test trades cannot be touched.
-- Optional cleanup is explicit and restricted to the selected replay scope.
+- CLEAR_DATA defaults to False. When enabled, it clears the complete replay
+  output tables before processing; when disabled, the replay continues from the
+  configured database state.
+- The configured trades database is used directly; there is no replay-specific
+  database allowlist.
 
 Default COFORGE adaptive multi-instrument command (PowerShell)
 --------------------------------------------------
@@ -51,22 +55,21 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
 from configs.monitor_config import MONITOR_CONFIG
 from configs.signal_config import SIGNAL_CONFIG
-from database.database import get_trades_db
+from database.database import get_trades_db, trades_engine
 from enums.enums import EntryStatus, ExitStatus
 from logconfig import setup_logging
 from models.trade_models import AuditLog as AuditLogORM
 from models.trade_models import Signal as SignalORM
+from models.trade_models import StockOpportunity as StockOpportunityORM
 from models.trade_models import UserTrade as UserTradeORM
 from schemas.signal import SignalSchema
 from schemas.snapshot import SnapshotSchema
 from schemas.user import UserSchema
 from schemas.user_trade import TradeManagementSchema, UserTradeSchema
 from services.signals.signal_generator import SignalGenerator
-from tests.replay_database_guard import require_allowed_replay_database
 from services.trade.executor import trade_executor as executor_module
 from services.trade.executor.trade_executor import TradeExecutor
 from services.trade.generator import tradegen_helper as tradegen_helper_module
@@ -78,18 +81,21 @@ from utils.json_utils import sanitize_json
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger(__name__)
 
-# Safe, visible defaults for the current dedicated COFORGE replay. Every value
-# can be overridden from the command line.
-DEFAULT_TRADING_DAY = "2026-07-24"
-DEFAULT_SYMBOLS = "MARUTI"
+# Visible source defaults. Every value can be overridden from the command line.
+DEFAULT_TRADING_DAY = "2026-07-27"
+DEFAULT_SYMBOLS = "LT,BHEL,INDIGO,MAXHEALTH,PERSISTENT,PNBHOUSING,TCS"
 DEFAULT_USERID = "DR1812"
 DEFAULT_INSTRUMENT_CHOICE = "MULTI"
 DEFAULT_TEST_MODE = "ADAPTIVE_EXIT"
-DEFAULT_CLEAR_RUN_DATA = True
+DEFAULT_CLEAR_DATA = False
 DEFAULT_REQUIRE_TRADE = True
 DEFAULT_REQUIRE_EXIT = True
 DEFAULT_REQUIRE_DERIVATIVES = True
+DEFAULT_START_TIME: Optional[str] = None
+DEFAULT_END_TIME: Optional[str] = None
+DEFAULT_BATCH_SIZE = 500
 DEFAULT_REPORT_DIR = "reports"
+DEFAULT_LOG_FILE: Optional[str] = None
 
 _EXPECTED_TRADEGEN_NONFATAL = {
     "TRADE_DECISION_NOT_ALLOWED",
@@ -137,12 +143,13 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--clear-run-data",
+        "--clear-data",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_CLEAR_RUN_DATA,
+        default=DEFAULT_CLEAR_DATA,
         help=(
-            "Delete only selected-day signals, selected-user trades, and "
-            f"selected-symbol audit rows before replay (default: {DEFAULT_CLEAR_RUN_DATA})"
+            "Clear complete auditlog, user_trades, signals, and "
+            "stock_opportunities tables before replay "
+            f"(default: {DEFAULT_CLEAR_DATA})"
         ),
     )
     parser.add_argument(
@@ -166,16 +173,24 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"(default: {DEFAULT_REQUIRE_DERIVATIVES})"
         ),
     )
-    parser.add_argument("--start-time", help="Optional inclusive HH:MM[:SS] filter")
-    parser.add_argument("--end-time", help="Optional inclusive HH:MM[:SS] filter")
-    parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument(
-        "--allowed-database",
-        default="backtest",
-        help="Exact trades database name permitted for this write-capable replay",
+        "--start-time",
+        default=DEFAULT_START_TIME,
+        help="Optional inclusive HH:MM[:SS] filter",
+    )
+    parser.add_argument(
+        "--end-time",
+        default=DEFAULT_END_TIME,
+        help="Optional inclusive HH:MM[:SS] filter",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Snapshot fetch batch size (default: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument("--report-dir", default=DEFAULT_REPORT_DIR)
-    parser.add_argument("--log-file")
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     return parser.parse_args(argv)
 
 
@@ -416,134 +431,34 @@ def _scope_audit_query(
     )
 
 
-def _clear_run_data(
-    *,
-    trading_day: date,
-    symbols: List[str],
-    userid: str,
-    lifecycle: str,
-) -> Dict[str, int]:
+def _configured_database_name() -> str:
+    database_name = str(trades_engine.url.database or "").strip()
+    return database_name or "UNKNOWN"
+
+
+def _clear_data() -> Dict[str, int]:
+    """Clear replay output tables; persisted snapshots and market data remain."""
     with get_trades_db() as db:
-        scoped_signals = _scope_signal_query(
-            db, trading_day, symbols, lifecycle
-        ).all()
-        scoped_trades = _scope_trade_query(
-            db, trading_day, symbols, userid
-        ).all()
-        signal_ids, trade_ids, package_symbols = _audit_scope_values(
-            symbols=symbols,
-            signals=scoped_signals,
-            trades=scoped_trades,
-        )
         audit_deleted = int(
-            _scope_audit_query(
-                db,
-                trading_day,
-                symbols,
-                userid,
-                signal_ids=signal_ids,
-                trade_ids=trade_ids,
-                instrument_symbols=package_symbols,
-            ).delete(
-                synchronize_session=False
-            )
+            db.query(AuditLogORM).delete(synchronize_session=False)
         )
         trades_deleted = int(
-            _scope_trade_query(db, trading_day, symbols, userid).delete(
-                synchronize_session=False
-            )
+            db.query(UserTradeORM).delete(synchronize_session=False)
+        )
+        opportunities_deleted = int(
+            db.query(StockOpportunityORM).delete(synchronize_session=False)
         )
         signals_deleted = int(
-            _scope_signal_query(db, trading_day, symbols, lifecycle).delete(
-                synchronize_session=False
-            )
+            db.query(SignalORM).delete(synchronize_session=False)
         )
         db.commit()
     return {
         "signals": signals_deleted,
+        "opportunities": opportunities_deleted,
         "trades": trades_deleted,
         "audit": audit_deleted,
     }
 
-
-def _assert_clean_scope(
-    *,
-    trading_day: date,
-    symbols: List[str],
-    userid: str,
-    lifecycle: str,
-) -> None:
-    with get_trades_db() as db:
-        signal_count = int(
-            _scope_signal_query(db, trading_day, symbols, lifecycle).count()
-        )
-        trade_count = int(_scope_trade_query(db, trading_day, symbols, userid).count())
-    if signal_count or trade_count:
-        raise RuntimeError(
-            "Replay scope is not clean. Re-run with --clear-run-data or clean the "
-            f"selected test scope manually. signals={signal_count} trades={trade_count}"
-        )
-
-
-
-def _assert_no_external_active_context(
-    *,
-    trading_day: date,
-    symbols: List[str],
-    userid: str,
-    lifecycle: str,
-) -> None:
-    """Fail when older/open context could contaminate the selected replay."""
-    start, end = _day_bounds(trading_day)
-    active_entry = [
-        EntryStatus.CREATED.value,
-        EntryStatus.READY.value,
-        EntryStatus.SUBMITTED.value,
-        EntryStatus.FILLED.value,
-    ]
-    terminal_exit = [ExitStatus.FILLED.value, ExitStatus.CANCELLED.value]
-
-    with get_trades_db() as db:
-        external_signals = (
-            db.query(SignalORM)
-            .filter(SignalORM.symbol.in_(symbols))
-            .filter(SignalORM.lifecycle == lifecycle)
-            .filter(SignalORM.status == "OPEN")
-            .filter(
-                or_(
-                    SignalORM.first_seen_time < start,
-                    SignalORM.first_seen_time >= end,
-                )
-            )
-            .count()
-        )
-        external_trades = (
-            db.query(UserTradeORM)
-            .filter(UserTradeORM.userid == userid)
-            .filter(UserTradeORM.equity_ref.in_(symbols))
-            .filter(UserTradeORM.entry_status.in_(active_entry))
-            .filter(
-                or_(
-                    UserTradeORM.exit_status.is_(None),
-                    ~UserTradeORM.exit_status.in_(terminal_exit),
-                )
-            )
-            .filter(
-                or_(
-                    UserTradeORM.entry_time < start,
-                    UserTradeORM.entry_time >= end,
-                )
-            )
-            .count()
-        )
-
-    if external_signals or external_trades:
-        raise RuntimeError(
-            "Open context outside the selected day would contaminate replay. "
-            f"external_open_signals={external_signals} "
-            f"external_active_trades={external_trades}. "
-            "Use a dedicated replay database/user or close the external rows first."
-        )
 
 def _signals_in_scope(
     *, trading_day: date, symbols: List[str], lifecycle: str
@@ -1201,22 +1116,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_dir.mkdir(parents=True, exist_ok=True)
     log_file = args.log_file or str(report_dir / "replay_auction_signal_trade_pipeline.log")
     setup_logging(log_file=log_file)
-    database_name = require_allowed_replay_database(
-        database_uri=AppConfig.SQLALCHEMY_BINDS["trades"],
-        allowed_database=args.allowed_database,
-    )
+    database_name = _configured_database_name()
     global logger
     logger = logging.getLogger(__name__)
 
     logger.info(
-        "Resolved replay configuration | date=%s symbols=%s userid=%s "
-        "instrument=%s test_mode=%s clear=%s require_trade=%s require_exit=%s require_derivatives=%s report_dir=%s",
+        "Resolved replay configuration | database=%s date=%s symbols=%s userid=%s "
+        "instrument=%s test_mode=%s clear_data=%s require_trade=%s "
+        "require_exit=%s require_derivatives=%s report_dir=%s",
+        database_name,
         trading_day,
         symbols,
         userid,
         instrument_choice,
         test_mode,
-        bool(args.clear_run_data),
+        bool(args.clear_data),
         bool(args.require_trade),
         bool(args.require_exit),
         bool(args.require_derivatives),
@@ -1224,26 +1138,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     _validate_replay_user(userid, instrument_choice)
 
-    cleared = {"signals": 0, "trades": 0, "audit": 0}
-    if args.clear_run_data:
-        cleared = _clear_run_data(
-            trading_day=trading_day,
-            symbols=symbols,
-            userid=userid,
-            lifecycle=lifecycle,
-        )
-    _assert_clean_scope(
-        trading_day=trading_day,
-        symbols=symbols,
-        userid=userid,
-        lifecycle=lifecycle,
-    )
-    _assert_no_external_active_context(
-        trading_day=trading_day,
-        symbols=symbols,
-        userid=userid,
-        lifecycle=lifecycle,
-    )
+    cleared = {"signals": 0, "opportunities": 0, "trades": 0, "audit": 0}
+    if args.clear_data:
+        cleared = _clear_data()
 
     snapshots = _load_snapshots(
         trading_day=trading_day,
@@ -1720,6 +1617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "last_snapshot_time": snapshots[-1].snapshot_time,
             "auction_recomputed": False,
             "snapshots_marked_processed": 0,
+            "clear_data": bool(args.clear_data),
             "cleared": cleared,
             "signal_action_counts": dict(sorted(signal_action_counts.items())),
             "signal_stage_observation_counts": dict(sorted(signal_stage_counts.items())),

@@ -64,8 +64,6 @@ class AuctionEngineRuntimeConfig(BaseModel):
     latest_create_time: str = "15:00:00"
     supported_symbol_types: Tuple[str, ...] = ("EQ",)
     default_replay_excluded_symbols: Tuple[str, ...] = ("NIFTY 50", "NIFTY BANK")
-    development_database_name: str = Field(default="backtest", min_length=1)
-    protected_database_names: Tuple[str, ...] = ("autotrades",)
 
     @field_validator(
         "earliest_evaluation_time",
@@ -102,23 +100,6 @@ class AuctionEngineRuntimeConfig(BaseModel):
             raise ValueError("default_replay_excluded_symbols cannot contain duplicates")
         if any(not item for item in cleaned):
             raise ValueError("default_replay_excluded_symbols cannot contain blanks")
-        return cleaned
-
-    @field_validator("development_database_name")
-    @classmethod
-    def _validate_development_database_name(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("development_database_name cannot be blank")
-        return cleaned
-
-    @field_validator("protected_database_names")
-    @classmethod
-    def _validate_protected_database_names(cls, value: Tuple[str, ...]) -> Tuple[str, ...]:
-        cleaned = tuple(item.strip() for item in value)
-        _require_unique_nonempty("protected_database_names", cleaned)
-        if any(not item for item in cleaned):
-            raise ValueError("protected_database_names cannot contain blanks")
         return cleaned
 
     @model_validator(mode="after")
