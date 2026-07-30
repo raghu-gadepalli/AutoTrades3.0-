@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
 from configs.trade_config import TRADE_CONFIG
 from database.database import get_trades_db
 from enums.enums import SignalStatus
@@ -29,6 +30,7 @@ from models.trade_models import Snapshot as SnapshotORM
 from schemas.user import UserSchema
 from schemas.user_trade import UserTradeSchema
 from utils.datetime_utils import business_now_naive, to_ist_naive
+from utils.intraday_lifecycle import cutoff_due
 
 
 DOWNSTREAM_CONTRACT_VERSION = "AUCTION_SIGNAL_DOWNSTREAM_V2"
@@ -618,6 +620,18 @@ class TradeDecisionHelper:
             return TradeDecision.block("signal_not_open", details=details)
         if context["signal_status"] in TERMINAL_SIGNAL_STATUSES:
             return TradeDecision.block("signal_terminal", details=details)
+
+        checked_time = business_now_naive()
+        details["intraday_entry_cutoff"] = {
+            "checked_time": checked_time,
+            "cutoff_time": INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time,
+            "due": cutoff_due(
+                checked_time,
+                INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time,
+            ),
+        }
+        if details["intraday_entry_cutoff"]["due"]:
+            return TradeDecision.block("intraday_entry_cutoff", details=details)
 
         # A lifecycle exit posture is never overrideable for new entry.
         hard_exit = (

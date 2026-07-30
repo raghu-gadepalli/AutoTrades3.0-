@@ -289,6 +289,17 @@ class BalanceEpisodeProjection(ContractModel):
     escape_direction: DirectionalBias
     outside_close_count: int = Field(ge=0)
     reentry_close_count: int = Field(ge=0)
+    escape_attempt_count: int = Field(default=0, ge=0)
+    failed_escape_count: int = Field(default=0, ge=0)
+    up_escape_attempt_count: int = Field(default=0, ge=0)
+    down_escape_attempt_count: int = Field(default=0, ge=0)
+    last_escape_direction: DirectionalBias = DirectionalBias.UNKNOWN
+    last_escape_started_at: Optional[datetime] = None
+    last_escape_failed_at: Optional[datetime] = None
+    rearm_required: bool = False
+    rearm_inside_close_count: int = Field(default=0, ge=0)
+    rearm_bars_elapsed: int = Field(default=0, ge=0)
+    attempt_limit_reached: bool = False
     reason_codes: Tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -326,6 +337,14 @@ class BalanceEpisodeProjection(ContractModel):
             expected = self.containment_bars / self.forming_bars_observed
             if abs(self.containment_ratio - expected) > 1e-9:
                 raise ValueError("Balance containment_ratio must match evidence counts")
+        if self.up_escape_attempt_count + self.down_escape_attempt_count != self.escape_attempt_count:
+            raise ValueError("Balance directional attempt counts must equal total attempts")
+        if self.failed_escape_count > self.escape_attempt_count:
+            raise ValueError("Balance failed escapes cannot exceed total attempts")
+        if self.rearm_required and self.current_state is not BalanceEpisodeState.FAILED_BACK_INSIDE:
+            raise ValueError("Balance rearm_required requires FAILED_BACK_INSIDE state")
+        if self.attempt_limit_reached and not self.rearm_required:
+            raise ValueError("Balance attempt limit requires rearm_required")
         return self
 
 
@@ -533,6 +552,17 @@ class BalanceEpisodeMemory(ContractModel):
     escape_direction: DirectionalBias
     outside_close_count: int = Field(ge=0)
     reentry_close_count: int = Field(ge=0)
+    escape_attempt_count: int = Field(default=0, ge=0)
+    failed_escape_count: int = Field(default=0, ge=0)
+    up_escape_attempt_count: int = Field(default=0, ge=0)
+    down_escape_attempt_count: int = Field(default=0, ge=0)
+    last_escape_direction: DirectionalBias = DirectionalBias.UNKNOWN
+    last_escape_started_at: Optional[datetime] = None
+    last_escape_failed_at: Optional[datetime] = None
+    rearm_required: bool = False
+    rearm_inside_close_count: int = Field(default=0, ge=0)
+    rearm_bars_elapsed: int = Field(default=0, ge=0)
+    attempt_limit_reached: bool = False
     emitted_event_ids: Tuple[str, ...] = ()
     last_reason_codes: Tuple[str, ...] = ()
 
@@ -547,6 +577,14 @@ class BalanceEpisodeMemory(ContractModel):
                 raise ValueError("Balance NONE memory cannot retain episode_id")
         elif self.episode_id is None or self.started_at is None or self.state_started_at is None:
             raise ValueError("Active balance memory requires identity and timestamps")
+        if self.up_escape_attempt_count + self.down_escape_attempt_count != self.escape_attempt_count:
+            raise ValueError("Balance memory directional attempt counts must equal total attempts")
+        if self.failed_escape_count > self.escape_attempt_count:
+            raise ValueError("Balance memory failed escapes cannot exceed total attempts")
+        if self.rearm_required and self.state is not BalanceEpisodeState.FAILED_BACK_INSIDE:
+            raise ValueError("Balance memory rearm_required requires FAILED_BACK_INSIDE state")
+        if self.attempt_limit_reached and not self.rearm_required:
+            raise ValueError("Balance memory attempt limit requires rearm_required")
         return self
 
 

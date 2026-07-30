@@ -242,6 +242,7 @@ def _mark_opposite_family_for_exit_if_needed(*, userid: str, signal: SignalSchem
         equity_ref=equity_ref,
         reason="OPPOSITE_SIGNAL",
         rule="trade_generator_opposite_signal",
+        ts=_signal_audit_ts(signal, {}),
     )
     return {
         "ok": False,
@@ -332,6 +333,129 @@ def _signal_audit_reason(signal: SignalSchema, decision_details: Optional[Dict[s
             return text
 
     return str(fallback or "").strip()
+
+_TRADE_ENTRY_STATE_VERSION = "TRADE_ENTRY_STATE_V1"
+_PRICE_DEFER_REASON_CODES = {
+    str(TRADE_CONFIG.policy.decision.signal_entry_wait_in_loss_code).strip(),
+    str(TRADE_CONFIG.policy.decision.signal_entry_wait_price_missing_code).strip(),
+}
+
+
+def _merge_trade_entry_state(
+    *,
+    meta_json: Dict[str, Any],
+    userid: str,
+    state: str,
+    reason_code: str,
+    evaluated_at: Any,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return signal metadata with one user's entry-decision state updated."""
+    if not isinstance(meta_json, dict):
+        raise ValueError("signal.meta_json must be an object")
+    userid0 = str(userid or "").strip()
+    if not userid0:
+        raise ValueError("userid is required for trade entry state")
+
+    next_meta = dict(meta_json)
+    existing = next_meta.get("trade_entry_state")
+    block = dict(existing) if isinstance(existing, dict) else {}
+    users_raw = block.get("users")
+    users = dict(users_raw) if isinstance(users_raw, dict) else {}
+    previous_raw = users.get(userid0)
+    previous = dict(previous_raw) if isinstance(previous_raw, dict) else {}
+
+    state0 = str(state or "").strip().upper()
+    reason0 = str(reason_code or "").strip()
+    count = int(previous.get("evaluation_count") or 0) + 1
+    first_deferred_at = previous.get("first_deferred_at")
+    if state0 == "DEFERRED" and first_deferred_at in (None, ""):
+        first_deferred_at = evaluated_at
+
+    defer_class = (
+        "PRICE"
+        if state0 == "DEFERRED" and reason0 in _PRICE_DEFER_REASON_CODES
+        else previous.get("defer_class")
+    )
+    users[userid0] = {
+        "state": state0,
+        "reason_code": reason0,
+        "defer_class": defer_class,
+        "first_deferred_at": first_deferred_at,
+        "last_evaluated_at": evaluated_at,
+        "evaluation_count": count,
+        "details": dict(details or {}),
+    }
+    block.update({
+        "contract_version": _TRADE_ENTRY_STATE_VERSION,
+        "users": users,
+    })
+    next_meta["trade_entry_state"] = block
+    return next_meta
+
+
+def _persist_trade_entry_state(
+    *,
+    signal: SignalSchema,
+    userid: str,
+    state: str,
+    reason_code: str,
+    decision_details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist only the non-structural entry-decision projection."""
+    try:
+        evaluated_at = _signal_audit_ts(signal, decision_details or {})
+        signal_id = str(getattr(signal, "signal_id", "") or "").strip()
+        latest = SignalSchema.fetch_by_signal_id_strict(signal_id) or signal
+        next_meta = _merge_trade_entry_state(
+            meta_json=_as_dict(getattr(latest, "meta_json", None)),
+            userid=userid,
+            state=state,
+            reason_code=reason_code,
+            evaluated_at=evaluated_at,
+            details=decision_details,
+        )
+        persisted = SignalSchema.update_signal(
+            signal_id=signal_id,
+            meta_json=next_meta,
+        )
+        if persisted is None:
+            raise RuntimeError("signal row missing while persisting trade entry state")
+    except Exception:
+        logger.warning(
+            "TradeGenerator: failed to persist trade entry state | userid=%s signal_id=%s state=%s",
+            userid,
+            getattr(signal, "signal_id", None),
+            state,
+            exc_info=True,
+        )
+
+
+def _record_price_defer_if_needed(
+    *,
+    signal: SignalSchema,
+    userid: str,
+    decision: Any,
+) -> None:
+    reasons = [
+        str(reason or "").strip()
+        for reason in (getattr(decision, "reasons", None) or [])
+    ]
+    matched = next(
+        (reason for reason in reasons if reason in _PRICE_DEFER_REASON_CODES),
+        None,
+    )
+    if matched is None:
+        return
+    details = decision.to_dict() if hasattr(decision, "to_dict") else {}
+    _persist_trade_entry_state(
+        signal=signal,
+        userid=userid,
+        state="DEFERRED",
+        reason_code=matched,
+        decision_details=details,
+    )
+
 
 def _is_autogen_eligible_user(user: UserSchema) -> bool:
     """Defence-in-depth eligibility for automatic signal deployment."""
@@ -450,6 +574,11 @@ class TradeGenerator:
         )
 
         if not decision.allowed:
+            _record_price_defer_if_needed(
+                signal=signal,
+                userid=userid,
+                decision=decision,
+            )
             _audit_trade_decision(
                 userid=userid,
                 signal=signal,
@@ -480,6 +609,13 @@ class TradeGenerator:
                 result=result,
             )
             if result.get("ok") and trade_ids:
+                _persist_trade_entry_state(
+                    signal=signal,
+                    userid=userid,
+                    state="DEPLOYED",
+                    reason_code="TRADE_PACKAGE_CREATED",
+                    decision_details=decision.to_dict(),
+                )
                 _audit_trade_created(
                     userid=userid,
                     signal=signal,
@@ -627,6 +763,11 @@ class TradeGenerator:
                 )
 
                 if not decision.allowed:
+                    _record_price_defer_if_needed(
+                        signal=signal,
+                        userid=userid,
+                        decision=decision,
+                    )
                     _audit_trade_decision(
                         userid=userid,
                         signal=signal,
@@ -687,6 +828,13 @@ class TradeGenerator:
                 )
 
                 if trade_ids:
+                    _persist_trade_entry_state(
+                        signal=signal,
+                        userid=userid,
+                        state="DEPLOYED",
+                        reason_code="TRADE_PACKAGE_CREATED",
+                        decision_details=decision.to_dict(),
+                    )
                     _audit_trade_created(
                         userid=userid,
                         signal=signal,

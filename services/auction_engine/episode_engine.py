@@ -110,6 +110,17 @@ class _BalanceMemory:
     escape_direction: DirectionalBias = DirectionalBias.UNKNOWN
     outside_close_count: int = 0
     reentry_close_count: int = 0
+    escape_attempt_count: int = 0
+    failed_escape_count: int = 0
+    up_escape_attempt_count: int = 0
+    down_escape_attempt_count: int = 0
+    last_escape_direction: DirectionalBias = DirectionalBias.UNKNOWN
+    last_escape_started_at: Optional[datetime] = None
+    last_escape_failed_at: Optional[datetime] = None
+    rearm_required: bool = False
+    rearm_inside_close_count: int = 0
+    rearm_bars_elapsed: int = 0
+    attempt_limit_reached: bool = False
     emitted_event_ids: Set[str] = field(default_factory=set)
     last_reason_codes: Tuple[str, ...] = ()
 
@@ -273,6 +284,17 @@ class PersistentEpisodeEngine:
                 escape_direction=memory.balance.escape_direction,
                 outside_close_count=memory.balance.outside_close_count,
                 reentry_close_count=memory.balance.reentry_close_count,
+                escape_attempt_count=memory.balance.escape_attempt_count,
+                failed_escape_count=memory.balance.failed_escape_count,
+                up_escape_attempt_count=memory.balance.up_escape_attempt_count,
+                down_escape_attempt_count=memory.balance.down_escape_attempt_count,
+                last_escape_direction=memory.balance.last_escape_direction,
+                last_escape_started_at=memory.balance.last_escape_started_at,
+                last_escape_failed_at=memory.balance.last_escape_failed_at,
+                rearm_required=memory.balance.rearm_required,
+                rearm_inside_close_count=memory.balance.rearm_inside_close_count,
+                rearm_bars_elapsed=memory.balance.rearm_bars_elapsed,
+                attempt_limit_reached=memory.balance.attempt_limit_reached,
                 reason_codes=balance_reasons,
             ),
             events=tuple(events),
@@ -300,6 +322,31 @@ class PersistentEpisodeEngine:
                 "balance_candidate_merge_count": memory.balance.candidate_merge_count,
                 "balance_candidate_bar_expansion_count": (
                     memory.balance.candidate_bar_expansion_count
+                ),
+                "balance_escape_attempt_count": memory.balance.escape_attempt_count,
+                "balance_failed_escape_count": memory.balance.failed_escape_count,
+                "balance_up_escape_attempt_count": (
+                    memory.balance.up_escape_attempt_count
+                ),
+                "balance_down_escape_attempt_count": (
+                    memory.balance.down_escape_attempt_count
+                ),
+                "balance_last_escape_direction": (
+                    memory.balance.last_escape_direction.value
+                ),
+                "balance_last_escape_started_at": (
+                    memory.balance.last_escape_started_at
+                ),
+                "balance_last_escape_failed_at": (
+                    memory.balance.last_escape_failed_at
+                ),
+                "balance_rearm_required": memory.balance.rearm_required,
+                "balance_rearm_inside_close_count": (
+                    memory.balance.rearm_inside_close_count
+                ),
+                "balance_rearm_bars_elapsed": memory.balance.rearm_bars_elapsed,
+                "balance_attempt_limit_reached": (
+                    memory.balance.attempt_limit_reached
                 ),
                 "directional_origin_source": memory.directional.origin_source.value,
                 "directional_parent_episode_id": memory.directional.parent_episode_id,
@@ -724,6 +771,7 @@ class PersistentEpisodeEngine:
         elif memory.state is BalanceEpisodeState.LOCKED:
             escape_side = self._escape_side(memory, observation)
             if escape_side in (DirectionalBias.UP, DirectionalBias.DOWN):
+                self._record_escape_attempt(memory, observation, escape_side)
                 memory.escape_direction = escape_side
                 memory.outside_close_count = 1
                 memory.reentry_close_count = 0
@@ -733,10 +781,14 @@ class PersistentEpisodeEngine:
                     BalanceEpisodeState.ESCAPE_WATCH,
                     AuctionEventType.BALANCE_ESCAPE_STARTED,
                     events,
-                    ("MEANINGFUL_CLOSE_OUTSIDE_FROZEN_BALANCE",),
+                    (
+                        "MEANINGFUL_CLOSE_OUTSIDE_FROZEN_BALANCE",
+                        "BALANCE_ESCAPE_ATTEMPT_RECORDED",
+                    ),
                     event_direction=escape_side,
                 )
                 reasons.append("BALANCE_ESCAPE_WATCH_STARTED")
+                reasons.append("BALANCE_ESCAPE_ATTEMPT_RECORDED")
             else:
                 memory.forming_bars_observed += 1
                 memory.containment_bars += 1
@@ -769,29 +821,45 @@ class PersistentEpisodeEngine:
                     memory.reentry_close_count
                     >= self.balance_cfg.failed_reentry_closes
                 ):
+                    self._record_failed_escape(memory, observation)
                     self._transition_balance(
                         memory,
                         observation,
                         BalanceEpisodeState.FAILED_BACK_INSIDE,
                         AuctionEventType.BALANCE_ESCAPE_FAILED,
                         events,
-                        ("ESCAPE_FAILED_BACK_INSIDE_FROZEN_BALANCE",),
+                        (
+                            "ESCAPE_FAILED_BACK_INSIDE_FROZEN_BALANCE",
+                            "BALANCE_REARM_REQUIRED_AFTER_FAILED_ESCAPE",
+                        ),
                         event_direction=_opposite_direction(memory.escape_direction),
                     )
                     reasons.append("BALANCE_ESCAPE_FAILED")
+                    reasons.append("BALANCE_REARM_REQUIRED")
+                    if memory.attempt_limit_reached:
+                        self._emit_balance_event(
+                            memory,
+                            observation,
+                            AuctionEventType.BALANCE_ATTEMPT_LIMIT_REACHED,
+                            events,
+                            (
+                                "BALANCE_ESCAPE_ATTEMPT_LIMIT_REACHED",
+                                "NEW_ACCEPTED_RANGE_REQUIRED_BEFORE_NEXT_ESCAPE",
+                            ),
+                            event_direction=memory.escape_direction,
+                        )
+                        reasons.append("BALANCE_ESCAPE_ATTEMPT_LIMIT_REACHED")
             else:
                 reasons.append("BALANCE_ESCAPE_WATCH_RETAINED")
 
         elif memory.state is BalanceEpisodeState.FAILED_BACK_INSIDE:
-            self._set_balance_state(
-                memory,
-                observation,
-                BalanceEpisodeState.LOCKED,
+            reasons.extend(
+                self._advance_failed_escape_rearm(
+                    memory,
+                    observation,
+                    events,
+                )
             )
-            memory.escape_direction = DirectionalBias.UNKNOWN
-            memory.outside_close_count = 0
-            memory.reentry_close_count = 0
-            reasons.append("FAILED_ESCAPE_RETURNED_TO_LOCKED_BALANCE")
 
         elif memory.state is BalanceEpisodeState.ACCEPTED_OUTSIDE:
             self._set_balance_state(
@@ -811,6 +879,151 @@ class PersistentEpisodeEngine:
 
         memory.last_reason_codes = tuple(reasons)
         return memory.last_reason_codes
+
+    def _record_escape_attempt(
+        self,
+        memory: _BalanceMemory,
+        observation: AuctionObservation,
+        side: DirectionalBias,
+    ) -> None:
+        if side not in (DirectionalBias.UP, DirectionalBias.DOWN):
+            raise ValueError("Balance escape attempt requires UP or DOWN direction")
+        if memory.rearm_required:
+            raise ValueError("Balance escape attempt cannot start while rearm is required")
+        memory.escape_attempt_count += 1
+        if side is DirectionalBias.UP:
+            memory.up_escape_attempt_count += 1
+        else:
+            memory.down_escape_attempt_count += 1
+        memory.last_escape_direction = side
+        memory.last_escape_started_at = observation.snapshot_time
+        memory.rearm_inside_close_count = 0
+        memory.rearm_bars_elapsed = 0
+
+    def _record_failed_escape(
+        self,
+        memory: _BalanceMemory,
+        observation: AuctionObservation,
+    ) -> None:
+        if memory.escape_direction not in (DirectionalBias.UP, DirectionalBias.DOWN):
+            raise ValueError("Failed escape requires an active escape direction")
+        memory.failed_escape_count += 1
+        memory.last_escape_failed_at = observation.snapshot_time
+        memory.rearm_required = True
+        memory.rearm_inside_close_count = 0
+        memory.rearm_bars_elapsed = 0
+        side_attempts = (
+            memory.up_escape_attempt_count
+            if memory.escape_direction is DirectionalBias.UP
+            else memory.down_escape_attempt_count
+        )
+        memory.attempt_limit_reached = bool(
+            memory.escape_attempt_count
+            >= self.balance_cfg.max_escape_attempts_per_episode
+            or side_attempts
+            >= self.balance_cfg.max_same_side_escape_attempts
+        )
+
+    def _advance_failed_escape_rearm(
+        self,
+        memory: _BalanceMemory,
+        observation: AuctionObservation,
+        events: List[AuctionEvent],
+    ) -> Tuple[str, ...]:
+        if not memory.rearm_required:
+            raise ValueError("FAILED_BACK_INSIDE balance must require rearm")
+
+        reasons: List[str] = []
+        memory.rearm_bars_elapsed += 1
+        inside = self._inside_frozen_balance(memory, observation.close)
+        if inside:
+            memory.rearm_inside_close_count += 1
+            memory.forming_bars_observed += 1
+            memory.containment_bars += 1
+            reasons.append("BALANCE_REARM_INSIDE_CONTAINMENT_PROGRESS")
+        else:
+            memory.rearm_inside_close_count = 0
+            reasons.append("BALANCE_REARM_INTERRUPTED_BY_OUTSIDE_CLOSE")
+
+        if memory.attempt_limit_reached:
+            if self._materially_new_accepted_range_available(memory, observation):
+                memory.rearm_required = False
+                memory.attempt_limit_reached = False
+                self._set_balance_state(
+                    memory,
+                    observation,
+                    BalanceEpisodeState.COMPLETED,
+                )
+                self._emit_balance_event(
+                    memory,
+                    observation,
+                    AuctionEventType.BALANCE_COMPLETED,
+                    events,
+                    (
+                        "ESCAPE_ATTEMPT_LIMIT_RELEASED_BY_NEW_ACCEPTED_RANGE",
+                        "OLD_BALANCE_EPISODE_COMPLETED_FOR_STRUCTURAL_RESET",
+                    ),
+                )
+                reasons.append("BALANCE_ATTEMPT_LIMIT_RELEASED_BY_NEW_RANGE")
+                return tuple(reasons)
+            reasons.append("BALANCE_ATTEMPT_LIMIT_REQUIRES_NEW_RANGE")
+            return tuple(reasons)
+
+        rearm_ready = bool(
+            memory.rearm_bars_elapsed
+            >= self.balance_cfg.failed_escape_rearm_min_bars
+            and memory.rearm_inside_close_count
+            >= self.balance_cfg.failed_escape_rearm_inside_closes
+        )
+        if not rearm_ready:
+            reasons.append("BALANCE_REARM_PENDING")
+            return tuple(reasons)
+
+        memory.rearm_required = False
+        memory.attempt_limit_reached = False
+        memory.escape_direction = DirectionalBias.UNKNOWN
+        memory.outside_close_count = 0
+        memory.reentry_close_count = 0
+        memory.rearm_inside_close_count = 0
+        memory.rearm_bars_elapsed = 0
+        self._transition_balance(
+            memory,
+            observation,
+            BalanceEpisodeState.LOCKED,
+            AuctionEventType.BALANCE_REARMED,
+            events,
+            (
+                "FAILED_ESCAPE_REARM_CONTAINMENT_CONFIRMED",
+                "FROZEN_BALANCE_ELIGIBLE_FOR_NEW_ESCAPE",
+            ),
+        )
+        reasons.append("FAILED_ESCAPE_REARMED_TO_LOCKED_BALANCE")
+        return tuple(reasons)
+
+    def _materially_new_accepted_range_available(
+        self,
+        memory: _BalanceMemory,
+        observation: AuctionObservation,
+    ) -> bool:
+        if not self._accepted_range_can_form(observation):
+            return False
+        if observation.accepted_range_id == memory.range_id:
+            return False
+        if (
+            memory.frozen_low is None
+            or memory.frozen_high is None
+            or observation.accepted_range_low is None
+            or observation.accepted_range_high is None
+        ):
+            raise ValueError("New accepted-range comparison requires full geometry")
+        overlap = self._range_overlap_ratio(
+            memory.frozen_low,
+            memory.frozen_high,
+            observation.accepted_range_low,
+            observation.accepted_range_high,
+        )
+        return overlap <= self.balance_cfg.attempt_limit_new_range_overlap_max
+
 
     def _start_directional_episode(
         self,
@@ -1074,6 +1287,17 @@ class PersistentEpisodeEngine:
         memory.escape_direction = DirectionalBias.UNKNOWN
         memory.outside_close_count = 0
         memory.reentry_close_count = 0
+        memory.escape_attempt_count = 0
+        memory.failed_escape_count = 0
+        memory.up_escape_attempt_count = 0
+        memory.down_escape_attempt_count = 0
+        memory.last_escape_direction = DirectionalBias.UNKNOWN
+        memory.last_escape_started_at = None
+        memory.last_escape_failed_at = None
+        memory.rearm_required = False
+        memory.rearm_inside_close_count = 0
+        memory.rearm_bars_elapsed = 0
+        memory.attempt_limit_reached = False
         self._emit_balance_event(
             memory,
             observation,
@@ -1268,6 +1492,17 @@ class PersistentEpisodeEngine:
                     "marginal_excursion_bars": memory.marginal_excursion_bars,
                     "meaningful_escape_bars": memory.meaningful_escape_bars,
                     "containment_ratio": self._balance_containment_ratio(memory),
+                    "escape_attempt_count": memory.escape_attempt_count,
+                    "failed_escape_count": memory.failed_escape_count,
+                    "up_escape_attempt_count": memory.up_escape_attempt_count,
+                    "down_escape_attempt_count": memory.down_escape_attempt_count,
+                    "last_escape_direction": memory.last_escape_direction.value,
+                    "last_escape_started_at": memory.last_escape_started_at,
+                    "last_escape_failed_at": memory.last_escape_failed_at,
+                    "rearm_required": memory.rearm_required,
+                    "rearm_inside_close_count": memory.rearm_inside_close_count,
+                    "rearm_bars_elapsed": memory.rearm_bars_elapsed,
+                    "attempt_limit_reached": memory.attempt_limit_reached,
                 },
             )
         )
@@ -1593,6 +1828,17 @@ class PersistentEpisodeEngine:
         memory.escape_direction = DirectionalBias.UNKNOWN
         memory.outside_close_count = 0
         memory.reentry_close_count = 0
+        memory.escape_attempt_count = 0
+        memory.failed_escape_count = 0
+        memory.up_escape_attempt_count = 0
+        memory.down_escape_attempt_count = 0
+        memory.last_escape_direction = DirectionalBias.UNKNOWN
+        memory.last_escape_started_at = None
+        memory.last_escape_failed_at = None
+        memory.rearm_required = False
+        memory.rearm_inside_close_count = 0
+        memory.rearm_bars_elapsed = 0
+        memory.attempt_limit_reached = False
 
     @staticmethod
     def _clear_reversal_watch(memory: _DirectionalMemory) -> None:

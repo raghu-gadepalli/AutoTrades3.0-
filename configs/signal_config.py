@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
+
 
 class SignalServiceConfig(BaseModel):
     window_start: str = "09:19:00"
@@ -89,6 +91,7 @@ class AuditConfig(BaseModel):
 
 class SignalGeneratorConfig(BaseModel):
     default_lifecycle: str = "DEFAULT"
+    intraday_cutoff_time: str = INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time
     audit: AuditConfig = Field(default_factory=AuditConfig)
     service: SignalServiceConfig = Field(default_factory=SignalServiceConfig)
     resolution: SignalResolutionConfig = Field(default_factory=SignalResolutionConfig)

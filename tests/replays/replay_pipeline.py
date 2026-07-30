@@ -75,12 +75,12 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # Snapshot API ticks. A tick at 09:18 normally persists the completed 09:15
 # three-minute snapshot; a tick at 15:30 normally persists 15:27.
-START = datetime(2026, 7, 24, 9, 18, tzinfo=IST)
-END = datetime(2026, 7, 24, 15, 30, tzinfo=IST)
+START = datetime(2026, 7, 29, 9, 18, tzinfo=IST)
+END = datetime(2026, 7, 29, 15, 30, tzinfo=IST)
 STEP_MINUTES = 3
 
 # Fixed replay universe. The symbols must be enabled EQ symbols in the DB.
-SYMBOLS: List[str] = ["MARUTI", "TATAELXSI", "MPHASIS", "INDIGO", "HINDZINC", "CGPOWER", "BHARATFORG", "INFY", "MFSL", "MUTHOOTFIN"]
+SYMBOLS: List[str] = ["EXIDEIND", "DABUR", "CGPOWER", "LTM", "PRESTIGE", "SIEMENS", "PAYTM", "AMBUJACEM"]
 SYMBOL_TYPE_FILTER = "EQ"
 
 # The user for whom TradeGenerator creates the replay trades.

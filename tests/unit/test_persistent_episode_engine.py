@@ -106,6 +106,35 @@ def _observation(
     )
 
 
+def _lock_balance(
+    engine: PersistentEpisodeEngine,
+    *,
+    start_index: int = 0,
+    range_id: str = "RANGE:TEST",
+    low: float = 99.0,
+    high: float = 101.0,
+):
+    projection = None
+    for index in range(start_index, start_index + 8):
+        projection = engine.advance(
+            _observation(
+                index,
+                observation_state=AuctionStateName.BALANCE,
+                trend_direction=DirectionalBias.UNKNOWN,
+                directional_bias=DirectionalBias.NEUTRAL,
+                protection=None,
+                accepted_range=True,
+                accepted_inside=True,
+                accepted_range_id=range_id,
+                accepted_range_low=low,
+                accepted_range_high=high,
+            )
+        )
+    assert projection is not None
+    assert projection.balance.current_state is BalanceEpisodeState.LOCKED
+    return projection
+
+
 def test_episode_observation_accepts_unbounded_range_position() -> None:
     above = _observation(0, accepted_range=True, accepted_inside=False).model_copy(
         update={"accepted_range_position": 1.4090909090909138}
@@ -446,23 +475,12 @@ def test_balance_locks_with_persistence_and_accepts_two_close_escape() -> None:
     )
 
 
-def test_balance_failed_escape_returns_to_locked_without_new_episode() -> None:
+def test_balance_failed_escape_requires_rearm_before_same_episode_relocks() -> None:
     engine = PersistentEpisodeEngine()
-    for index in range(8):
-        locked = engine.advance(
-            _observation(
-                index,
-                observation_state=AuctionStateName.BALANCE,
-                trend_direction=DirectionalBias.UNKNOWN,
-                directional_bias=DirectionalBias.NEUTRAL,
-                protection=None,
-                accepted_range=True,
-                accepted_inside=True,
-            )
-        )
+    locked = _lock_balance(engine)
     episode_id = locked.balance.episode_id
 
-    engine.advance(
+    started = engine.advance(
         _observation(
             8,
             close=101.20,
@@ -474,6 +492,12 @@ def test_balance_failed_escape_returns_to_locked_without_new_episode() -> None:
             accepted_inside=False,
         )
     )
+    assert started.balance.escape_attempt_count == 1
+    assert started.balance.up_escape_attempt_count == 1
+    assert started.balance.down_escape_attempt_count == 0
+    assert started.balance.last_escape_direction is DirectionalBias.UP
+    assert started.balance.last_escape_started_at == START + timedelta(minutes=24)
+
     failed = engine.advance(
         _observation(
             9,
@@ -488,11 +512,16 @@ def test_balance_failed_escape_returns_to_locked_without_new_episode() -> None:
     )
     assert failed.balance.current_state is BalanceEpisodeState.FAILED_BACK_INSIDE
     assert failed.balance.episode_id == episode_id
+    assert failed.balance.failed_escape_count == 1
+    assert failed.balance.rearm_required is True
+    assert failed.balance.rearm_inside_close_count == 0
+    assert failed.balance.rearm_bars_elapsed == 0
+    assert failed.balance.last_escape_failed_at == START + timedelta(minutes=27)
     assert _permission_results(failed)[SetupFamily.FAILED_BREAKOUT] is (
         StructuralPermissionResult.PERMIT
     )
 
-    relocked = engine.advance(
+    first_inside = engine.advance(
         _observation(
             10,
             close=100.40,
@@ -504,8 +533,190 @@ def test_balance_failed_escape_returns_to_locked_without_new_episode() -> None:
             accepted_inside=True,
         )
     )
+    assert first_inside.balance.current_state is BalanceEpisodeState.FAILED_BACK_INSIDE
+    assert first_inside.balance.rearm_required is True
+    assert first_inside.balance.rearm_inside_close_count == 1
+    assert first_inside.balance.rearm_bars_elapsed == 1
+    assert AuctionEventType.BALANCE_REARMED not in {
+        event.event_type for event in first_inside.events
+    }
+
+    relocked = engine.advance(
+        _observation(
+            11,
+            close=100.30,
+            observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN,
+            directional_bias=DirectionalBias.NEUTRAL,
+            protection=None,
+            accepted_range=True,
+            accepted_inside=True,
+        )
+    )
     assert relocked.balance.current_state is BalanceEpisodeState.LOCKED
     assert relocked.balance.episode_id == episode_id
+    assert relocked.balance.rearm_required is False
+    assert relocked.balance.escape_attempt_count == 1
+    assert relocked.balance.failed_escape_count == 1
+    assert AuctionEventType.BALANCE_REARMED in {
+        event.event_type for event in relocked.events
+    }
+
+
+def test_balance_rearm_blocks_immediate_opposite_escape() -> None:
+    engine = PersistentEpisodeEngine()
+    _lock_balance(engine)
+    engine.advance(
+        _observation(
+            8,
+            close=101.20,
+            observation_state=AuctionStateName.BOUNDARY_INTERACTION,
+            trend_direction=DirectionalBias.UNKNOWN,
+            directional_bias=DirectionalBias.UP,
+            protection=None,
+            accepted_range=True,
+            accepted_inside=False,
+        )
+    )
+    engine.advance(
+        _observation(
+            9,
+            close=100.50,
+            observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN,
+            directional_bias=DirectionalBias.NEUTRAL,
+            protection=None,
+            accepted_range=True,
+            accepted_inside=True,
+        )
+    )
+
+    interrupted = engine.advance(
+        _observation(
+            10,
+            close=98.80,
+            observation_state=AuctionStateName.BOUNDARY_INTERACTION,
+            trend_direction=DirectionalBias.UNKNOWN,
+            directional_bias=DirectionalBias.DOWN,
+            protection=None,
+            accepted_range=True,
+            accepted_inside=False,
+        )
+    )
+
+    assert interrupted.balance.current_state is BalanceEpisodeState.FAILED_BACK_INSIDE
+    assert interrupted.balance.rearm_required is True
+    assert interrupted.balance.rearm_inside_close_count == 0
+    assert interrupted.balance.rearm_bars_elapsed == 1
+    assert interrupted.balance.escape_attempt_count == 1
+    assert interrupted.balance.down_escape_attempt_count == 0
+    assert AuctionEventType.BALANCE_ESCAPE_STARTED not in {
+        event.event_type for event in interrupted.events
+    }
+
+
+def test_same_side_attempt_limit_requires_materially_new_range() -> None:
+    engine = PersistentEpisodeEngine()
+    first_locked = _lock_balance(engine)
+    episode_id = first_locked.balance.episode_id
+
+    # First UP attempt fails and then objectively rearms.
+    engine.advance(
+        _observation(
+            8, close=101.20, observation_state=AuctionStateName.BOUNDARY_INTERACTION,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.UP,
+            protection=None, accepted_range=True, accepted_inside=False,
+        )
+    )
+    engine.advance(
+        _observation(
+            9, close=100.50, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+        )
+    )
+    engine.advance(
+        _observation(
+            10, close=100.40, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+        )
+    )
+    engine.advance(
+        _observation(
+            11, close=100.30, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+        )
+    )
+
+    # Second UP attempt reaches the same-side limit when it fails.
+    second_started = engine.advance(
+        _observation(
+            12, close=101.25, observation_state=AuctionStateName.BOUNDARY_INTERACTION,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.UP,
+            protection=None, accepted_range=True, accepted_inside=False,
+        )
+    )
+    assert second_started.balance.escape_attempt_count == 2
+    assert second_started.balance.up_escape_attempt_count == 2
+
+    limited = engine.advance(
+        _observation(
+            13, close=100.60, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+        )
+    )
+    assert limited.balance.current_state is BalanceEpisodeState.FAILED_BACK_INSIDE
+    assert limited.balance.attempt_limit_reached is True
+    assert AuctionEventType.BALANCE_ATTEMPT_LIMIT_REACHED in {
+        event.event_type for event in limited.events
+    }
+
+    still_limited = engine.advance(
+        _observation(
+            14, close=100.40, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+        )
+    )
+    assert still_limited.balance.current_state is BalanceEpisodeState.FAILED_BACK_INSIDE
+    assert still_limited.balance.attempt_limit_reached is True
+    assert still_limited.balance.episode_id == episode_id
+
+    # A materially different accepted range completes the old episode.
+    completed = engine.advance(
+        _observation(
+            15, close=104.0, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+            accepted_range_id="RANGE:NEW", accepted_range_low=103.0,
+            accepted_range_high=105.0,
+        )
+    )
+    assert completed.balance.current_state is BalanceEpisodeState.COMPLETED
+    assert completed.balance.episode_id == episode_id
+    assert AuctionEventType.BALANCE_COMPLETED in {
+        event.event_type for event in completed.events
+    }
+    assert "BALANCE_ATTEMPT_LIMIT_RELEASED_BY_NEW_RANGE" in (
+        completed.balance.reason_codes
+    )
+
+    new_episode = engine.advance(
+        _observation(
+            16, close=104.0, observation_state=AuctionStateName.BALANCE,
+            trend_direction=DirectionalBias.UNKNOWN, directional_bias=DirectionalBias.NEUTRAL,
+            protection=None, accepted_range=True, accepted_inside=True,
+            accepted_range_id="RANGE:NEW", accepted_range_low=103.0,
+            accepted_range_high=105.0,
+        )
+    )
+    assert new_episode.balance.current_state is BalanceEpisodeState.FORMING
+    assert new_episode.balance.episode_id != episode_id
+    assert new_episode.balance.escape_attempt_count == 0
+
 
 
 def test_locked_balance_records_but_blocks_structural_reversal_event() -> None:

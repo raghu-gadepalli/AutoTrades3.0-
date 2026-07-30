@@ -185,3 +185,27 @@ def test_fill_cancel_race_queues_exit_for_actual_filled_quantity(monkeypatch):
     assert submitted.entry_status == EntryStatus.FILLED.value
     assert submitted.executed_entry_qty == 4
     assert submitted.exit_status == ExitStatus.READY.value
+
+
+def test_intraday_cutoff_expires_pending_virtual_entry_package(monkeypatch):
+    cutoff = datetime(2026, 7, 29, 15, 18, 0)
+    ready = _trade(trade_id=5, mode="VIRTUAL", entry_status="READY")
+
+    monkeypatch.setattr(
+        executor_module.UserTradeSchema,
+        "fetch_active_trades_for_signal",
+        staticmethod(lambda **kwargs: [ready]),
+    )
+    monkeypatch.setattr(executor_module, "_persist_executor_update", _persist_in_memory)
+
+    processed = TradeExecutor()._process_trade_for_user(
+        ready,
+        SimpleNamespace(userid="U1"),
+        asof_time=cutoff,
+    )
+
+    assert processed is True
+    assert ready.entry_status == EntryStatus.EXPIRED.value
+    assert ready.exit_status == ExitStatus.NONE.value
+    assert ready.exec_status == "ENTRY_EXPIRED_INTRADAY_SIGNAL_CUTOFF"
+    assert ready.exec_status_message == "ENTRY_CANCEL_INTRADAY_SIGNAL_CUTOFF"

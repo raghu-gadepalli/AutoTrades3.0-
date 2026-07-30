@@ -13,7 +13,7 @@ from enums.auction_engine import (
     SetupFamily,
     StructuralPermissionResult,
 )
-from enums.enums import EntryStatus, LifecycleStage, SignalSide, SignalStatus
+from enums.enums import LifecycleStage, SignalSide, SignalStatus
 from schemas.signal import SignalSchema
 from services.auction_engine.contracts import AdvisorDecision
 from services.signals.signal_generator import SignalAssembler, SignalFetcher, _signal_id
@@ -25,7 +25,6 @@ class _Fetcher:
     def __init__(self) -> None:
         self.active = None
         self.by_id = {}
-        self.market_deployed_signal_ids = set()
         self.symbol = SimpleNamespace(
             symbol="TEST",
             equity_ref="TEST",
@@ -42,9 +41,6 @@ class _Fetcher:
     def fetch_signal_by_id(self, signal_id):
         return self.by_id.get(signal_id)
 
-    def has_market_deployment(self, signal_id):
-        return signal_id in self.market_deployed_signal_ids
-
 
 class _Persister:
     def __init__(self, fetcher: _Fetcher) -> None:
@@ -52,7 +48,7 @@ class _Persister:
         self.created_candidate = None
         self.created_evaluation = None
         self.completed_routes = []
-        self.completed_signal_closes = []
+        self.cutoff_closes = []
         self.progressed_candidates = []
         self.terminal_records = []
 
@@ -148,21 +144,19 @@ class _Persister:
     def complete_opportunity(self, *, signal, snapshot, route):
         self.completed_routes.append(route)
 
-    def close_completed_unfilled_signal(
+    def close_at_intraday_cutoff(
         self,
         *,
         signal,
         snapshot,
-        reason,
         meta_json,
-        criteria_json,
         analytics,
     ):
-        self.completed_signal_closes.append((signal.signal_id, reason))
+        self.cutoff_closes.append(signal.signal_id)
         closed = signal.model_copy(update={
             "stage": LifecycleStage.FORCE_EXIT,
             "status": SignalStatus.CLOSED,
-            "status_reason": reason,
+            "status_reason": "INTRADAY_SIGNAL_CUTOFF",
             "last_eval_time": snapshot.snapshot_time,
             "last_snapshot_time": snapshot.snapshot_time,
             "meta_json": meta_json,
@@ -185,32 +179,6 @@ class _Advisor:
             reason_codes=("TEST_ADVISOR",),
             diagnostics={},
         )
-
-
-def test_signal_fetcher_market_deployment_ignores_ready_rows(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "services.signals.signal_generator.UserTradeSchema.fetch_for_signal_id",
-        lambda signal_id: [
-            SimpleNamespace(
-                entry_status=EntryStatus.READY,
-                executed_entry_qty=None,
-            )
-        ],
-    )
-    assert SignalFetcher().has_market_deployment("SIG-READY") is False
-
-
-def test_signal_fetcher_market_deployment_accepts_submitted_or_partial_fill(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "services.signals.signal_generator.UserTradeSchema.fetch_for_signal_id",
-        lambda signal_id: [
-            SimpleNamespace(
-                entry_status=EntryStatus.CANCELLED,
-                executed_entry_qty=1,
-            )
-        ],
-    )
-    assert SignalFetcher().has_market_deployment("SIG-PARTIAL") is True
 
 
 def test_symbol_generate_signals_gate_uses_schema_field() -> None:
@@ -435,7 +403,7 @@ def test_all_six_families_reach_signal_persistence_only_from_events(
     assert signal.meta_json["setup_levels"]["setup_contract_version"] == "AUTHORITATIVE_SETUP_V1"
 
 
-def test_directional_completion_closes_unfilled_signal_and_opportunity() -> None:
+def test_directional_completion_keeps_signal_open_and_completes_opportunity() -> None:
     create_snapshot = _event_snapshot(
         AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
         SetupFamily.REVERSAL,
@@ -456,23 +424,20 @@ def test_directional_completion_closes_unfilled_signal_and_opportunity() -> None
     )
     events = assembler.assemble(completed_snapshot)
 
-    assert [item[0] for item in events] == ["CLOSE"]
-    closed = events[0][1]
-    assert closed.signal_id == created.signal_id
-    assert closed.status is SignalStatus.CLOSED
-    assert closed.stage is LifecycleStage.FORCE_EXIT
-    assert closed.status_reason == "DIRECTIONAL_COMPLETED_OPPORTUNITY_WINDOW_COMPLETED"
-    assert closed.meta_json["management"]["should_exit_signal"] is True
-    assert closed.meta_json["lifecycle"]["trade_action"] == "FORCE_EXIT"
+    assert [item[0] for item in events] == ["HOLD"]
+    held = events[0][1]
+    assert held.signal_id == created.signal_id
+    assert held.status is SignalStatus.OPEN
+    assert held.stage is not LifecycleStage.FORCE_EXIT
+    assert held.meta_json["management"]["should_exit_signal"] is False
+    assert held.meta_json["lifecycle"]["trade_action"] == "HOLD_POSITION"
     assert [route.source_event_type for route in persister.completed_routes] == [
         AuctionEventType.DIRECTIONAL_COMPLETED
     ]
-    assert persister.completed_signal_closes == [
-        (created.signal_id, "DIRECTIONAL_COMPLETED_OPPORTUNITY_WINDOW_COMPLETED")
-    ]
+    assert persister.cutoff_closes == []
 
 
-def test_balance_completion_closes_unfilled_signal_and_opportunity() -> None:
+def test_balance_completion_keeps_signal_open_and_completes_opportunity() -> None:
     create_snapshot = _event_snapshot(
         AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
         SetupFamily.ACCEPTED_BREAKOUT,
@@ -484,39 +449,6 @@ def test_balance_completion_closes_unfilled_signal_and_opportunity() -> None:
     persister = _Persister(fetcher)
     assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
     created = assembler.assemble(create_snapshot)[0][1]
-
-    completed_snapshot = _event_snapshot(
-        AuctionEventType.BALANCE_COMPLETED,
-        SetupFamily.ACCEPTED_BREAKOUT,
-        direction=DirectionalBias.UP,
-        close=101.4,
-    )
-    events = assembler.assemble(completed_snapshot)
-
-    assert [item[0] for item in events] == ["CLOSE"]
-    closed = events[0][1]
-    assert closed.signal_id == created.signal_id
-    assert closed.status is SignalStatus.CLOSED
-    assert closed.status_reason == "BALANCE_COMPLETED_OPPORTUNITY_WINDOW_COMPLETED"
-    assert closed.meta_json["management"]["should_exit_signal"] is True
-    assert [route.source_event_type for route in persister.completed_routes] == [
-        AuctionEventType.BALANCE_COMPLETED
-    ]
-
-
-def test_balance_completion_keeps_market_deployed_signal_open() -> None:
-    create_snapshot = _event_snapshot(
-        AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
-        SetupFamily.ACCEPTED_BREAKOUT,
-        direction=DirectionalBias.UP,
-        close=101.2,
-        data={"frozen_low": 99.0, "frozen_high": 101.0},
-    )
-    fetcher = _Fetcher()
-    persister = _Persister(fetcher)
-    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
-    created = assembler.assemble(create_snapshot)[0][1]
-    fetcher.market_deployed_signal_ids.add(created.signal_id)
 
     completed_snapshot = _event_snapshot(
         AuctionEventType.BALANCE_COMPLETED,
@@ -536,7 +468,56 @@ def test_balance_completion_keeps_market_deployed_signal_open() -> None:
     assert [route.source_event_type for route in persister.completed_routes] == [
         AuctionEventType.BALANCE_COMPLETED
     ]
-    assert persister.completed_signal_closes == []
+    assert persister.cutoff_closes == []
+
+
+def test_intraday_cutoff_closes_open_signal_and_requests_trade_exit() -> None:
+    create_snapshot = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
+        SetupFamily.ACCEPTED_BREAKOUT,
+        direction=DirectionalBias.UP,
+        close=101.2,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
+    )
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
+    created = assembler.assemble(create_snapshot)[0][1]
+
+    cutoff_snapshot = create_snapshot.model_copy(update={
+        "snapshot_time": datetime(2026, 7, 29, 15, 18),
+        "gen_signals": False,
+    })
+    fetcher.symbol.active = False
+    fetcher.symbol.generate_signals = False
+    events = assembler.assemble(cutoff_snapshot)
+
+    assert [item[0] for item in events] == ["CLOSE"]
+    closed = events[0][1]
+    assert closed.signal_id == created.signal_id
+    assert closed.status is SignalStatus.CLOSED
+    assert closed.stage is LifecycleStage.FORCE_EXIT
+    assert closed.status_reason == "INTRADAY_SIGNAL_CUTOFF"
+    assert closed.meta_json["management"]["should_exit_signal"] is True
+    assert closed.meta_json["lifecycle"]["trade_action"] == "FORCE_EXIT"
+    assert closed.meta_json["management"]["auction_action"] == "SESSION_CUTOFF"
+    assert persister.cutoff_closes == [created.signal_id]
+
+
+def test_intraday_cutoff_does_not_create_new_signal() -> None:
+    snapshot = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
+        SetupFamily.ACCEPTED_BREAKOUT,
+        direction=DirectionalBias.UP,
+        close=101.2,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
+    ).model_copy(update={"snapshot_time": datetime(2026, 7, 29, 15, 18)})
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
+
+    assert assembler.assemble(snapshot) == []
+    assert persister.created_candidate is None
 
 
 def test_same_episode_breakout_acceptance_progresses_signal_without_replacement() -> None:
@@ -721,3 +702,53 @@ def test_generate_events_preserves_replacement_and_creation_transitions() -> Non
     assert replacement_candidate.source_event_type is (
         AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED
     )
+
+
+def test_balance_completion_keeps_price_deferred_signal_open() -> None:
+    create_snapshot = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
+        SetupFamily.ACCEPTED_BREAKOUT,
+        direction=DirectionalBias.DOWN,
+        close=99.8,
+        data={"frozen_low": 100.0, "frozen_high": 102.0},
+    )
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
+    created = assembler.assemble(create_snapshot)[0][1]
+
+    meta = dict(created.meta_json)
+    meta["trade_entry_state"] = {
+        "contract_version": "TRADE_ENTRY_STATE_V1",
+        "users": {
+            "TESTUSER": {
+                "state": "DEFERRED",
+                "reason_code": "SIGNAL_ENTRY_WAIT_NOT_STRICTLY_PROFITABLE",
+                "first_deferred_at": create_snapshot.snapshot_time,
+                "last_evaluated_at": create_snapshot.snapshot_time,
+                "evaluation_count": 1,
+                "details": {},
+            }
+        },
+    }
+    deferred = created.model_copy(update={"meta_json": meta})
+    fetcher.active = deferred
+    fetcher.by_id[deferred.signal_id] = deferred
+
+    completed_snapshot = _event_snapshot(
+        AuctionEventType.BALANCE_COMPLETED,
+        SetupFamily.ACCEPTED_BREAKOUT,
+        direction=DirectionalBias.DOWN,
+        close=99.6,
+    )
+    events = assembler.assemble(completed_snapshot)
+
+    assert [item[0] for item in events] == ["HOLD"]
+    held = events[0][1]
+    assert held.signal_id == created.signal_id
+    assert held.status is SignalStatus.OPEN
+    assert held.meta_json["trade_entry_state"]["users"]["TESTUSER"]["state"] == "DEFERRED"
+    assert [route.source_event_type for route in persister.completed_routes] == [
+        AuctionEventType.BALANCE_COMPLETED
+    ]
+    assert persister.cutoff_closes == []

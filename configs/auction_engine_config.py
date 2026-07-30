@@ -242,6 +242,7 @@ class DirectionalEpisodePolicyConfig(BaseModel):
     start_blocking_balance_states: Tuple[BalanceEpisodeState, ...] = (
         BalanceEpisodeState.LOCKED,
         BalanceEpisodeState.ESCAPE_WATCH,
+        BalanceEpisodeState.FAILED_BACK_INSIDE,
     )
 
     direction_source_precedence: Tuple[DirectionObservationSource, ...] = (
@@ -313,6 +314,22 @@ class BalanceEpisodePolicyConfig(BaseModel):
     escape_acceptance_closes: int = Field(default=2, ge=1)
     failed_reentry_closes: int = Field(default=1, ge=1)
 
+    # A failed escape does not immediately restore initiation permission. The
+    # frozen balance must first regain stable inside containment.
+    failed_escape_rearm_inside_closes: int = Field(default=2, ge=1)
+    failed_escape_rearm_min_bars: int = Field(default=2, ge=1)
+
+    # Raw escape attempts are episode facts, independent of whether a setup or
+    # signal was eventually deployed. Once the limit is reached, a materially
+    # new accepted range is required before another escape can be initiated.
+    max_escape_attempts_per_episode: int = Field(default=3, ge=1)
+    max_same_side_escape_attempts: int = Field(default=2, ge=1)
+    attempt_limit_new_range_overlap_max: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+    )
+
     require_non_provisional_source_range: bool = True
     require_breakout_eligible_source_range: bool = True
 
@@ -329,6 +346,20 @@ class BalanceEpisodePolicyConfig(BaseModel):
         if self.lock_containment_ratio_min < self.probable_containment_ratio_min:
             raise ValueError(
                 "Balance lock containment ratio cannot be below probable ratio"
+            )
+        if (
+            self.failed_escape_rearm_min_bars
+            < self.failed_escape_rearm_inside_closes
+        ):
+            raise ValueError(
+                "Balance rearm minimum bars cannot be less than required inside closes"
+            )
+        if (
+            self.max_same_side_escape_attempts
+            > self.max_escape_attempts_per_episode
+        ):
+            raise ValueError(
+                "Same-side escape attempt limit cannot exceed total episode limit"
             )
         return self
 
@@ -432,6 +463,15 @@ class StructuralPermissionPolicyConfig(BaseModel):
         ),
         StructuralStateRuleConfig(
             balance_state=BalanceEpisodeState.ESCAPE_WATCH,
+            setup_families=(
+                SetupFamily.CONTINUATION,
+                SetupFamily.REACCELERATION,
+                SetupFamily.REVERSAL,
+            ),
+            result=StructuralPermissionResult.BLOCK,
+        ),
+        StructuralStateRuleConfig(
+            balance_state=BalanceEpisodeState.FAILED_BACK_INSIDE,
             setup_families=(
                 SetupFamily.CONTINUATION,
                 SetupFamily.REACCELERATION,

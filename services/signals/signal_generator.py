@@ -22,10 +22,9 @@ from enums.auction_engine import (
     SetupFamily,
     TradeSide,
 )
-from enums.enums import EntryStatus, LifecycleStage, SignalSide, SignalStatus
+from enums.enums import LifecycleStage, SignalSide, SignalStatus
 from schemas.signal import SignalSchema
 from schemas.stock_opportunity import StockOpportunitySchema
-from schemas.user_trade import UserTradeSchema
 from schemas.snapshot import SnapshotSchema
 from schemas.symbol import SymbolSchema
 from services.auction_engine.event_driven_setup_engine import (
@@ -36,6 +35,7 @@ from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
 from services.signals.signal_metrics import calculate_signal_metrics
 from services.signals.stock_advisor import StockAdvisor
+from utils.intraday_lifecycle import cutoff_due
 from utils.json_utils import sanitize_json
 
 logger = logging.getLogger(__name__)
@@ -68,24 +68,6 @@ class SignalFetcher:
 
     def fetch_signal_by_id(self, signal_id: str) -> Optional[SignalSchema]:
         return SignalSchema.fetch_by_signal_id_strict(signal_id)
-
-    def has_market_deployment(self, signal_id: str) -> bool:
-        """Return True only after an entry reached the broker/virtual market.
-
-        CREATED/READY rows are still pending entry intents and must not keep an
-        otherwise completed opportunity's signal open. SUBMITTED rows are
-        treated as deployed because a broker order is already in flight. Any
-        positive executed quantity also counts, regardless of the persisted
-        entry status, so partial-fill/cancel races remain protected.
-        """
-        trades = UserTradeSchema.fetch_for_signal_id(signal_id)
-        for trade in trades:
-            executed_qty = int(trade.executed_entry_qty or 0)
-            if executed_qty > 0:
-                return True
-            if trade.entry_status in {EntryStatus.SUBMITTED, EntryStatus.FILLED}:
-                return True
-        return False
 
 
 class SignalPersister:
@@ -227,23 +209,17 @@ class SignalPersister:
             route=route,
         )
 
-    def close_completed_unfilled_signal(
+
+
+    def close_at_intraday_cutoff(
         self,
         *,
         signal: SignalSchema,
         snapshot: SnapshotSchema,
-        reason: str,
         meta_json: Dict[str, Any],
-        criteria_json: Dict[str, Any],
         analytics: Dict[str, Any],
     ) -> SignalSchema:
-        """Close entry eligibility after opportunity completion.
-
-        The linked stock_opportunities row has already been moved to COMPLETED,
-        so this method must not call terminate_opportunity(), whose contract is
-        reserved for INVALIDATED/REPLACED outcomes. This signal close applies
-        only when no order was submitted and no entry quantity was filled.
-        """
+        reason = "INTRADAY_SIGNAL_CUTOFF"
         persisted = SignalSchema.close_signal(
             signal_id=signal.signal_id,
             stage=LifecycleStage.FORCE_EXIT,
@@ -253,7 +229,7 @@ class SignalPersister:
             ts=snapshot.snapshot_time,
             last_eval_time=snapshot.snapshot_time,
             last_snapshot_time=snapshot.snapshot_time,
-            criteria_json=criteria_json,
+            criteria_json=signal.criteria_json or {},
             snapshot_json=_snapshot_json(snapshot),
             meta_json=meta_json,
             last_price=_decimal(snapshot.close),
@@ -263,8 +239,12 @@ class SignalPersister:
         )
         if persisted is None:
             raise RuntimeError(
-                f"Completed unfilled signal close returned no row: {signal.signal_id}"
+                f"Intraday cutoff signal close returned no row: {signal.signal_id}"
             )
+        StockOpportunitySchema.complete_at_intraday_cutoff(
+            snapshot=snapshot,
+            signal=persisted,
+        )
         return persisted
 
 
@@ -302,14 +282,50 @@ class SignalAssembler:
         if symbol_row is None:
             logger.info("SIG_SKIP | %s | SYMBOL_RECORD_MISSING", symbol)
             return []
+
+        equity_ref = str(symbol_row.equity_ref or symbol_row.symbol).strip().upper()
+        active = self.fetcher.fetch_active_signal(equity_ref, self.lifecycle)
+
+        if cutoff_due(snapshot.snapshot_time, SIGNAL_CONFIG.intraday_cutoff_time):
+            if active is None:
+                logger.info(
+                    "SIG_CUTOFF_NO_ACTION | %s @ %s | no active signal",
+                    symbol,
+                    snapshot.snapshot_time,
+                )
+                return []
+            identity = _signal_identity(active)
+            reason = "INTRADAY_SIGNAL_CUTOFF"
+            meta = _updated_meta(
+                signal=active,
+                snapshot=snapshot,
+                identity=identity,
+                stage=LifecycleStage.FORCE_EXIT,
+                status=SignalStatus.CLOSED,
+                signal_action="CLOSE",
+                reason=reason,
+                auction_action="SESSION_CUTOFF",
+            )
+            persisted = self.persister.close_at_intraday_cutoff(
+                signal=active,
+                snapshot=snapshot,
+                meta_json=meta,
+                analytics=_analytics(active, snapshot),
+            )
+            logger.info(
+                "SIG_CUTOFF_CLOSE | %s @ %s | signal_id=%s",
+                symbol,
+                snapshot.snapshot_time,
+                active.signal_id,
+            )
+            return [("CLOSE", persisted)]
+
         if not bool(symbol_row.active) or not bool(symbol_row.generate_signals):
             logger.info("SIG_SKIP | %s | SYMBOL_NOT_SIGNAL_ENABLED", symbol)
             return []
         if not bool(snapshot.gen_signals):
             logger.info("SIG_SKIP | %s | SNAPSHOT_SIGNAL_GENERATION_DISABLED", symbol)
             return []
-        equity_ref = str(symbol_row.equity_ref or symbol_row.symbol).strip().upper()
-        active = self.fetcher.fetch_active_signal(equity_ref, self.lifecycle)
 
         routes = self.router.route(snapshot.auction.lifecycle)
         evaluations = self.setup_engine.evaluate(snapshot, routes)
@@ -363,42 +379,14 @@ class SignalAssembler:
                 if progression_pending:
                     continue
 
-                completion_reason = (
-                    f"{route.source_event_type.value}_OPPORTUNITY_WINDOW_COMPLETED"
-                )
+                # A CLOSE route ends only the setup/opportunity creation window.
+                # The signal thesis remains independent and stays OPEN until an
+                # explicit INVALIDATE/REPLACE event or the intraday signal cutoff.
                 self.persister.complete_opportunity(
                     signal=active,
                     snapshot=snapshot,
                     route=route,
                 )
-
-                # A completion event ends entry eligibility, but it must not
-                # force-exit an order already submitted or a filled position.
-                # When nothing reached the market, synchronize the linked
-                # signal to CLOSED so it cannot remain the stale active signal
-                # for the rest of the day.
-                if not self.fetcher.has_market_deployment(active.signal_id):
-                    meta = _updated_meta(
-                        signal=active,
-                        snapshot=snapshot,
-                        identity=active_identity,
-                        stage=LifecycleStage.FORCE_EXIT,
-                        status=SignalStatus.CLOSED,
-                        signal_action="CLOSE",
-                        reason=completion_reason,
-                        auction_action="EVENT_CLOSE",
-                    )
-                    persisted = self.persister.close_completed_unfilled_signal(
-                        signal=active,
-                        snapshot=snapshot,
-                        reason=completion_reason,
-                        meta_json=meta,
-                        criteria_json=_criteria_json(snapshot, evaluations, manager),
-                        analytics=_analytics(active, snapshot),
-                    )
-                    events.append(("CLOSE", persisted))
-                    active = None
-                    break
 
         if selected is not None:
             replaces_active = active is not None
@@ -930,6 +918,11 @@ def _updated_meta(
             "latest_authoritative_progression"
         ]
     meta["authoritative_event_lineage"] = lineage
+    if "trade_entry_state" in signal.meta_json:
+        trade_entry_state = signal.meta_json["trade_entry_state"]
+        if not isinstance(trade_entry_state, dict):
+            raise ValueError("Existing trade_entry_state must be an object")
+        meta["trade_entry_state"] = dict(trade_entry_state)
     return sanitize_json(meta)
 
 

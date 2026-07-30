@@ -34,7 +34,7 @@ from services.auction_engine.contracts import (
     EvidenceSnapshot,
     stable_key,
 )
-from services.auction_engine.episode_contracts import AuctionEvent
+from services.auction_engine.episode_contracts import AuctionEvent, BalanceEpisodeMemory
 from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
 from services.auction_engine.structural_permissions import StructuralPermissionMatrix
 
@@ -121,6 +121,72 @@ class AuctionEngineConfigTests(unittest.TestCase):
         self.assertTrue(
             any(rule.balance_state is BalanceEpisodeState.LOCKED for rule in state_rules)
         )
+
+    def test_balance_rearm_config_rejects_invalid_attempt_limits(self) -> None:
+        payload = AUCTION_ENGINE_CONFIG.resolved_dict()
+        payload["episode"]["balance"]["max_escape_attempts_per_episode"] = 1
+        payload["episode"]["balance"]["max_same_side_escape_attempts"] = 2
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Same-side escape attempt limit cannot exceed total episode limit",
+        ):
+            AuctionEngineConfig.model_validate(payload)
+
+    def test_balance_rearm_config_rejects_too_few_rearm_bars(self) -> None:
+        payload = AUCTION_ENGINE_CONFIG.resolved_dict()
+        payload["episode"]["balance"]["failed_escape_rearm_inside_closes"] = 3
+        payload["episode"]["balance"]["failed_escape_rearm_min_bars"] = 2
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Balance rearm minimum bars cannot be less than required inside closes",
+        ):
+            AuctionEngineConfig.model_validate(payload)
+
+    def test_balance_escape_memory_roundtrip_preserves_rearm_history(self) -> None:
+        memory = BalanceEpisodeMemory(
+            sequence=1,
+            episode_id="BAL:TEST:2026-07-20:001:NEUTRAL:100000",
+            state=BalanceEpisodeState.FAILED_BACK_INSIDE,
+            started_at=datetime(2026, 7, 20, 10, 0),
+            state_started_at=datetime(2026, 7, 20, 10, 30),
+            state_age_bars=2,
+            range_id="RANGE:TEST",
+            candidate_low=None,
+            candidate_high=None,
+            source_range_ids=("RANGE:TEST",),
+            candidate_merge_count=0,
+            candidate_bar_expansion_count=0,
+            candidate_last_valid_at=datetime(2026, 7, 20, 10, 24),
+            frozen_low=99.0,
+            frozen_high=101.0,
+            containment_bars=8,
+            forming_bars_observed=10,
+            marginal_excursion_bars=0,
+            meaningful_escape_bars=0,
+            forming_invalid_bars=0,
+            escape_direction=DirectionalBias.UP,
+            outside_close_count=1,
+            reentry_close_count=1,
+            escape_attempt_count=2,
+            failed_escape_count=2,
+            up_escape_attempt_count=2,
+            down_escape_attempt_count=0,
+            last_escape_direction=DirectionalBias.UP,
+            last_escape_started_at=datetime(2026, 7, 20, 10, 27),
+            last_escape_failed_at=datetime(2026, 7, 20, 10, 30),
+            rearm_required=True,
+            rearm_inside_close_count=0,
+            rearm_bars_elapsed=0,
+            attempt_limit_reached=True,
+            emitted_event_ids=("event-1", "event-2"),
+            last_reason_codes=("BALANCE_REARM_REQUIRED",),
+        )
+
+        restored = BalanceEpisodeMemory.model_validate(
+            memory.model_dump(mode="json")
+        )
+
+        self.assertEqual(restored, memory)
 
     def test_escape_started_is_authoritative_breakout_initiation_permission(self) -> None:
         event = AuctionEvent(

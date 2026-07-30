@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
+from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
 from database.database import get_trades_db
 from models.trade_models import Snapshot as SnapshotORM
 from models.trade_models import UserTrade as UserTradeORM
@@ -47,6 +48,7 @@ from services.audit.auditlog import write_auditlog
 
 from services.zerodha.kiteconnect_service import KiteConnectService
 from utils.datetime_utils import IST
+from utils.intraday_lifecycle import cutoff_due
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,11 @@ ENTRY_SIGNAL_GUARD_VALID = "VALID"
 ENTRY_SIGNAL_GUARD_INVALID = "INVALID"
 ENTRY_SIGNAL_GUARD_DEFER = "DEFER"
 ENTRY_SIGNAL_GUARD_BYPASS = "BYPASS"
+
+def _is_intraday_signal_cutoff_reason(reason: Any) -> bool:
+    return str(reason or "").strip().upper().startswith(
+        "ENTRY_CANCEL_INTRADAY_SIGNAL_CUTOFF"
+    )
 
 
 # -------------------------------------------------------------------
@@ -344,6 +351,8 @@ def _build_exit_fill_updates(
 ) -> Dict[str, Any]:
     when0 = _to_ist_naive(when) or _now_ist_naive()
     exit_px_d = d(exit_px or 0)
+    if exit_px_d <= 0:
+        raise ValueError("Exit fill price must be positive before marking FILLED")
     qty_i = _try_int(
         qty
         or getattr(ut, "executed_exit_qty", None)
@@ -352,17 +361,19 @@ def _build_exit_fill_updates(
         or 1,
         1,
     )
+    if qty_i <= 0:
+        raise ValueError("Exit fill quantity must be positive before marking FILLED")
 
     upd: Dict[str, Any] = {
         "exit_status": ExitStatus.FILLED.value,
-        "executed_exit_price": float(exit_px_d) if exit_px_d > 0 else None,
+        "executed_exit_price": float(exit_px_d),
         "executed_exit_qty": qty_i,
         "exit_exec_time": when0,
         "exit_time": _to_ist_naive(getattr(ut, "exit_time", None)) or when0,
         "last_time": when0,
-        "last_price": float(exit_px_d) if exit_px_d > 0 else getattr(ut, "last_price", None),
+        "last_price": float(exit_px_d),
     }
-    upd.update(_obs_update(obs_kind, code=status_code, message=status_message))
+    upd.update(_obs_update(obs_kind, code=status_code, message=status_message, when=when0))
 
     exit_pnl = _calc_exit_pnl(ut, exit_px_d, qty_i)
     exit_pnl_per_unit = _calc_exit_pnl_per_unit(ut, exit_px_d)
@@ -514,6 +525,22 @@ def _next_modified_limit_price(symbol: str, side: str, old_price: Any) -> Option
     return _round_to_tick(target)
 
 
+def _latest_snapshot_record(symbol: str, *, asof_time: datetime) -> Optional[Any]:
+    symbol0 = str(symbol or "").strip().upper()
+    asof = _to_ist_naive(asof_time)
+    if not symbol0 or asof is None:
+        return None
+
+    with get_trades_db() as db:
+        return (
+            db.query(SnapshotORM)
+            .filter(SnapshotORM.symbol == symbol0)
+            .filter(SnapshotORM.snapshot_time <= asof)
+            .order_by(SnapshotORM.snapshot_time.desc())
+            .first()
+        )
+
+
 def _latest_underlying_snapshot_price(
     symbol: str,
     *,
@@ -524,34 +551,80 @@ def _latest_underlying_snapshot_price(
     Entry eligibility uses the persisted snapshot LTP first and falls back only
     to that same snapshot's close.  It never substitutes a trade-leg price.
     """
-    symbol0 = str(symbol or "").strip().upper()
-    asof = _to_ist_naive(asof_time)
-    if not symbol0 or asof is None:
-        return None, None, None
-
-    with get_trades_db() as db:
-        rec = (
-            db.query(SnapshotORM)
-            .filter(SnapshotORM.symbol == symbol0)
-            .filter(SnapshotORM.snapshot_time <= asof)
-            .order_by(SnapshotORM.snapshot_time.desc())
-            .first()
-        )
-
+    rec = _latest_snapshot_record(symbol, asof_time=asof_time)
     if rec is None:
         return None, None, None
 
+    snapshot_ts = _to_ist_naive(getattr(rec, "snapshot_time", None))
     ltp = d(getattr(rec, "ltp", None))
     if ltp > 0:
-        return ltp, _to_ist_naive(getattr(rec, "snapshot_time", None)), "LTP"
+        return ltp, snapshot_ts, "LTP"
 
     payload = getattr(rec, "data", None)
     if not isinstance(payload, dict) or "close" not in payload:
-        return None, _to_ist_naive(getattr(rec, "snapshot_time", None)), None
+        return None, snapshot_ts, None
     close = d(payload["close"])
     if close <= 0:
-        return None, _to_ist_naive(getattr(rec, "snapshot_time", None)), None
-    return close, _to_ist_naive(getattr(rec, "snapshot_time", None)), "CLOSE"
+        return None, snapshot_ts, None
+    return close, snapshot_ts, "CLOSE"
+
+
+def _derivative_price_from_snapshot_payload(
+    payload: Any,
+    *,
+    trade_symbol: str,
+    instrument_type: Any,
+) -> Optional[Decimal]:
+    """Resolve one exact derivative quote from an underlying snapshot.
+
+    The resolver never substitutes ATM/edge contracts or another strike.  The
+    persisted trade symbol must match the snapshot derivative instrument.
+    """
+    if not isinstance(payload, dict):
+        return None
+    derivatives = payload.get("derivatives")
+    if not isinstance(derivatives, dict):
+        return None
+
+    symbol0 = str(trade_symbol or "").strip().upper()
+    inst = _enum_str(instrument_type)
+    if not symbol0 or inst not in {"FUT", "CE", "PE"}:
+        return None
+
+    if inst == "FUT":
+        future = derivatives.get("future")
+        if not isinstance(future, dict):
+            return None
+        future_symbol = str(future.get("instrument") or future.get("symbol") or "").strip().upper()
+        price = d(future.get("last_price"))
+        return price if future_symbol == symbol0 and price > 0 else None
+
+    ladder = derivatives.get("option_ladder")
+    if isinstance(ladder, dict):
+        bucket = "calls" if inst == "CE" else "puts"
+        rows = ladder.get(bucket)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_symbol = str(row.get("symbol") or "").strip().upper()
+                price = d(row.get("ltp"))
+                if row_symbol == symbol0 and price > 0:
+                    return price
+
+    lite = derivatives.get("options_lite")
+    if isinstance(lite, dict):
+        bucket = "top_calls" if inst == "CE" else "top_puts"
+        rows = lite.get(bucket)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_symbol = str(row.get("symbol") or "").strip().upper()
+                price = d(row.get("ltp"))
+                if row_symbol == symbol0 and price > 0:
+                    return price
+    return None
 
 
 # -------------------------------------------------------------------
@@ -564,6 +637,10 @@ def _virtual_fill_price_time(
     planned_price: Optional[Any],
     planned_time: Optional[datetime] = None,
     asof_time: Optional[datetime] = None,
+    *,
+    equity_ref: Optional[str] = None,
+    instrument_type: Optional[Any] = None,
+    last_known_price: Optional[Any] = None,
 ) -> Tuple[Decimal, datetime]:
     """Return deterministic fill price/time for virtual and replay execution.
 
@@ -591,11 +668,29 @@ def _virtual_fill_price_time(
             if px is not None and d(px) > 0:
                 return d(px), (_to_ist_naive(ts) or execution_ts)
 
-        # Derivative symbols generally do not have their own snapshots. In replay
-        # the planned price from trade generation/monitor is already derived from
-        # the replay snapshot/derivatives chain, so prefer it over live/latest.
+        # Derivative legs are priced from the exact symbol embedded in the
+        # latest completed underlying snapshot.  They generally do not have a
+        # separate snapshots row of their own.
+        inst = _enum_str(instrument_type)
+        underlying = str(equity_ref or "").strip().upper()
+        if inst in {"FUT", "CE", "PE"} and underlying:
+            rec = _latest_snapshot_record(underlying, asof_time=execution_ts)
+            if rec is not None:
+                px = _derivative_price_from_snapshot_payload(
+                    getattr(rec, "data", None),
+                    trade_symbol=symbol,
+                    instrument_type=inst,
+                )
+                if px is not None and px > 0:
+                    ts = _to_ist_naive(getattr(rec, "snapshot_time", None))
+                    return px, (ts or execution_ts)
+
+        # Planned and last-monitored prices are deterministic replay fallbacks.
         if pp > 0:
             return pp, execution_ts
+        last_px = d(last_known_price)
+        if last_px > 0:
+            return last_px, execution_ts
 
     if _execution_use_live_price_for_virtual():
         px = _quote_best_price(symbol, side)
@@ -1046,12 +1141,29 @@ class TradeExecutor:
         es = _entry_status(ut)
         xs = _exit_status(ut)
 
+        entry_pending = es in (EntryStatus.READY.value, EntryStatus.SUBMITTED.value)
+        entry_cutoff_due = bool(
+            entry_pending
+            and bool(getattr(ut, "intraday_only", False))
+            and cutoff_due(
+                asof_time,
+                INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time,
+            )
+        )
+
         guard_state = ENTRY_SIGNAL_GUARD_BYPASS
         guard_reason: Optional[str] = None
-        if es in (EntryStatus.READY.value, EntryStatus.SUBMITTED.value):
+        if entry_pending and not entry_cutoff_due:
             guard_state, _, guard_reason = self._entry_signal_guard(ut)
 
         if not _is_real(ut):
+            if entry_cutoff_due:
+                return self._cancel_invalidated_entry_package(
+                    ut,
+                    reason="ENTRY_CANCEL_INTRADAY_SIGNAL_CUTOFF",
+                    asof_time=asof_time,
+                    broker=None,
+                )
             if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
                 return self._cancel_invalidated_entry_package(
                     ut,
@@ -1069,6 +1181,14 @@ class TradeExecutor:
 
         broker_login_ok = _try_int(getattr(user, "broker_login", 0), 0) == 1
         broker = ZerodhaBroker(user) if broker_login_ok else None
+
+        if entry_cutoff_due:
+            return self._cancel_invalidated_entry_package(
+                ut,
+                reason="ENTRY_CANCEL_INTRADAY_SIGNAL_CUTOFF",
+                asof_time=asof_time,
+                broker=broker,
+            )
 
         if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
             return self._cancel_invalidated_entry_package(
@@ -1122,13 +1242,26 @@ class TradeExecutor:
         xs = _exit_status(ut)
         if xs in (ExitStatus.READY.value, ExitStatus.SUBMITTED.value, ExitStatus.FILLED.value):
             return True
+        cutoff = _is_intraday_signal_cutoff_reason(reason)
         _persist_executor_update(ut, {
             "exit_status": ExitStatus.READY.value,
-            "exit_reason": "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION",
-            "exit_rule": "trade_executor_signal_revalidation",
+            "exit_reason": (
+                "INTRADAY_SIGNAL_CUTOFF"
+                if cutoff
+                else "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION"
+            ),
+            "exit_rule": (
+                "trade_executor_intraday_signal_cutoff"
+                if cutoff
+                else "trade_executor_signal_revalidation"
+            ),
             "exit_intent_time": asof_time,
             "exit_time": asof_time,
-            "exec_status": "EXIT_READY_SIGNAL_INVALIDATED_DURING_ENTRY",
+            "exec_status": (
+                "EXIT_READY_INTRADAY_SIGNAL_CUTOFF_DURING_ENTRY"
+                if cutoff
+                else "EXIT_READY_SIGNAL_INVALIDATED_DURING_ENTRY"
+            ),
             "exec_status_message": str(reason)[:250],
             "exec_last_checked_at": asof_time,
         })
@@ -1143,23 +1276,36 @@ class TradeExecutor:
         fill_time: datetime,
         reason: str,
     ) -> bool:
+        cutoff = _is_intraday_signal_cutoff_reason(reason)
         updates = _entry_fill_updates(
             ut,
             fill_price=fill_price,
             fill_qty=fill_qty,
             when=fill_time,
             reconcile_message=(
-                "Broker entry filled while originating signal was invalid; "
+                "Broker entry filled while entry eligibility was terminal; "
                 f"immediate exit queued. reason={reason}"
             ),
         )
         updates.update({
             "exit_status": ExitStatus.READY.value,
-            "exit_reason": "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION",
-            "exit_rule": "trade_executor_signal_revalidation",
+            "exit_reason": (
+                "INTRADAY_SIGNAL_CUTOFF"
+                if cutoff
+                else "SIGNAL_INVALIDATED_BEFORE_ENTRY_COMPLETION"
+            ),
+            "exit_rule": (
+                "trade_executor_intraday_signal_cutoff"
+                if cutoff
+                else "trade_executor_signal_revalidation"
+            ),
             "exit_intent_time": fill_time,
             "exit_time": fill_time,
-            "exec_status": "ENTRY_FILLED_DURING_SIGNAL_INVALIDATION",
+            "exec_status": (
+                "ENTRY_FILLED_DURING_INTRADAY_SIGNAL_CUTOFF"
+                if cutoff
+                else "ENTRY_FILLED_DURING_SIGNAL_INVALIDATION"
+            ),
             "exec_status_message": str(reason)[:250],
             "exec_last_checked_at": fill_time,
         })
@@ -1175,6 +1321,11 @@ class TradeExecutor:
         asof_time: datetime,
     ) -> bool:
         oid = str(getattr(ut, "entry_order_id", "") or "").strip()
+        terminal_suffix = (
+            "INTRADAY_SIGNAL_CUTOFF"
+            if _is_intraday_signal_cutoff_reason(reason)
+            else "SIGNAL_INVALIDATED"
+        )
         if not oid:
             _persist_executor_update(ut, {
                 "entry_status": EntryStatus.INVALID.value,
@@ -1208,7 +1359,7 @@ class TradeExecutor:
         if status == OrderStatus.COMPLETE:
             if avg is None or avg <= 0:
                 _persist_executor_update(ut, {
-                    "exec_status": "ENTRY_INVALIDATED_FILL_PRICE_PENDING",
+                    "exec_status": f"ENTRY_{terminal_suffix}_FILL_PRICE_PENDING",
                     "exec_status_message": str(reason)[:250],
                     "exec_last_checked_at": asof_time,
                 })
@@ -1225,7 +1376,7 @@ class TradeExecutor:
             if filled_qty > 0:
                 if avg is None or avg <= 0:
                     _persist_executor_update(ut, {
-                        "exec_status": "ENTRY_INVALIDATED_PARTIAL_FILL_PRICE_PENDING",
+                        "exec_status": f"ENTRY_{terminal_suffix}_PARTIAL_FILL_PRICE_PENDING",
                         "exec_status_message": str(reason)[:250],
                         "exec_last_checked_at": asof_time,
                     })
@@ -1249,26 +1400,22 @@ class TradeExecutor:
                 "entry_status": terminal,
                 "executed_entry_price": None,
                 "executed_entry_qty": 0,
-                "exec_status": f"ENTRY_{status.value}_SIGNAL_INVALIDATED",
+                "exec_status": f"ENTRY_{status.value}_{terminal_suffix}",
                 "exec_status_message": str(reason)[:250],
                 "exec_last_checked_at": asof_time,
             })
             return True
 
-        already_requested = _enum_str(getattr(ut, "exec_status", "")) == (
-            "ENTRY_CANCEL_REQUESTED_SIGNAL_INVALIDATED"
-        )
+        requested_code = f"ENTRY_CANCEL_REQUESTED_{terminal_suffix}"
+        failed_code = f"ENTRY_CANCEL_REQUEST_FAILED_{terminal_suffix}"
+        already_requested = _enum_str(getattr(ut, "exec_status", "")) == requested_code
         requested = True if already_requested else _safe_cancel_order(
             broker,
             order_id=oid,
             variety=variety,
         )
         _persist_executor_update(ut, {
-            "exec_status": (
-                "ENTRY_CANCEL_REQUESTED_SIGNAL_INVALIDATED"
-                if requested
-                else "ENTRY_CANCEL_REQUEST_FAILED_SIGNAL_INVALIDATED"
-            ),
+            "exec_status": requested_code if requested else failed_code,
             "exec_status_message": str(reason)[:250],
             "exec_last_checked_at": asof_time,
         })
@@ -1289,13 +1436,18 @@ class TradeExecutor:
         if not package:
             package = [ut]
 
+        cutoff = _is_intraday_signal_cutoff_reason(reason)
+        terminal_suffix = (
+            "INTRADAY_SIGNAL_CUTOFF" if cutoff else "SIGNAL_INVALIDATED"
+        )
+
         for leg in package:
             es = _entry_status(leg)
             if es in (EntryStatus.CREATED.value, EntryStatus.READY.value):
                 _persist_executor_update(leg, {
                     "entry_status": EntryStatus.EXPIRED.value,
                     "exit_status": ExitStatus.NONE.value,
-                    "exec_status": "ENTRY_EXPIRED_SIGNAL_INVALIDATED",
+                    "exec_status": f"ENTRY_EXPIRED_{terminal_suffix}",
                     "exec_status_message": str(reason)[:250],
                     "exec_last_checked_at": asof_time,
                 })
@@ -1306,13 +1458,16 @@ class TradeExecutor:
                     _persist_executor_update(leg, {
                         "entry_status": EntryStatus.CANCELLED.value,
                         "exit_status": ExitStatus.NONE.value,
-                        "exec_status": "VIRTUAL_ENTRY_CANCELLED_SIGNAL_INVALIDATED",
+                        "exec_status": f"VIRTUAL_ENTRY_CANCELLED_{terminal_suffix}",
                         "exec_status_message": str(reason)[:250],
                         "exec_last_checked_at": asof_time,
                     })
                 elif broker is None:
                     _persist_executor_update(leg, {
-                        "exec_status": "ENTRY_CANCEL_PENDING_BROKER_LOGIN_REQUIRED",
+                        "exec_status": (
+                            "ENTRY_CANCEL_PENDING_BROKER_LOGIN_REQUIRED_"
+                            f"{terminal_suffix}"
+                        ),
                         "exec_status_message": str(reason)[:250],
                         "exec_last_checked_at": asof_time,
                     })
@@ -1333,7 +1488,7 @@ class TradeExecutor:
                 )
 
         logger.info(
-            "TradeExecutor: invalidated entry package handled | userid=%s signal_id=%s reason=%s legs=%d",
+            "TradeExecutor: terminal entry package handled | userid=%s signal_id=%s reason=%s legs=%d",
             getattr(ut, "userid", None),
             getattr(ut, "signal_id", None),
             reason,
@@ -1391,6 +1546,12 @@ class TradeExecutor:
         broker submission so a stale READY package cannot execute after its
         signal has died.
         """
+        if bool(getattr(ut, "intraday_only", False)) and cutoff_due(
+            asof_time,
+            INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time,
+        ):
+            return "ENTRY_CANCEL_INTRADAY_SIGNAL_CUTOFF"
+
         guard_state, signal, guard_reason = self._entry_signal_guard(ut)
         if guard_state == ENTRY_SIGNAL_GUARD_INVALID:
             return guard_reason or "ENTRY_CANCEL_SIGNAL_INVALIDATED"
@@ -1471,6 +1632,9 @@ class TradeExecutor:
                 getattr(ut, "entry_price", None),
                 getattr(ut, "entry_intent_time", None) or getattr(ut, "entry_time", None),
                 asof_time=asof_time,
+                equity_ref=getattr(ut, "equity_ref", None),
+                instrument_type=getattr(ut, "instrument_type", None),
+                last_known_price=getattr(ut, "last_price", None),
             )
             expiry_reason = self._revalidate_ready_entry(
                 ut,
@@ -1503,7 +1667,23 @@ class TradeExecutor:
                 getattr(ut, "exit_price", None),
                 getattr(ut, "exit_intent_time", None) or getattr(ut, "exit_time", None) or getattr(ut, "last_time", None),
                 asof_time=asof_time,
+                equity_ref=getattr(ut, "equity_ref", None),
+                instrument_type=getattr(ut, "instrument_type", None),
+                last_known_price=getattr(ut, "last_price", None),
             )
+            if px <= 0:
+                _persist_executor_update(
+                    ut,
+                    {
+                        "exec_last_checked_at": ts,
+                        "exec_status": "EXIT_DEFER_PRICE_UNAVAILABLE",
+                        "exec_status_message": (
+                            "Virtual exit remains READY because no positive exact "
+                            "instrument price was available."
+                        ),
+                    },
+                )
+                return True
             qty = _try_int(
                 getattr(ut, "executed_exit_qty", None)
                 or getattr(ut, "executed_entry_qty", None)

@@ -559,6 +559,77 @@ class StockOpportunitySchema(BaseModel):
             raise
 
     @staticmethod
+    def complete_at_intraday_cutoff(
+        *,
+        snapshot: SnapshotSchema,
+        signal: SignalSchema,
+    ) -> StockOpportunitySchema:
+        """Complete a still-active opportunity at the session cutoff.
+
+        An opportunity that already completed through its Auction creation
+        window keeps that original completion reason.  Signal lifecycle remains
+        independent and is closed separately by SignalGenerator.
+        """
+        ts = _to_ist_naive(snapshot.snapshot_time)
+        reason = "INTRADAY_SIGNAL_CUTOFF"
+        try:
+            existing = StockOpportunitySchema.fetch_by_signal_id(signal.signal_id)
+            if existing is None:
+                raise RuntimeError(
+                    f"Missing deployed opportunity for signal {signal.signal_id}"
+                )
+
+            state = str(existing.lifecycle_state or "").strip().upper()
+            if state == "COMPLETED":
+                return existing
+            if state in {"INVALIDATED", "REPLACED"}:
+                raise RuntimeError(
+                    "Open signal cannot reach intraday cutoff with terminal "
+                    f"opportunity state={state} signal_id={signal.signal_id}"
+                )
+
+            transition = _transition(
+                transition_key=(
+                    f"COMPLETED:INTRADAY_SIGNAL_CUTOFF:"
+                    f"{existing.trading_day}:{signal.signal_id}"
+                ),
+                transition_time=ts,
+                state="COMPLETED",
+                reason=reason,
+                signal_id=signal.signal_id,
+                event_id=f"INTRADAY_SIGNAL_CUTOFF:{existing.trading_day}",
+                event_type="INTRADAY_SIGNAL_CUTOFF",
+                episode_id=existing.latest_episode_id,
+                setup_family=existing.current_setup_family,
+                side=signal.side.value,
+            )
+            updated = StockOpportunitySchema.update_opportunity(
+                signal_id=signal.signal_id,
+                update_data={
+                    "lifecycle_state": "COMPLETED",
+                    "lifecycle_reason": reason,
+                    "last_eval_time": ts,
+                    "completed_at": existing.completed_at or ts,
+                    "transition_history": _append_unique(
+                        existing.transition_history,
+                        transition,
+                        identity_key="transition_key",
+                    ),
+                },
+            )
+            if updated is None:
+                raise RuntimeError(
+                    f"Missing deployed opportunity for signal {signal.signal_id}"
+                )
+            return updated
+        except Exception:
+            logger.exception(
+                "stock opportunity cutoff completion failed | signal_id=%s",
+                signal.signal_id,
+            )
+            raise
+
+    @staticmethod
     def terminate_opportunity(
         *,
         snapshot: SnapshotSchema,

@@ -140,6 +140,18 @@ class TradeEntryLifecycleTests(unittest.TestCase):
             patch.object(UserTradeSchema, "has_any_trade_for_signal", return_value=False),
             patch.object(UserTradeSchema, "fetch_active_trades_for_signal", return_value=[]),
             patch.object(UserTradeSchema, "fetch_active_trades_for_user_equity_ref", return_value=[]),
+            patch(
+                "services.trade.generator.tradegen_validator.business_now_naive",
+                return_value=datetime(2026, 7, 29, 12, 0),
+            ),
+            patch(
+                "services.trade.generator.tradegen_validator._signal_snapshot_price",
+                return_value={
+                    "current_price": 101.0,
+                    "price_source": "TEST",
+                    "price_snapshot_time": datetime(2026, 7, 29, 12, 0),
+                },
+            ),
         ):
             return TradeDecisionHelper.evaluate(user=user, signal=signal, mode=mode)
 
@@ -149,6 +161,28 @@ class TradeEntryLifecycleTests(unittest.TestCase):
         self.assertEqual(TRADE_DECISION_ALLOW, decision.decision)
         self.assertEqual("ACTIVE", decision.details["signal_stage"])
         self.assertEqual("STRENGTHEN", decision.details["management_posture"])
+
+    def test_intraday_entry_cutoff_blocks_all_new_signal_entries(self):
+        signal = make_signal()
+        with (
+            patch.object(UserTradeSchema, "has_any_trade_for_signal", return_value=False),
+            patch.object(UserTradeSchema, "fetch_active_trades_for_signal", return_value=[]),
+            patch.object(UserTradeSchema, "fetch_active_trades_for_user_equity_ref", return_value=[]),
+            patch(
+                "services.trade.generator.tradegen_validator.business_now_naive",
+                return_value=datetime(2026, 7, 29, 15, 18),
+            ),
+        ):
+            decision = TradeDecisionHelper.evaluate(
+                user=make_user(),
+                signal=signal,
+                mode=MODE_MANUAL_CONFIRM,
+            )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(TRADE_DECISION_BLOCK, decision.decision)
+        self.assertEqual(["intraday_entry_cutoff"], decision.reasons)
+        self.assertTrue(decision.details["intraday_entry_cutoff"]["due"])
 
     def test_defensive_signal_waits_for_manual_confirmation(self):
         signal = make_signal(stage="PROTECT", posture="CAUTION", trade_action="TIGHTEN_STOP")
@@ -182,15 +216,27 @@ class TradeEntryLifecycleTests(unittest.TestCase):
     def test_missing_downstream_contract_fails_visibly(self):
         signal = make_signal()
         del signal.meta_json["downstream_contract"]
-        with self.assertRaisesRegex(ValueError, "downstream_contract"):
+        with (
+            patch(
+                "services.trade.generator.tradegen_validator.business_now_naive",
+                return_value=datetime(2026, 7, 29, 12, 0),
+            ),
+            self.assertRaisesRegex(ValueError, "downstream_contract"),
+        ):
             TradeDecisionHelper.evaluate(user=make_user(), signal=signal, mode=MODE_AUTO)
 
     def test_duplicate_check_database_error_propagates(self):
         signal = make_signal()
-        with patch.object(
-            UserTradeSchema,
-            "has_any_trade_for_signal",
-            side_effect=RuntimeError("db unavailable"),
+        with (
+            patch.object(
+                UserTradeSchema,
+                "has_any_trade_for_signal",
+                side_effect=RuntimeError("db unavailable"),
+            ),
+            patch(
+                "services.trade.generator.tradegen_validator.business_now_naive",
+                return_value=datetime(2026, 7, 29, 12, 0),
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "db unavailable"):
                 TradeDecisionHelper.evaluate(user=make_user(), signal=signal, mode=MODE_AUTO)

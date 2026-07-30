@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Dict, List
 from pydantic import BaseModel, Field
 
+from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
+
 
 class ProfitProtectionConfig(BaseModel):
     """First profit-protection step after a trade proves itself.
@@ -115,7 +117,7 @@ class MonitorConfig(BaseModel):
     data_user: str = "VZS807"
     quote_batch_size: int = 180
     quote_batch_sleep_sec: float = 0.35
-    intraday_cutoff_time: str = "15:20:00"
+    intraday_cutoff_time: str = INTRADAY_LIFECYCLE_CONFIG.trade_fail_safe_cutoff_time
     monitor_entry_status: List[str] = Field(default_factory=lambda: ["FILLED"])
 
     # Live quote control. Replay uses EXECUTION_CONFIG.use_snapshot as the single switch.
