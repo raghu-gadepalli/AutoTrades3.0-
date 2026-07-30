@@ -1,20 +1,35 @@
-"""Strict signal-time deployment Advisor for event-driven Auction candidates.
+"""Strict causal deployment Advisor for Auction candidates and deferred entries.
 
-The Advisor does not discover setups or alter Auction lifecycle.  It evaluates
-only the selected authoritative candidate and fails loudly on malformed input.
-There is no fail-open path.
+The Advisor never discovers a setup, changes Auction lifecycle, closes a signal,
+or manages a trade.  It answers only whether deployment quality is ALLOW,
+WATCH, or BLOCK at the current completed snapshot.  Required context failures
+raise; there is no fail-open path.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG, StockAdvisorPolicyConfig
 from enums.auction_engine import AdvisorAction, AuctionEventType, SetupFamily, TradeSide
+from schemas.signal import SignalSchema
 from schemas.snapshot import SnapshotSchema
 from services.auction_engine.contracts import AdvisorDecision
 from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
+from services.signals.stock_advisor_context import (
+    AdvisorDayPathSummary,
+    DeferredEntryFreshnessSummary,
+    evaluate_deferred_entry_freshness,
+    is_mature_narrow_range_churn,
+    summarise_barrier,
+    summarise_day_path,
+    summarise_episode_history,
+)
+from services.signals.stock_advisor_history import (
+    StockAdvisorHistoryProvider,
+    StockAdvisorHistoryProviderProtocol,
+)
 
 
 _SOURCE_RANGE_EVENT_TYPES = {
@@ -39,25 +54,17 @@ class StockAdvisor:
     def __init__(
         self,
         config: StockAdvisorPolicyConfig = STOCK_ADVISOR_CONFIG,
+        history_provider: Optional[StockAdvisorHistoryProviderProtocol] = None,
     ) -> None:
         self.policy = config
+        self.history_provider = history_provider or StockAdvisorHistoryProvider()
 
     def evaluate_authoritative(
         self,
         snapshot: SnapshotSchema,
         candidate: AuthoritativeSetupCandidate,
     ) -> AdvisorDecision:
-        if not isinstance(snapshot, SnapshotSchema):
-            raise TypeError("StockAdvisor requires SnapshotSchema")
-        if not isinstance(candidate, AuthoritativeSetupCandidate):
-            raise TypeError("StockAdvisor requires AuthoritativeSetupCandidate")
-        if snapshot.auction.status != "OK" or snapshot.auction.observation is None:
-            raise ValueError("StockAdvisor requires authoritative Auction observation")
-        symbol = snapshot.symbol.strip().upper()
-        if candidate.symbol != symbol:
-            raise ValueError("StockAdvisor candidate/snapshot symbol mismatch")
-        if candidate.snapshot_time != snapshot.snapshot_time:
-            raise ValueError("StockAdvisor candidate/snapshot time mismatch")
+        self._validate_candidate_inputs(snapshot, candidate)
         if not self.policy.enabled:
             return self._decision(
                 snapshot,
@@ -66,14 +73,32 @@ class StockAdvisor:
                 ("ADVISOR_DISABLED_ALLOW",),
                 (),
                 range_context=None,
+                context_diagnostics={},
             )
 
         observation = snapshot.auction.observation
+        lifecycle = snapshot.auction.lifecycle
+        assert observation is not None and lifecycle is not None
         family = candidate.setup_family.value
         subtype = candidate.setup_subtype.upper()
-        side_direction = "UP" if candidate.side.value == "BUY" else "DOWN"
+        side_direction = "UP" if candidate.side is TradeSide.BUY else "DOWN"
         matches: List[Tuple[str, str]] = []
         range_context = self._resolve_range_context(snapshot, candidate)
+
+        prior_opportunities = self.history_provider.fetch_prior_opportunities(
+            symbol=snapshot.symbol,
+            trading_day=snapshot.snapshot_time.date(),
+            before_time=snapshot.snapshot_time,
+            limit=self.policy.prior_opportunity_limit,
+        )
+        prior_snapshots = self.history_provider.fetch_day_snapshots(
+            symbol=snapshot.symbol,
+            trading_day=snapshot.snapshot_time.date(),
+            through_time=snapshot.snapshot_time,
+            limit=self.policy.day_history_limit,
+            include_current=False,
+        )
+        day_snapshots = [*prior_snapshots, snapshot]
 
         if (
             observation.exhaustion_active
@@ -97,15 +122,74 @@ class StockAdvisor:
 
         if family in self._normalised(
             self.policy.accepted_breakout_current_context_families
+        ) and not range_context.outside_for_side:
+            matches.append((
+                self.policy.accepted_breakout_current_context_action,
+                "ACCEPTED_BREAKOUT_NOT_CURRENTLY_OUTSIDE",
+            ))
+
+        day_path = self._day_path_summary(
+            snapshot=snapshot,
+            day_snapshots=day_snapshots,
+            range_context=range_context,
+            candidate=candidate,
+        )
+        churn_matched = False
+        churn_facts: Tuple[str, ...] = ()
+        churn_policy = self.policy.mature_range_churn
+        if (
+            churn_policy.enabled
+            and family in self._normalised(churn_policy.families)
+            and range_context.low is not None
+            and range_context.high is not None
         ):
-            if not range_context.outside_for_side:
-                matches.append((
-                    self.policy.accepted_breakout_current_context_action,
-                    "ACCEPTED_BREAKOUT_NOT_CURRENTLY_OUTSIDE",
-                ))
+            churn_matched, churn_facts = is_mature_narrow_range_churn(
+                day_path,
+                failed_escape_count=lifecycle.balance.failed_escape_count,
+                policy=churn_policy,
+            )
+            if churn_matched:
+                matches.append((churn_policy.action, "MATURE_NARROW_RANGE_CHURN"))
+
+        episode_history = summarise_episode_history(
+            prior_opportunities,
+            source_episode_id=candidate.source_episode_id,
+            side=candidate.side,
+            snapshot=snapshot,
+            policy=self.policy.repeated_episode,
+        )
+        if (
+            self.policy.repeated_episode.enabled
+            and episode_history.exhausted_objective_context
+        ):
+            matches.append((
+                self.policy.repeated_episode.action,
+                "REPEATED_EXHAUSTED_SAME_EPISODE_DEPLOYMENT",
+            ))
+
+        barrier = summarise_barrier(
+            snapshot,
+            prior_snapshots,
+            side=candidate.side,
+            policy=self.policy.barriers,
+            excluded_price=range_context.reference_price,
+        )
+        if (
+            self.policy.barriers.enabled
+            and family in self._normalised(self.policy.barriers.families)
+            and barrier.active
+        ):
+            direction = "UPSIDE" if candidate.side is TradeSide.BUY else "DOWNSIDE"
+            assert barrier.barrier_type is not None
+            matches.append((
+                self.policy.barriers.action,
+                f"{direction}_BARRIER_NOT_CLEARED_{barrier.barrier_type}",
+            ))
 
         action = self._resolve_action(matches)
-        reasons = tuple(reason for configured, reason in matches if configured == action.value)
+        reasons = tuple(
+            reason for configured, reason in matches if configured == action.value
+        )
         if not reasons:
             reasons = ("ADVISOR_ALLOW",)
         return self._decision(
@@ -115,6 +199,147 @@ class StockAdvisor:
             reasons,
             tuple(matches),
             range_context=range_context,
+            context_diagnostics={
+                "day_path": day_path.to_dict(),
+                "mature_range_churn": {
+                    "matched": churn_matched,
+                    "facts": list(churn_facts),
+                },
+                "episode_history": episode_history.to_dict(),
+                "barrier": barrier.to_dict(),
+            },
+        )
+
+    def evaluate_deferred_entry(
+        self,
+        *,
+        signal: SignalSchema,
+        snapshot: SnapshotSchema,
+    ) -> AdvisorDecision:
+        """Evaluate entry freshness for an already-open undeployed signal.
+
+        WATCH means keep the signal open but do not create a trade package at
+        this cadence.  It never closes or invalidates the signal.
+        """
+        if not isinstance(signal, SignalSchema):
+            raise TypeError("Deferred StockAdvisor requires SignalSchema")
+        if not isinstance(snapshot, SnapshotSchema):
+            raise TypeError("Deferred StockAdvisor requires SnapshotSchema")
+        symbol = snapshot.symbol.strip().upper()
+        signal_symbol = str(signal.symbol or signal.equity_ref or "").strip().upper()
+        if signal_symbol != symbol:
+            raise ValueError("Deferred StockAdvisor signal/snapshot symbol mismatch")
+        if snapshot.auction.status != "OK" or snapshot.auction.lifecycle is None:
+            raise ValueError("Deferred StockAdvisor requires authoritative Auction lifecycle")
+        if signal.first_seen_time is None:
+            raise ValueError("Deferred StockAdvisor requires signal.first_seen_time")
+        side = TradeSide(str(getattr(signal.side, "value", signal.side)).upper())
+
+        if not self.policy.enabled or not self.policy.deferred_entry.enabled:
+            summary = DeferredEntryFreshnessSummary(
+                applicable=False,
+                fresh=True,
+                reason="DEFERRED_ENTRY_ADVISOR_DISABLED",
+                age_minutes=None,
+                matching_fresh_events=(),
+                pullback_detected=False,
+                pullback_atr=None,
+                resumption_detected=False,
+                resumption_atr=None,
+                consolidation_detected=False,
+                consolidation_range_atr=None,
+                consolidation_break_detected=False,
+                bars_considered=0,
+            )
+            action = AdvisorAction.ALLOW
+            reasons = ("DEFERRED_ENTRY_ADVISOR_DISABLED",)
+        else:
+            prior_snapshots = self.history_provider.fetch_day_snapshots(
+                symbol=symbol,
+                trading_day=snapshot.snapshot_time.date(),
+                through_time=snapshot.snapshot_time,
+                limit=self.policy.deferred_entry.history_bars,
+                include_current=False,
+            )
+            signal_time = self._naive_time(signal.first_seen_time)
+            causal = [
+                row
+                for row in prior_snapshots
+                if self._naive_time(row.snapshot_time) >= signal_time
+            ]
+            causal.append(snapshot)
+            summary = evaluate_deferred_entry_freshness(
+                snapshots=causal,
+                signal_created_time=signal.first_seen_time,
+                side=side,
+                policy=self.policy.deferred_entry,
+            )
+            action = AdvisorAction.ALLOW if summary.fresh else AdvisorAction.WATCH
+            reasons = (summary.reason,)
+
+        return AdvisorDecision(
+            symbol=symbol,
+            snapshot_time=snapshot.snapshot_time,
+            action=action,
+            selected_candidate_id=str(signal.signal_id),
+            reason_codes=reasons,
+            diagnostics={
+                "deployment_scope": "DEFERRED_TRADE_ENTRY_ONLY",
+                "signal_id": signal.signal_id,
+                "signal_setup": str(getattr(signal.setup, "value", signal.setup)),
+                "signal_side": side.value,
+                "freshness": summary.to_dict(),
+            },
+        )
+
+    @staticmethod
+    def _validate_candidate_inputs(
+        snapshot: SnapshotSchema,
+        candidate: AuthoritativeSetupCandidate,
+    ) -> None:
+        if not isinstance(snapshot, SnapshotSchema):
+            raise TypeError("StockAdvisor requires SnapshotSchema")
+        if not isinstance(candidate, AuthoritativeSetupCandidate):
+            raise TypeError("StockAdvisor requires AuthoritativeSetupCandidate")
+        if (
+            snapshot.auction.status != "OK"
+            or snapshot.auction.observation is None
+            or snapshot.auction.lifecycle is None
+        ):
+            raise ValueError("StockAdvisor requires authoritative Auction observation")
+        symbol = snapshot.symbol.strip().upper()
+        if candidate.symbol != symbol:
+            raise ValueError("StockAdvisor candidate/snapshot symbol mismatch")
+        if candidate.snapshot_time != snapshot.snapshot_time:
+            raise ValueError("StockAdvisor candidate/snapshot time mismatch")
+
+    def _day_path_summary(
+        self,
+        *,
+        snapshot: SnapshotSchema,
+        day_snapshots: List[SnapshotSchema],
+        range_context: _AdvisorRangeContext,
+        candidate: AuthoritativeSetupCandidate,
+    ) -> AdvisorDayPathSummary:
+        lifecycle = snapshot.auction.lifecycle
+        observation = snapshot.auction.observation
+        assert lifecycle is not None and observation is not None
+        if lifecycle.balance.episode_id == candidate.source_episode_id:
+            started_at = lifecycle.balance.started_at
+            containment = lifecycle.balance.containment_ratio
+        else:
+            started_at = observation.accepted_range_established_at
+            containment = (
+                lifecycle.balance.containment_ratio
+                if lifecycle.balance.episode_id is not None
+                else None
+            )
+        return summarise_day_path(
+            day_snapshots,
+            range_low=range_context.low,
+            range_high=range_context.high,
+            episode_started_at=started_at,
+            containment_ratio=containment,
         )
 
     def _resolve_range_context(
@@ -204,8 +429,8 @@ class StockAdvisor:
             and observation.accepted_range_breakout_eligible
             and not observation.accepted_range_provisional
         )
-        low = (float(observation.accepted_range_low) if range_valid else None)
-        high = (float(observation.accepted_range_high) if range_valid else None)
+        low = float(observation.accepted_range_low) if range_valid else None
+        high = float(observation.accepted_range_high) if range_valid else None
         if range_valid:
             assert low is not None and high is not None
             if (
@@ -247,9 +472,10 @@ class StockAdvisor:
         matches: Tuple[Tuple[str, str], ...],
         *,
         range_context: _AdvisorRangeContext | None,
+        context_diagnostics: Dict[str, Any],
     ) -> AdvisorDecision:
         observation = snapshot.auction.observation
-        diagnostics = {
+        diagnostics: Dict[str, Any] = {
             "deployment_scope": "NEW_SIGNAL_ONLY",
             "candidate_family": candidate.setup_family.value,
             "candidate_subtype": candidate.setup_subtype,
@@ -260,6 +486,7 @@ class StockAdvisor:
                 {"configured_action": configured, "reason": reason}
                 for configured, reason in matches
             ],
+            **context_diagnostics,
         }
         if range_context is not None:
             diagnostics["range_context"] = {
@@ -303,6 +530,15 @@ class StockAdvisor:
     @staticmethod
     def _normalised(values: Tuple[str, ...]) -> set[str]:
         return {str(value).strip().upper() for value in values}
+
+    @staticmethod
+    def _naive_time(value: Any):
+        if not hasattr(value, "replace"):
+            raise TypeError("Advisor timestamp must be datetime")
+        if getattr(value, "tzinfo", None) is not None:
+            from utils.datetime_utils import IST
+            value = value.astimezone(IST)
+        return value.replace(tzinfo=None)
 
 
 __all__ = ["StockAdvisor"]

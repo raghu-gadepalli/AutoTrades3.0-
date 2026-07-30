@@ -961,6 +961,71 @@ class SnapshotSchema(StrictBaseModel):
             return False
 
     @staticmethod
+    def fetch_day_context_for_advisor(
+        *,
+        symbol: str,
+        trading_day: date,
+        through_time: datetime,
+        limit: Optional[int] = None,
+        include_current: bool = True,
+    ) -> List["SnapshotSchema"]:
+        """Load one symbol's causal day context for StockAdvisor.
+
+        Rows are returned in ascending snapshot order.  The query is bounded to
+        one symbol/day and never reads beyond ``through_time``.
+        """
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_symbol:
+            raise ValueError("Advisor snapshot query requires symbol")
+        if not isinstance(trading_day, date):
+            raise TypeError("Advisor snapshot query requires trading_day")
+        ts = through_time
+        if not isinstance(ts, datetime):
+            raise TypeError("Advisor snapshot query requires through_time")
+        if ts.tzinfo is not None:
+            # DB timestamps are naive IST throughout this repository.
+            from utils.datetime_utils import IST
+            ts = ts.astimezone(IST).replace(tzinfo=None)
+        else:
+            ts = ts.replace(tzinfo=None)
+        if ts.date() != trading_day:
+            raise ValueError("Advisor snapshot cutoff must match trading_day")
+        if limit is not None and int(limit) <= 0:
+            raise ValueError("Advisor snapshot limit must be positive")
+
+        day_start = datetime.combine(trading_day, dtime.min)
+        day_end = day_start + timedelta(days=1)
+        with get_trades_db() as db:
+            query = (
+                db.query(SnapshotORM)
+                .filter(SnapshotORM.symbol == clean_symbol)
+                .filter(SnapshotORM.snapshot_time >= day_start)
+                .filter(SnapshotORM.snapshot_time < day_end)
+            )
+            query = query.filter(
+                SnapshotORM.snapshot_time <= ts
+                if include_current
+                else SnapshotORM.snapshot_time < ts
+            )
+            query = query.order_by(SnapshotORM.snapshot_time.desc())
+            if limit is not None:
+                query = query.limit(int(limit))
+            rows = query.all()
+
+        rows = list(reversed(rows))
+        out: List[SnapshotSchema] = []
+        for row in rows:
+            if not row.data:
+                raise ValueError(
+                    f"Advisor snapshot payload missing for {clean_symbol} @ {row.snapshot_time}"
+                )
+            parsed = SnapshotSchema.from_db_dict(row.data)
+            if parsed.snapshot_time.replace(tzinfo=None) != row.snapshot_time.replace(tzinfo=None):
+                raise ValueError("Advisor snapshot JSON time differs from DB snapshot_time")
+            out.append(parsed)
+        return out
+
+    @staticmethod
     def fetch_recent_today_for_symbol_before_time(
         symbol: str,
         ts: datetime,

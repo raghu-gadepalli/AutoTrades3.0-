@@ -22,15 +22,20 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
+from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG
 from configs.trade_config import TRADE_CONFIG
 from database.database import get_trades_db
 from enums.enums import SignalStatus
 from schemas.signal import SignalSchema
+from schemas.snapshot import SnapshotSchema
 from models.trade_models import Snapshot as SnapshotORM
 from schemas.user import UserSchema
 from schemas.user_trade import UserTradeSchema
 from utils.datetime_utils import business_now_naive, to_ist_naive
 from utils.intraday_lifecycle import cutoff_due
+from services.signals.stock_advisor import StockAdvisor
+from services.auction_engine.contracts import AdvisorDecision
+from enums.auction_engine import AdvisorAction
 
 
 DOWNSTREAM_CONTRACT_VERSION = "AUCTION_SIGNAL_DOWNSTREAM_V2"
@@ -565,6 +570,43 @@ def _price_entry_decision(signal: SignalSchema, *, mode: str, warnings: List[str
     )
 
 
+def _deferred_entry_advisor_decision(signal: SignalSchema):
+    """Return causal Advisor freshness for an undeployed OPEN signal."""
+    symbol = _symbol(signal)
+    evaluation_time = _signal_evaluation_time(signal)
+    created_time = to_ist_naive(getattr(signal, "first_seen_time", None))
+    if not symbol or evaluation_time is None or created_time is None:
+        raise ValueError(
+            "Deferred entry Advisor requires symbol, evaluation time, and first_seen_time"
+        )
+    evaluation_time = to_ist_naive(evaluation_time)
+    assert evaluation_time is not None
+    age_minutes = (evaluation_time - created_time).total_seconds() / 60.0
+    if age_minutes < STOCK_ADVISOR_CONFIG.deferred_entry.min_age_minutes:
+        return AdvisorDecision(
+            symbol=symbol,
+            snapshot_time=evaluation_time,
+            action=AdvisorAction.ALLOW,
+            selected_candidate_id=str(signal.signal_id),
+            reason_codes=("ENTRY_WITHIN_INITIAL_MATURATION_WINDOW",),
+            diagnostics={
+                "deployment_scope": "DEFERRED_TRADE_ENTRY_ONLY",
+                "freshness": {
+                    "applicable": False,
+                    "fresh": True,
+                    "reason": "ENTRY_WITHIN_INITIAL_MATURATION_WINDOW",
+                    "age_minutes": round(age_minutes, 3),
+                },
+            },
+        )
+    snapshot = SnapshotSchema.fetch_latest_for_symbol_asof(symbol, evaluation_time)
+    if snapshot is None:
+        raise ValueError(
+            f"Deferred entry Advisor snapshot missing for {symbol} @ {evaluation_time}"
+        )
+    return StockAdvisor().evaluate_deferred_entry(signal=signal, snapshot=snapshot)
+
+
 def _active_trade_exists(userid: str, signal_id: str) -> bool:
     rows = UserTradeSchema.fetch_active_trades_for_signal(userid=userid, signal_id=signal_id)
     for row in rows:
@@ -677,6 +719,33 @@ class TradeDecisionHelper:
         if price_decision is not None:
             price_decision.details = {**details, **price_decision.details}
             return price_decision
+
+        # Directionally favourable price is necessary but no longer sufficient
+        # for a delayed undeployed signal.  The signal remains OPEN while the
+        # Advisor waits for a fresh executable event, pullback-resumption, or
+        # consolidation break.  This does not impose a TTL or close the signal.
+        if mode == MODE_AUTO:
+            deferred_advisor = _deferred_entry_advisor_decision(signal)
+            details["deferred_entry_advisor"] = deferred_advisor.model_dump(
+                mode="json"
+            )
+            if deferred_advisor.action.value == "WATCH":
+                return TradeDecision.wait(
+                    deferred_advisor.reason_codes[0],
+                    warnings=warnings,
+                    details=details,
+                )
+            if deferred_advisor.action.value == "BLOCK":
+                return TradeDecision.block(
+                    deferred_advisor.reason_codes[0],
+                    warnings=warnings,
+                    details=details,
+                )
+            if deferred_advisor.action.value != "ALLOW":
+                raise ValueError(
+                    "Unsupported deferred StockAdvisor action: "
+                    f"{deferred_advisor.action.value}"
+                )
 
         if _policy_bool("block_duplicate_signal_trade") and _active_trade_exists(userid, signal_id):
             return TradeDecision.block("active_trade_exists_for_signal", warnings=warnings, details=details)

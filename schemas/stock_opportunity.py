@@ -120,6 +120,7 @@ def _advisor_evaluation(
         "action": diagnostic["advisor_action"],
         "reason_codes": diagnostic.get("advisor_reason_codes", ()),
         "outcome": diagnostic.get("outcome"),
+        "diagnostics": diagnostic.get("advisor_diagnostics"),
     })
 
 
@@ -721,6 +722,50 @@ class StockOpportunitySchema(BaseModel):
                 state,
             )
             raise
+
+    @staticmethod
+    def fetch_prior_deployed_for_advisor(
+        *,
+        symbol: str,
+        trading_day: date,
+        before_time: datetime,
+        limit: Optional[int] = None,
+    ) -> List["StockOpportunitySchema"]:
+        """Return only causal prior deployed opportunities for StockAdvisor.
+
+        ``deployed_at < before_time`` is deliberate: the candidate currently
+        being evaluated must never see itself or a future replay row.
+        """
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_symbol:
+            raise ValueError("Advisor opportunity query requires symbol")
+        if not isinstance(trading_day, date):
+            raise TypeError("Advisor opportunity query requires trading_day")
+        cutoff = _to_ist_naive(before_time)
+        if cutoff.date() != trading_day:
+            raise ValueError("Advisor opportunity cutoff must match trading_day")
+        if limit is not None and int(limit) <= 0:
+            raise ValueError("Advisor opportunity limit must be positive")
+
+        with get_trades_db() as db:
+            query = (
+                db.query(StockOpportunityORM)
+                .filter(StockOpportunityORM.symbol == clean_symbol)
+                .filter(StockOpportunityORM.trading_day == trading_day)
+                .filter(StockOpportunityORM.deployed_at < cutoff)
+                .order_by(
+                    StockOpportunityORM.deployed_at.desc(),
+                    StockOpportunityORM.id.desc(),
+                )
+            )
+            if limit is not None:
+                query = query.limit(int(limit))
+            rows = query.all()
+
+        # Policy code consumes chronological history.  Query newest-first to
+        # avoid expensive wide-row filesorts, then restore causal order here.
+        rows = list(reversed(rows))
+        return [StockOpportunitySchema.model_validate(row) for row in rows]
 
     @staticmethod
     def delete_for_replay(*, symbols: Sequence[str], trading_day: date) -> int:

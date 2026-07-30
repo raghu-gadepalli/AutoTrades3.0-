@@ -471,6 +471,7 @@ class SignalAssembler:
                         outcome="ADVISOR_BLOCK",
                         advisor_action=advisor.action.value,
                         advisor_reason_codes=advisor.reason_codes,
+                        advisor_diagnostics=advisor.diagnostics,
                     )
                     logger.info(
                         "SIG_BLOCK | %s @ %s | candidate=%s reasons=%s",
@@ -487,6 +488,7 @@ class SignalAssembler:
                         outcome="ADVISOR_WATCH_DEFERRED",
                         advisor_action=advisor.action.value,
                         advisor_reason_codes=advisor.reason_codes,
+                        advisor_diagnostics=advisor.diagnostics,
                     )
                     logger.info(
                         "SIG_DEFER | %s @ %s | candidate=%s reasons=%s",
@@ -507,6 +509,7 @@ class SignalAssembler:
                         outcome="ADVISOR_PASSED",
                         advisor_action=advisor.action.value,
                         advisor_reason_codes=advisor.reason_codes,
+                        advisor_diagnostics=advisor.diagnostics,
                     )
                 else:
                     raise ValueError(
@@ -728,6 +731,7 @@ def _evaluation_diagnostics(
             "manager_reason_codes": tuple(manager.reason_codes),
             "advisor_action": None,
             "advisor_reason_codes": (),
+            "advisor_diagnostics": None,
             "outcome": outcome,
         })
     return records
@@ -740,6 +744,7 @@ def _mark_evaluation_outcome(
     outcome: str,
     advisor_action: Optional[str] = None,
     advisor_reason_codes: Sequence[str] = (),
+    advisor_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> None:
     matches = [record for record in records if record["candidate_id"] == candidate_id]
     if len(matches) != 1:
@@ -752,6 +757,9 @@ def _mark_evaluation_outcome(
     if advisor_action is not None:
         record["advisor_action"] = advisor_action
         record["advisor_reason_codes"] = tuple(advisor_reason_codes)
+        record["advisor_diagnostics"] = (
+            dict(advisor_diagnostics) if advisor_diagnostics is not None else None
+        )
 
 
 def _diagnostic_for_candidate(

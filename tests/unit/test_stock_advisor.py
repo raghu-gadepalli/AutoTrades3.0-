@@ -13,6 +13,18 @@ from services.signals.stock_advisor import StockAdvisor
 from tests.unit.test_event_driven_setup_engine import _event_snapshot
 
 
+class _EmptyHistoryProvider:
+    def fetch_prior_opportunities(self, **kwargs):
+        return []
+
+    def fetch_day_snapshots(self, **kwargs):
+        return []
+
+
+def _advisor() -> StockAdvisor:
+    return StockAdvisor(history_provider=_EmptyHistoryProvider())
+
+
 def _snapshot_with_observation_range(
     snapshot: SnapshotSchema,
     *,
@@ -56,7 +68,7 @@ def test_breakout_initiation_uses_frozen_source_range_not_current_observation() 
         inside=True,
     )
 
-    decision = StockAdvisor().evaluate_authoritative(snapshot, _candidate(snapshot))
+    decision = _advisor().evaluate_authoritative(snapshot, _candidate(snapshot))
 
     assert decision.action is AdvisorAction.ALLOW
     assert decision.reason_codes == ("ADVISOR_ALLOW",)
@@ -82,7 +94,7 @@ def test_accepted_breakout_uses_frozen_source_range_not_current_observation() ->
         inside=True,
     )
 
-    decision = StockAdvisor().evaluate_authoritative(snapshot, _candidate(snapshot))
+    decision = _advisor().evaluate_authoritative(snapshot, _candidate(snapshot))
 
     assert decision.action is AdvisorAction.ALLOW
     assert "ACCEPTED_BREAKOUT_NOT_CURRENTLY_OUTSIDE" not in decision.reason_codes
@@ -107,7 +119,7 @@ def test_non_balance_candidate_still_uses_current_observation_range() -> None:
         inside=True,
     )
 
-    decision = StockAdvisor().evaluate_authoritative(snapshot, _candidate(snapshot))
+    decision = _advisor().evaluate_authoritative(snapshot, _candidate(snapshot))
 
     assert decision.action is AdvisorAction.WATCH
     assert decision.reason_codes == ("INSIDE_ACCEPTED_RANGE",)
@@ -127,7 +139,7 @@ def test_balance_candidate_rejects_reference_boundary_mismatch() -> None:
     candidate = _candidate(snapshot).model_copy(update={"reference_price": 100.5})
 
     try:
-        StockAdvisor().evaluate_authoritative(snapshot, candidate)
+        _advisor().evaluate_authoritative(snapshot, candidate)
     except ValueError as exc:
         assert str(exc) == "StockAdvisor candidate/source boundary mismatch"
     else:
