@@ -275,6 +275,66 @@ def test_structural_block_cannot_create_signal() -> None:
     assert assembler.last_evaluation_diagnostics[0]["blockers"] == ("STRUCTURAL_PERMISSION_BLOCK",)
 
 
+def test_advisor_watch_defers_new_signal_creation() -> None:
+    snapshot = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_STARTED,
+        SetupFamily.BREAKOUT_INITIATION,
+        direction=DirectionalBias.UP,
+        close=101.2,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
+    )
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+    assembler = SignalAssembler(
+        fetcher=fetcher,
+        persister=persister,
+        advisor=_Advisor(AdvisorAction.WATCH),
+    )
+
+    assert assembler.assemble(snapshot) == []
+    assert persister.created_candidate is None
+    assert fetcher.active is None
+    diagnostic = assembler.last_evaluation_diagnostics[0]
+    assert diagnostic["outcome"] == "ADVISOR_WATCH_DEFERRED"
+    assert diagnostic["advisor_action"] == AdvisorAction.WATCH.value
+    assert diagnostic["advisor_reason_codes"] == ("TEST_ADVISOR",)
+
+
+def test_watched_initiation_can_deploy_on_later_allowed_acceptance() -> None:
+    initiation = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_STARTED,
+        SetupFamily.BREAKOUT_INITIATION,
+        direction=DirectionalBias.UP,
+        close=101.2,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
+    )
+    accepted = _event_snapshot(
+        AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
+        SetupFamily.ACCEPTED_BREAKOUT,
+        direction=DirectionalBias.UP,
+        close=101.4,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
+    )
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+
+    deferred = SignalAssembler(
+        fetcher=fetcher,
+        persister=persister,
+        advisor=_Advisor(AdvisorAction.WATCH),
+    ).assemble(initiation)
+    assert deferred == []
+    assert fetcher.active is None
+
+    events = SignalAssembler(
+        fetcher=fetcher,
+        persister=persister,
+        advisor=_Advisor(AdvisorAction.ALLOW),
+    ).assemble(accepted)
+    assert [item[0] for item in events] == ["CREATE"]
+    assert events[0][1].setup == SetupFamily.ACCEPTED_BREAKOUT.value
+
+
 def test_advisor_block_suppresses_only_new_creation() -> None:
     snapshot = _event_snapshot(
         AuctionEventType.BALANCE_ESCAPE_ACCEPTED,

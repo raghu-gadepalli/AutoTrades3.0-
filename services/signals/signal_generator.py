@@ -492,17 +492,37 @@ class SignalAssembler:
                         advisor.reason_codes,
                     )
                     selected = None
-                elif advisor.action not in {AdvisorAction.ALLOW, AdvisorAction.WATCH}:
-                    raise ValueError(
-                        f"Unsupported deployment Advisor action: {advisor.action.value}"
+                elif advisor.action is AdvisorAction.WATCH:
+                    _mark_evaluation_outcome(
+                        self.last_evaluation_diagnostics,
+                        selected.candidate_id,
+                        outcome="ADVISOR_WATCH_DEFERRED",
+                        advisor_action=advisor.action.value,
+                        advisor_reason_codes=advisor.reason_codes,
                     )
-                else:
+                    logger.info(
+                        "SIG_DEFER | %s @ %s | candidate=%s reasons=%s",
+                        symbol,
+                        snapshot.snapshot_time,
+                        selected.candidate_id,
+                        advisor.reason_codes,
+                    )
+                    # WATCH is a first-class deployment defer. Do not create or
+                    # replace a signal from this candidate. A later authoritative
+                    # Auction event may produce a fresh candidate that is assessed
+                    # again by the Advisor on a subsequent cadence.
+                    selected = None
+                elif advisor.action is AdvisorAction.ALLOW:
                     _mark_evaluation_outcome(
                         self.last_evaluation_diagnostics,
                         selected.candidate_id,
                         outcome="ADVISOR_PASSED",
                         advisor_action=advisor.action.value,
                         advisor_reason_codes=advisor.reason_codes,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported deployment Advisor action: {advisor.action.value}"
                     )
 
         if selected is not None:
