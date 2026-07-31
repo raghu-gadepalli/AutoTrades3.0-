@@ -9,7 +9,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
-from sqlalchemy import Text, cast, or_, and_
+from sqlalchemy import Text, cast, or_, and_, func
 from sqlalchemy.exc import IntegrityError
 
 from database.database import get_trades_db
@@ -726,6 +726,102 @@ class SnapshotSchema(StrictBaseModel):
                 "ltp": ltp_val,
                 "ltp_time": getattr(rec, "ltp_time", None),
             }
+
+    @staticmethod
+    def fetch_latest_rankable_time(
+        *,
+        trading_day: date,
+        symbols: List[str],
+        minimum_coverage_ratio: float = 0.90,
+        through_time: Optional[datetime] = None,
+    ) -> Tuple[datetime, int, int]:
+        """Return the latest cadence with sufficient cross-sectional coverage.
+
+        StockRank must compare symbols at the same completed snapshot time.  It
+        therefore never silently substitutes an older per-symbol snapshot.  A
+        cadence is rankable only when its exact-time symbol coverage reaches the
+        configured ratio.
+        """
+        clean_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+        if not clean_symbols:
+            raise ValueError("StockRank snapshot-time lookup requires symbols")
+        ratio = float(minimum_coverage_ratio)
+        if ratio <= 0.0 or ratio > 1.0:
+            raise ValueError("minimum_coverage_ratio must be in (0, 1]")
+
+        day_start = datetime.combine(trading_day, dtime.min)
+        day_end = day_start + timedelta(days=1)
+        required = max(1, math.ceil(len(clean_symbols) * ratio))
+        with get_trades_db() as db:
+            query = (
+                db.query(
+                    SnapshotORM.snapshot_time.label("snapshot_time"),
+                    func.count(func.distinct(SnapshotORM.symbol)).label("coverage"),
+                )
+                .filter(SnapshotORM.snapshot_time >= day_start)
+                .filter(SnapshotORM.snapshot_time < day_end)
+                .filter(SnapshotORM.symbol.in_(clean_symbols))
+            )
+            if through_time is not None:
+                query = query.filter(SnapshotORM.snapshot_time <= through_time)
+            rows = (
+                query.group_by(SnapshotORM.snapshot_time)
+                .having(func.count(func.distinct(SnapshotORM.symbol)) >= required)
+                .order_by(SnapshotORM.snapshot_time.desc())
+                .all()
+            )
+        if not rows:
+            raise ValueError(
+                "No snapshot cadence satisfies StockRank coverage "
+                f"required={required}/{len(clean_symbols)} day={trading_day}"
+            )
+        row = rows[0]
+        return row.snapshot_time, int(row.coverage), len(clean_symbols)
+
+    @staticmethod
+    def fetch_rank_snapshots_at_time(
+        *,
+        rank_time: datetime,
+        symbols: List[str],
+    ) -> List["SnapshotSchema"]:
+        """Load strict snapshots for an exact StockRank cadence."""
+        clean_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+        if not clean_symbols:
+            raise ValueError("StockRank snapshot fetch requires symbols")
+
+        with get_trades_db() as db:
+            rows = (
+                db.query(
+                    SnapshotORM.symbol.label("symbol"),
+                    SnapshotORM.snapshot_time.label("snapshot_time"),
+                    SnapshotORM.ltp.label("ltp"),
+                    SnapshotORM.ltp_time.label("ltp_time"),
+                    cast(SnapshotORM.data, Text).label("data_text"),
+                )
+                .filter(SnapshotORM.snapshot_time == rank_time)
+                .filter(SnapshotORM.symbol.in_(clean_symbols))
+                .order_by(SnapshotORM.symbol.asc())
+                .all()
+            )
+
+        snapshots: List[SnapshotSchema] = []
+        for row in rows:
+            try:
+                raw = row.data_text
+                payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+                if payload["symbol"] != str(row.symbol).strip().upper():
+                    raise ValueError("Snapshot JSON symbol differs from DB symbol")
+                payload_time = datetime.fromisoformat(payload["snapshot_time"]) if isinstance(payload["snapshot_time"], str) else payload["snapshot_time"]
+                if payload_time.replace(tzinfo=None) != row.snapshot_time.replace(tzinfo=None):
+                    raise ValueError("Snapshot JSON time differs from DB snapshot_time")
+                payload["ltp"] = float(row.ltp) if row.ltp is not None else None
+                payload["ltp_time"] = row.ltp_time
+                snapshots.append(SnapshotSchema.from_db_dict(payload))
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid StockRank snapshot payload for {row.symbol} @ {row.snapshot_time}"
+                ) from exc
+        return snapshots
 
     @staticmethod
     def fetch_symbols_for_day(trading_day: date) -> List[str]:

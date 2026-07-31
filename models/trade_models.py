@@ -435,6 +435,102 @@ class DerivativesChain(Base):
 
 
 # -----------------------------------
+# Diagnostic stock movement ranking
+# -----------------------------------
+
+class StockRank(Base):
+    """One symbol's diagnostic rank at one completed snapshot cadence.
+
+    StockRank is intentionally append-by-cadence and idempotent by
+    (symbol, rank_time).  It never controls symbol.active, signal creation or
+    trade lifecycle in this first implementation.
+    """
+
+    __tablename__ = "stock_rank"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    run_id = Column(String(64), nullable=False)
+    trading_day = Column(Date, nullable=False)
+    rank_time = Column(DateTime, nullable=False)
+    symbol = Column(String(32), nullable=False)
+    rank_position = Column(Integer, nullable=False)
+    universe_size = Column(Integer, nullable=False)
+
+    direction = Column(String(8), nullable=False)
+    classification = Column(String(32), nullable=False)
+
+    total_score = Column(DECIMAL(10, 4), nullable=False)
+    movement_score = Column(DECIMAL(10, 4), nullable=False)
+    quality_score = Column(DECIMAL(10, 4), nullable=False)
+    range_penalty = Column(DECIMAL(10, 4), nullable=False)
+    stall_penalty = Column(DECIMAL(10, 4), nullable=False)
+
+    close_price = Column(DECIMAL(16, 6), nullable=False)
+    previous_close = Column(DECIMAL(16, 6), nullable=True)
+    today_open = Column(DECIMAL(16, 6), nullable=True)
+    gap_pct = Column(DECIMAL(12, 6), nullable=True)
+    session_move_pct = Column(DECIMAL(12, 6), nullable=True)
+    post_open_move_pct = Column(DECIMAL(12, 6), nullable=True)
+
+    move_15m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_30m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_60m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_15m_atr = Column(DECIMAL(12, 6), nullable=True)
+    move_30m_atr = Column(DECIMAL(12, 6), nullable=True)
+    move_60m_atr = Column(DECIMAL(12, 6), nullable=True)
+
+    atr_value = Column(DECIMAL(16, 6), nullable=False)
+    atr_pct = Column(DECIMAL(12, 6), nullable=True)
+    directional_efficiency = Column(DECIMAL(12, 6), nullable=True)
+    recent_efficiency = Column(DECIMAL(12, 6), nullable=True)
+    direction_consistency = Column(DECIMAL(12, 6), nullable=False)
+    acceleration_score = Column(DECIMAL(12, 6), nullable=False)
+    volume_ratio = Column(DECIMAL(12, 6), nullable=True)
+    freshness_score = Column(DECIMAL(12, 6), nullable=False)
+    bars_since_extreme = Column(Integer, nullable=False)
+
+    range_active = Column(Boolean, nullable=False, default=False)
+    range_episode_id = Column(String(128), nullable=True)
+    range_id = Column(String(128), nullable=True)
+    range_age_bars = Column(Integer, nullable=False, default=0)
+    range_width_pct = Column(DECIMAL(12, 6), nullable=True)
+    containment_ratio = Column(DECIMAL(12, 6), nullable=True)
+    midpoint_crossings = Column(Integer, nullable=False, default=0)
+    vwap_crossings = Column(Integer, nullable=False, default=0)
+    failed_escape_count = Column(Integer, nullable=False, default=0)
+    rearm_required = Column(Boolean, nullable=False, default=False)
+    attempt_limit_reached = Column(Boolean, nullable=False, default=False)
+
+    metrics_json = Column(JSON, nullable=False)
+
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "rank_time", name="uq_stock_rank_symbol_time"),
+        Index("idx_stock_rank_run", "run_id"),
+        Index("idx_stock_rank_time_position", "rank_time", "rank_position"),
+        Index("idx_stock_rank_day_symbol", "trading_day", "symbol"),
+        Index("idx_stock_rank_day_class", "trading_day", "classification"),
+        Index("idx_stock_rank_day_score", "trading_day", "total_score"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<StockRank {self.symbol} rank={self.rank_position} "
+            f"score={self.total_score} class={self.classification}>"
+        )
+
+
+# -----------------------------------
 # Signals (lifecycle-based)
 # -----------------------------------
 
