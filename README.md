@@ -83,7 +83,7 @@ The primary service entry points are under `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `run_stockscan.py` | Refresh the enabled intraday universe and ranking inputs |
+| `run_stock_rank.py` | Reserved entry point for the six-minute StockRank runner; keep its systemd unit disabled until the StockRank service patch is applied |
 | `gen_derivatives.py` | Generate derivatives-chain context |
 | `gen_snapshots.py` | Generate completed-candle snapshots |
 | `gen_signals.py` | Process unprocessed snapshots through SignalGenerator |
@@ -96,6 +96,19 @@ The primary service entry points are under `scripts/`:
 | `init_intraday_reset.py` | Archive configured data and clear intraday operational tables |
 
 Systemd service templates are stored in the repository root with the `t_*.service` naming convention.
+
+## Operational programs
+
+Occasional/manual workflows are under `operations/`:
+
+| Program | Responsibility |
+|---|---|
+| `filter_stock_universe.py` | Review/apply whitelist and blacklist policy; owns only `symbols.enabled` |
+| `generate_stock_universe.py` | Review/apply long-horizon 150-to-100 curation; owns only `symbols.active` |
+| `refresh_broker_instruments.py` | Refresh raw NSE/NFO broker instruments |
+| `refresh_derivative_symbols.py` | Refresh application FUT/OPT symbols from broker instruments |
+
+Universe operations default to review mode and require `--apply` for membership writes. The retired first-candle StockScan selector and its separate service module have been removed. StockRank remains a separate diagnostic/persistence concern and its production runner is implemented in a later patch.
 
 ## Service window and failure handling
 

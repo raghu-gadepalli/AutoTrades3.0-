@@ -349,7 +349,7 @@ class Symbol(Base):
     processed            = Column(Boolean, nullable=False, default=False)
 
     # Long-lived flags
-    active               = Column(Boolean, nullable=False, default=False)   # listed/supported
+    active               = Column(Boolean, nullable=False, default=False)   # curated observed universe
     enabled              = Column(Boolean, nullable=False, default=True)    # policy/universe gate
 
     # Promotion/demotion timestamps
