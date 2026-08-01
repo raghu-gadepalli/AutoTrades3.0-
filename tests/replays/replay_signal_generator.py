@@ -37,6 +37,7 @@ from models.trade_models import StockOpportunity as StockOpportunityORM
 from schemas.signal import SignalSchema
 from schemas.stock_opportunity import StockOpportunitySchema
 from schemas.snapshot import SnapshotSchema
+from services.advisor_context.reporting import flatten_advisor_context_for_csv
 from services.signals.signal_generator import SignalGenerator
 from utils.json_utils import sanitize_json
 
@@ -484,6 +485,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     evaluation_rows: List[Dict[str, Any]] = []
     action_counts: Counter[str] = Counter()
     evaluation_outcome_counts: Counter[str] = Counter()
+    advisor_action_counts: Counter[str] = Counter()
+    advisor_context_presence_counts: Counter[str] = Counter()
+    stock_rank_availability_counts: Counter[str] = Counter()
+    stock_rank_tier_counts: Counter[str] = Counter()
+    stock_rank_freshness_counts: Counter[str] = Counter()
+    stock_rank_influence_counts: Counter[str] = Counter()
+    market_regime_availability_counts: Counter[str] = Counter()
+    market_regime_state_counts: Counter[str] = Counter()
+    market_regime_influence_counts: Counter[str] = Counter()
     stage_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
     management_posture_counts: Counter[str] = Counter()
@@ -513,6 +523,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             action_name = "NO_ACTION"
         for diagnostic in generator.assembler.last_evaluation_diagnostics:
             evaluation_outcome_counts[str(diagnostic["outcome"])] += 1
+            advisor_action = diagnostic["advisor_action"]
+            context_fields = flatten_advisor_context_for_csv(
+                advisor_action=advisor_action,
+                advisor_diagnostics=diagnostic["advisor_diagnostics"],
+            )
+            if advisor_action is not None:
+                advisor_action_counts[str(advisor_action)] += 1
+                advisor_context_presence_counts[
+                    "PRESENT" if context_fields["advisor_context_present"] else "MISSING"
+                ] += 1
+                stock_rank_availability_counts[
+                    str(context_fields["stock_rank_availability"])
+                ] += 1
+                stock_rank_tier_counts[
+                    str(context_fields["stock_rank_attention_tier"] or "UNAVAILABLE")
+                ] += 1
+                stock_rank_freshness_counts[
+                    "FRESH" if context_fields["stock_rank_fresh"] else "NOT_FRESH"
+                ] += 1
+                stock_rank_influence_counts[
+                    str(context_fields["stock_rank_influence"])
+                ] += 1
+                market_regime_availability_counts[
+                    str(context_fields["market_regime_availability"])
+                ] += 1
+                market_regime_state_counts[
+                    str(context_fields["market_regime_state"])
+                ] += 1
+                market_regime_influence_counts[
+                    str(context_fields["market_regime_influence"])
+                ] += 1
             evaluation_rows.append(sanitize_json({
                 "index": index,
                 "symbol": snapshot.symbol,
@@ -528,9 +569,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "blockers": json.dumps(diagnostic["blockers"]),
                 "reason_codes": json.dumps(diagnostic["reason_codes"]),
                 "manager_reason_codes": json.dumps(diagnostic["manager_reason_codes"]),
-                "advisor_action": diagnostic["advisor_action"],
+                "advisor_action": advisor_action,
                 "advisor_reason_codes": json.dumps(diagnostic["advisor_reason_codes"]),
                 "outcome": diagnostic["outcome"],
+                **context_fields,
             }))
         lifecycle_projection = snapshot.auction.lifecycle
         if lifecycle_projection is None:
@@ -686,6 +728,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cleared": cleared,
         "signal_action_counts": dict(sorted(action_counts.items())),
         "setup_evaluation_outcome_counts": dict(sorted(evaluation_outcome_counts.items())),
+        "advisor_evaluations": sum(advisor_action_counts.values()),
+        "advisor_action_counts": dict(sorted(advisor_action_counts.items())),
+        "advisor_context_presence_counts": dict(
+            sorted(advisor_context_presence_counts.items())
+        ),
+        "stock_rank_availability_counts": dict(
+            sorted(stock_rank_availability_counts.items())
+        ),
+        "stock_rank_tier_counts": dict(sorted(stock_rank_tier_counts.items())),
+        "stock_rank_freshness_counts": dict(
+            sorted(stock_rank_freshness_counts.items())
+        ),
+        "stock_rank_influence_counts": dict(
+            sorted(stock_rank_influence_counts.items())
+        ),
+        "market_regime_availability_counts": dict(
+            sorted(market_regime_availability_counts.items())
+        ),
+        "market_regime_state_counts": dict(
+            sorted(market_regime_state_counts.items())
+        ),
+        "market_regime_influence_counts": dict(
+            sorted(market_regime_influence_counts.items())
+        ),
         "signal_stage_observation_counts": dict(sorted(stage_counts.items())),
         "signal_status_observation_counts": dict(sorted(status_counts.items())),
         "management_posture_counts": dict(
@@ -709,6 +775,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "signal_action_counts": json.dumps(summary["signal_action_counts"], sort_keys=True),
         "setup_evaluation_outcome_counts": json.dumps(
             summary["setup_evaluation_outcome_counts"], sort_keys=True
+        ),
+        "advisor_action_counts": json.dumps(
+            summary["advisor_action_counts"], sort_keys=True
+        ),
+        "advisor_context_presence_counts": json.dumps(
+            summary["advisor_context_presence_counts"], sort_keys=True
+        ),
+        "stock_rank_availability_counts": json.dumps(
+            summary["stock_rank_availability_counts"], sort_keys=True
+        ),
+        "stock_rank_tier_counts": json.dumps(
+            summary["stock_rank_tier_counts"], sort_keys=True
+        ),
+        "stock_rank_freshness_counts": json.dumps(
+            summary["stock_rank_freshness_counts"], sort_keys=True
+        ),
+        "stock_rank_influence_counts": json.dumps(
+            summary["stock_rank_influence_counts"], sort_keys=True
+        ),
+        "market_regime_availability_counts": json.dumps(
+            summary["market_regime_availability_counts"], sort_keys=True
+        ),
+        "market_regime_state_counts": json.dumps(
+            summary["market_regime_state_counts"], sort_keys=True
+        ),
+        "market_regime_influence_counts": json.dumps(
+            summary["market_regime_influence_counts"], sort_keys=True
         ),
         "signal_stage_observation_counts": json.dumps(
             summary["signal_stage_observation_counts"], sort_keys=True
