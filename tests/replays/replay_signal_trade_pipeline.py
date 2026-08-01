@@ -1038,11 +1038,22 @@ def _derivative_validation_rows(
         instrument_type = trade.instrument_type.value
         if instrument_type not in {"FUT", "CE", "PE"}:
             continue
-        if trade.entry_time is None:
-            raise ValueError(f"Derivative trade {trade.id} is missing entry_time")
+        # Derivative legs are priced when the package becomes READY.  Keep
+        # entry_time as the signal-origin anchor and validate against the
+        # later entry-intent snapshot whenever it is available.
+        validation_time = trade.entry_intent_time or trade.entry_time
+        if validation_time is None:
+            raise ValueError(
+                f"Derivative trade {trade.id} is missing entry_intent_time and entry_time"
+            )
+        validation_time_source = (
+            "entry_intent_time"
+            if trade.entry_intent_time is not None
+            else "entry_time_fallback"
+        )
         key = (
             trade.equity_ref.strip().upper(),
-            _snapshot_time_naive_ist(trade.entry_time),
+            _snapshot_time_naive_ist(validation_time),
         )
         if key not in by_key:
             raise LookupError(f"No entry snapshot for derivative trade {trade.id}: {key}")
@@ -1065,6 +1076,8 @@ def _derivative_validation_rows(
                 "trade_id": trade.id,
                 "instrument_type": instrument_type,
                 "trade_symbol": trade.symbol,
+                "validation_time_source": validation_time_source,
+                "validation_time": validation_time,
                 "entry_snapshot_time": quote["snapshot_time"],
                 "expected_symbol": quote["expected_symbol"],
                 "expected_entry_price": quote["expected_entry_price"],
@@ -1081,6 +1094,76 @@ def _derivative_validation_rows(
             }
         )
     return rows
+
+
+def _as_naive_ist_datetime(value: Any, *, context: str) -> datetime:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"{context} cannot be blank")
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if not isinstance(value, datetime):
+        raise TypeError(f"{context} must be datetime")
+    return _snapshot_time_naive_ist(value)
+
+
+def _validate_account_governor_timestamps(
+    *,
+    rows: List[Dict[str, Any]],
+    trades: List[UserTradeSchema],
+    trading_day: date,
+) -> None:
+    package_intents: Dict[Tuple[str, str], set[datetime]] = {}
+    for trade in trades:
+        signal_id = str(trade.signal_id or "").strip()
+        userid = str(trade.userid or "").strip().upper()
+        if not signal_id or trade.entry_intent_time is None:
+            continue
+        key = (userid, signal_id)
+        package_intents.setdefault(key, set()).add(
+            _as_naive_ist_datetime(
+                trade.entry_intent_time,
+                context=f"trade {trade.id} entry_intent_time",
+            )
+        )
+
+    for row in rows:
+        as_of = _as_naive_ist_datetime(
+            row["account_governor_as_of"],
+            context=f"Account Governor row {row['id']} as_of",
+        )
+        audit_ts = _as_naive_ist_datetime(
+            row["ts"],
+            context=f"Account Governor row {row['id']} ts",
+        )
+        if as_of.date() != trading_day or audit_ts.date() != trading_day:
+            raise AssertionError(
+                f"Account Governor row {row['id']} escaped replay day: "
+                f"as_of={as_of} ts={audit_ts}"
+            )
+        if as_of != audit_ts:
+            raise AssertionError(
+                f"Account Governor row {row['id']} audit timestamp mismatch: "
+                f"as_of={as_of} ts={audit_ts}"
+            )
+
+        key = (
+            str(row["userid"] or "").strip().upper(),
+            str(row["entity_id"] or "").strip(),
+        )
+        intent_times = package_intents.get(key, set())
+        if len(intent_times) != 1:
+            raise AssertionError(
+                f"Account Governor row {row['id']} expected one package "
+                f"entry_intent_time for {key}; found {sorted(intent_times)}"
+            )
+        intent_time = next(iter(intent_times))
+        if as_of != intent_time:
+            raise AssertionError(
+                f"Account Governor row {row['id']} authorization time does not "
+                f"match package entry_intent_time: as_of={as_of} "
+                f"entry_intent_time={intent_time}"
+            )
 
 
 def _validate_derivative_coverage(
@@ -1608,6 +1691,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     account_governor_influence_counts = Counter(
         str(row["account_governor_influence"] or "").strip().upper()
         for row in account_governor_rows
+    )
+    _capture_validation(
+        validation_failures,
+        code="ACCOUNT_GOVERNOR_TIMESTAMP_CONTRACT",
+        validator=lambda: _validate_account_governor_timestamps(
+            rows=account_governor_rows,
+            trades=final_trades,
+            trading_day=trading_day,
+        ),
     )
     expected_account_governor_assessments = int(
         tradegen_outcome_counts.get("CREATED", 0)

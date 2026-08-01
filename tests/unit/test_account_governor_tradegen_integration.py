@@ -40,8 +40,12 @@ def _plan() -> TradePlan:
 
 
 def test_plan_is_converted_to_resolved_governor_request() -> None:
-    request = module._account_governor_request_from_plan(_plan())
+    request = module._account_governor_request_from_plan(
+        _plan(), authorization_time=datetime(2026, 7, 31, 10, 27)
+    )
     assert request.userid == "TCQ489"
+    assert request.as_of == datetime(2026, 7, 31, 10, 27)
+    assert request.as_of != _plan().trade_time
     assert request.signal_id == "SIG-1"
     assert request.equity_ref == "COFORGE"
     assert len(request.proposed_legs) == 2
@@ -60,7 +64,9 @@ def test_diagnostic_assessment_is_logged_without_authorising(monkeypatch) -> Non
 
     monkeypatch.setattr(module, "write_auditlog", fake_write_auditlog)
     result = module._assess_and_audit_account_governor(
-        request=module._account_governor_request_from_plan(_plan())
+        request=module._account_governor_request_from_plan(
+            _plan(), authorization_time=datetime(2026, 7, 31, 10, 27)
+        )
     )
 
     assessment = result["assessment"]
@@ -93,9 +99,11 @@ def test_manual_payload_is_converted_after_existing_validation() -> None:
             "entry_price": Decimal("3030"),
             "quantity": 175,
             "lotsize": 175,
-        }
+        },
+        authorization_time=datetime(2026, 7, 31, 11, 3),
     )
     assert request.source == "MANUAL"
+    assert request.as_of == datetime(2026, 7, 31, 11, 3)
     assert request.signal_id == "MANUAL:123"
     assert request.proposed_legs[0].instrument_type == "FUT"
     assert request.proposed_legs[0].quantity == 175

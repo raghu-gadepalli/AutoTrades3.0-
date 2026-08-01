@@ -1193,10 +1193,17 @@ def _account_governor_quantity_for_leg(*, plan: TradePlan, leg: TradeLegPlan) ->
     return None
 
 
-def _account_governor_request_from_plan(plan: TradePlan) -> AccountGovernorRequest:
+def _account_governor_request_from_plan(
+    plan: TradePlan,
+    *,
+    authorization_time: datetime,
+) -> AccountGovernorRequest:
+    as_of = _to_ist_naive(authorization_time)
+    if as_of is None:
+        raise ValueError("Account Governor authorization_time is required")
     return AccountGovernorRequest(
         userid=getattr(plan.user, "userid", None),
-        as_of=plan.trade_time,
+        as_of=as_of,
         source=plan.source,
         signal_id=getattr(plan.signal, "signal_id", None),
         equity_ref=plan.equity_ref,
@@ -1222,10 +1229,14 @@ def _account_governor_request_from_plan(plan: TradePlan) -> AccountGovernorReque
 def _account_governor_request_from_manual_payload(
     *,
     payload: Dict[str, Any],
+    authorization_time: datetime,
 ) -> AccountGovernorRequest:
+    as_of = _to_ist_naive(authorization_time)
+    if as_of is None:
+        raise ValueError("Account Governor authorization_time is required")
     return AccountGovernorRequest(
         userid=payload["userid"],
-        as_of=payload["entry_time"],
+        as_of=as_of,
         source=payload["source"],
         signal_id=payload["signal_id"],
         equity_ref=payload["equity_ref"],
@@ -2937,9 +2948,15 @@ class TradeGenHelper:
             "lotsize": lotsize_i,
         }
 
+        # Account governance is evaluated at package authorisation time, not
+        # at the older signal-origin timestamp stored in entry_time.
+        # Account governance is evaluated at package authorisation time, not
+        # at the older signal actionable timestamp carried by the plan.
+        authorization_time = business_now_naive()
         account_governor = _assess_and_audit_account_governor(
             request=_account_governor_request_from_manual_payload(
                 payload=create_payload,
+                authorization_time=authorization_time,
             )
         )
 
@@ -3039,8 +3056,12 @@ class TradeGenHelper:
         if not isinstance(plan, TradePlan):
             return {"ok": False, "error": "PLAN_BUILD_FAILED"}
 
+        authorization_time = business_now_naive()
         account_governor = _assess_and_audit_account_governor(
-            request=_account_governor_request_from_plan(plan)
+            request=_account_governor_request_from_plan(
+                plan,
+                authorization_time=authorization_time,
+            )
         )
         created_trades = TradeGenHelper._persist_plan(plan)
         if not created_trades:

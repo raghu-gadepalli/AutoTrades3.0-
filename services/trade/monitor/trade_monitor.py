@@ -70,9 +70,6 @@ def d(x: Any) -> Decimal:
         raise ValueError(f"invalid decimal value: {x!r}") from exc
 
 
-def _now_ist() -> datetime:
-    return datetime.now(tz=IST)
-
 
 def _to_ist_naive(ts: Optional[datetime]) -> Optional[datetime]:
     if ts is None:
@@ -427,6 +424,7 @@ def _normalize_trade_management_for_monitor(
     side: str,
     basis_price: Decimal,
     snapshot_dict: Dict[str, Any],
+    asof_time: datetime,
     instrument_type: str = "EQ",
 ) -> Dict[str, Any]:
     return TradeMonHelper.normalize_trade_management(
@@ -435,7 +433,7 @@ def _normalize_trade_management_for_monitor(
         instrument_type=instrument_type,
         entry_price=basis_price,
         underlying_atr=extract_underlying_atr(snapshot_dict),
-        asof_time=_now_ist(),
+        asof_time=asof_time,
     )
 
 
@@ -1066,6 +1064,7 @@ class TradeMonitor:
             side=side,
             basis_price=basis_price,
             snapshot_dict=_normalize_snapshot_dict(snapshot),
+            asof_time=last_time,
             instrument_type=instrument_type,
         )
         managed_stop_price = _decimal_or_none(
