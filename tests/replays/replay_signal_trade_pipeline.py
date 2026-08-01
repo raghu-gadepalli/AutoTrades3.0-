@@ -74,6 +74,10 @@ from services.trade.executor import trade_executor as executor_module
 from services.trade.executor.trade_executor import TradeExecutor
 from services.trade.generator import tradegen_helper as tradegen_helper_module
 from services.trade.generator import tradegen_validator as tradegen_validator_module
+from services.account_governor.reporting import (
+    empty_account_governor_fields,
+    flatten_account_governor_audit_payload,
+)
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
 from utils.json_utils import sanitize_json
@@ -101,6 +105,26 @@ _EXPECTED_TRADEGEN_NONFATAL = {
     "TRADE_DECISION_NOT_ALLOWED",
     "SIGNAL_ALREADY_DEPLOYED",
 }
+
+
+def _resolve_snapshot_symbol_scope(
+    requested_symbols: Sequence[str],
+    snapshots: Sequence[Any],
+) -> Tuple[List[str], List[str]]:
+    """Return replayable and missing symbols without changing request order."""
+
+    observed_symbols = {
+        str(snapshot.symbol).strip().upper()
+        for snapshot in snapshots
+        if str(snapshot.symbol).strip()
+    }
+    replayed_symbols = [
+        symbol for symbol in requested_symbols if symbol in observed_symbols
+    ]
+    missing_symbols = [
+        symbol for symbol in requested_symbols if symbol not in observed_symbols
+    ]
+    return replayed_symbols, missing_symbols
 
 
 def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -817,25 +841,33 @@ def _audit_rows(
             .order_by(AuditLogORM.ts.asc(), AuditLogORM.id.asc())
             .all()
         )
-    return [
-        {
-            "id": row.id,
-            "ts": row.ts,
-            "entity_type": row.entity_type,
-            "entity_id": row.entity_id,
-            "symbol": row.symbol,
-            "userid": row.userid,
-            "evaluation_stage": row.evaluation_stage,
-            "previous_state": row.previous_state,
-            "new_state": row.new_state,
-            "action": row.action,
-            "reason_code": row.reason_code,
-            "reason_text": row.reason_text,
-            "confidence": row.confidence,
-            "payload_json": json.dumps(sanitize_json(row.payload_json), sort_keys=True),
-        }
-        for row in rows
-    ]
+
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = sanitize_json(row.payload_json)
+        governor_fields = empty_account_governor_fields()
+        if str(row.entity_type or "").strip().upper() == "ACCOUNT_GOVERNOR":
+            governor_fields = flatten_account_governor_audit_payload(payload)
+        output.append(
+            {
+                "id": row.id,
+                "ts": row.ts,
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "symbol": row.symbol,
+                "userid": row.userid,
+                "evaluation_stage": row.evaluation_stage,
+                "previous_state": row.previous_state,
+                "new_state": row.new_state,
+                "action": row.action,
+                "reason_code": row.reason_code,
+                "reason_text": row.reason_text,
+                "confidence": row.confidence,
+                "payload_json": json.dumps(payload, sort_keys=True),
+                **governor_fields,
+            }
+        )
+    return output
 
 
 def _tradegen_outcome(result: Dict[str, Any]) -> Tuple[str, Optional[str], int]:
@@ -1138,26 +1170,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     _validate_replay_user(userid, instrument_choice)
 
-    cleared = {"signals": 0, "opportunities": 0, "trades": 0, "audit": 0}
-    if args.clear_data:
-        cleared = _clear_data()
-
+    requested_symbols = list(symbols)
     snapshots = _load_snapshots(
         trading_day=trading_day,
-        symbols=symbols,
+        symbols=requested_symbols,
         batch_size=max(1, int(args.batch_size)),
         start_clock=_parse_clock(args.start_time),
         end_clock=_parse_clock(args.end_time),
     )
-    if not snapshots:
-        raise RuntimeError(
-            f"No stored snapshots found for date={trading_day} symbols={symbols}"
+    symbols, missing_symbols = _resolve_snapshot_symbol_scope(
+        requested_symbols, snapshots
+    )
+
+    if not symbols:
+        logger.error(
+            "REPLAY_PREFLIGHT_FAILED | no stored snapshots for requested scope | "
+            "day=%s requested_symbols=%s | no data was cleared",
+            trading_day,
+            requested_symbols,
+        )
+        return 2
+
+    if missing_symbols:
+        logger.warning(
+            "REPLAY_SYMBOLS_SKIPPED | no snapshots for selected symbols | "
+            "day=%s skipped=%s replayed=%s",
+            trading_day,
+            missing_symbols,
+            symbols,
         )
 
-    observed_symbols = {snapshot.symbol for snapshot in snapshots}
-    missing_symbols = [symbol for symbol in symbols if symbol not in observed_symbols]
-    if missing_symbols:
-        raise RuntimeError(f"No snapshots found for selected symbols: {missing_symbols}")
+    cleared = {"signals": 0, "opportunities": 0, "trades": 0, "audit": 0}
+    if args.clear_data:
+        cleared = _clear_data()
 
     old_use_snapshot = EXECUTION_CONFIG.use_snapshot
     old_live_virtual = EXECUTION_CONFIG.use_live_price_for_virtual
@@ -1181,10 +1226,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trade_monitor = TradeMonitor()
 
     logger.info(
-        "Starting strict Auction signal/trade replay | day=%s symbols=%s userid=%s "
-        "instrument=%s test_mode=%s snapshots=%d cleared=%s",
+        "Starting strict Auction signal/trade replay | day=%s requested_symbols=%s "
+        "replayed_symbols=%s skipped_symbols=%s userid=%s instrument=%s "
+        "test_mode=%s snapshots=%d cleared=%s",
         trading_day,
+        requested_symbols,
         symbols,
+        missing_symbols,
         userid,
         instrument_choice,
         test_mode,
@@ -1544,6 +1592,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     audit_stage_counts = Counter(
         str(row["evaluation_stage"] or "").strip().upper() for row in audit_rows
     )
+    account_governor_rows = [
+        row
+        for row in audit_rows
+        if str(row["entity_type"] or "").strip().upper() == "ACCOUNT_GOVERNOR"
+    ]
+    account_governor_availability_counts = Counter(
+        str(row["account_governor_availability"] or "").strip().upper()
+        for row in account_governor_rows
+    )
+    account_governor_state_counts = Counter(
+        str(row["account_governor_state"] or "").strip().upper()
+        for row in account_governor_rows
+    )
+    account_governor_influence_counts = Counter(
+        str(row["account_governor_influence"] or "").strip().upper()
+        for row in account_governor_rows
+    )
+    expected_account_governor_assessments = int(
+        tradegen_outcome_counts.get("CREATED", 0)
+    )
+    if len(account_governor_rows) != expected_account_governor_assessments:
+        _record_validation_failure(
+            validation_failures,
+            code="ACCOUNT_GOVERNOR_AUDIT_COUNT_MISMATCH",
+            message=(
+                "Account Governor diagnostic rows do not match created trade packages"
+            ),
+            details={
+                "created_packages": expected_account_governor_assessments,
+                "account_governor_rows": len(account_governor_rows),
+            },
+        )
     monitor_audit_rows = int(audit_stage_counts["TRADE_MONITOR"])
     if monitor_audit_rows != monitor_update_total:
         _record_validation_failure(
@@ -1598,7 +1678,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "trading_day": trading_day,
             "database_name": database_name,
             "database_writes": True,
+            "requested_symbols": requested_symbols,
             "symbols": symbols,
+            "missing_symbols": missing_symbols,
             "userid": userid,
             "instrument_choice": instrument_choice,
             "test_mode": test_mode,
@@ -1636,6 +1718,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_exit_pnl": round(total_exit_pnl, 4),
             "audit_rows": len(audit_rows),
             "audit_stage_counts": dict(sorted(audit_stage_counts.items())),
+            "account_governor_assessments": len(account_governor_rows),
+            "account_governor_context_presence_counts": {
+                "PRESENT": sum(
+                    1
+                    for row in account_governor_rows
+                    if row["account_governor_context_present"] is True
+                )
+            },
+            "account_governor_availability_counts": dict(
+                sorted(account_governor_availability_counts.items())
+            ),
+            "account_governor_state_counts": dict(
+                sorted(account_governor_state_counts.items())
+            ),
+            "account_governor_influence_counts": dict(
+                sorted(account_governor_influence_counts.items())
+            ),
             "trade_monitor_audit_rows": monitor_audit_rows,
             "trade_executor_audit_rows": executor_audit_rows,
             "expected_trade_executor_audit_rows": expected_executor_audit_rows,
@@ -1668,6 +1767,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_csv(prefix.with_name(prefix.name + "_trades.csv"), trade_rows)
     _write_csv(prefix.with_name(prefix.name + "_audit.csv"), audit_rows)
     _write_csv(
+        prefix.with_name(prefix.name + "_account_governor.csv"),
+        account_governor_rows,
+    )
+    _write_csv(
         prefix.with_name(prefix.name + "_monitor_errors.csv"),
         monitor_error_rows,
     )
@@ -1689,7 +1792,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         [
             {
                 **summary,
+                "requested_symbols": json.dumps(summary["requested_symbols"]),
                 "symbols": json.dumps(summary["symbols"]),
+                "missing_symbols": json.dumps(summary["missing_symbols"]),
                 "cleared": json.dumps(summary["cleared"], sort_keys=True),
                 "signal_action_counts": json.dumps(
                     summary["signal_action_counts"], sort_keys=True
@@ -1708,6 +1813,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ),
                 "final_instrument_counts": json.dumps(
                     summary["final_instrument_counts"], sort_keys=True
+                ),
+                "account_governor_context_presence_counts": json.dumps(
+                    summary["account_governor_context_presence_counts"],
+                    sort_keys=True,
+                ),
+                "account_governor_availability_counts": json.dumps(
+                    summary["account_governor_availability_counts"],
+                    sort_keys=True,
+                ),
+                "account_governor_state_counts": json.dumps(
+                    summary["account_governor_state_counts"],
+                    sort_keys=True,
+                ),
+                "account_governor_influence_counts": json.dumps(
+                    summary["account_governor_influence_counts"],
+                    sort_keys=True,
                 ),
                 "validation_errors": json.dumps(
                     summary["validation_errors"], sort_keys=True, default=str

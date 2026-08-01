@@ -68,6 +68,12 @@ from database.database import get_trades_db
 from models.trade_models import UserTrade as UserTradeORM, Snapshot as SnapshotORM
 from utils.datetime_utils import IST, business_now_naive
 from utils.json_utils import sanitize_json
+from services.account_governor.contracts import (
+    AccountGovernorPackageLeg,
+    AccountGovernorRequest,
+)
+from services.account_governor.service import AccountGovernorService
+from services.audit.auditlog import write_auditlog
 from services.trade.monitor.trademon_helper import TradeMonHelper, extract_underlying_atr
 from services.trade.generator.tradegen_validator import (
     TradeDecisionHelper,
@@ -77,6 +83,7 @@ from services.trade.generator.tradegen_validator import (
 )
 
 logger = logging.getLogger(__name__)
+_ACCOUNT_GOVERNOR = AccountGovernorService()
 
 
 # =============================================================================
@@ -1169,6 +1176,128 @@ class TradePlan:
     legs: List[TradeLegPlan]
     source: str
     message: str
+
+
+def _account_governor_quantity_for_leg(*, plan: TradePlan, leg: TradeLegPlan) -> Optional[int]:
+    requested = int(getattr(leg, "quantity_override", 0) or 0)
+    if requested > 0:
+        return requested
+    signal_quantity = int(getattr(plan.signal, "quantity", 0) or 0)
+    if signal_quantity > 0:
+        return signal_quantity
+    if _inst_code(leg.instrument_type) != "EQ":
+        return max(int(leg.lotsize or 1), 1)
+    # The EQ quantity is derived from min_eq_amt during assembly. Keep it
+    # explicitly unknown in the neutral contract rather than duplicate sizing
+    # logic inside Account Governor.
+    return None
+
+
+def _account_governor_request_from_plan(plan: TradePlan) -> AccountGovernorRequest:
+    return AccountGovernorRequest(
+        userid=getattr(plan.user, "userid", None),
+        as_of=plan.trade_time,
+        source=plan.source,
+        signal_id=getattr(plan.signal, "signal_id", None),
+        equity_ref=plan.equity_ref,
+        side=plan.side,
+        execution_mode=plan.execution_mode,
+        product_type=plan.product_type,
+        position_style=plan.position_style,
+        intraday_only=bool(plan.intraday_only),
+        proposed_legs=tuple(
+            AccountGovernorPackageLeg(
+                instrument_type=_inst_code(leg.instrument_type),
+                symbol=leg.trade_symbol,
+                side=_instrument_entry_side(leg.instrument_type, plan.side),
+                entry_price=leg.entry_price_exec,
+                quantity=_account_governor_quantity_for_leg(plan=plan, leg=leg),
+                lotsize=max(int(leg.lotsize or 1), 1),
+            )
+            for leg in plan.legs
+        ),
+    )
+
+
+def _account_governor_request_from_manual_payload(
+    *,
+    payload: Dict[str, Any],
+) -> AccountGovernorRequest:
+    return AccountGovernorRequest(
+        userid=payload["userid"],
+        as_of=payload["entry_time"],
+        source=payload["source"],
+        signal_id=payload["signal_id"],
+        equity_ref=payload["equity_ref"],
+        side=payload["trade_type"],
+        execution_mode=payload["execution_mode"],
+        product_type=payload["product_type"],
+        position_style=payload["position_style"],
+        intraday_only=bool(payload["intraday_only"]),
+        proposed_legs=(
+            AccountGovernorPackageLeg(
+                instrument_type=payload["instrument_type"],
+                symbol=payload["symbol"],
+                side=payload["trade_type"],
+                entry_price=payload["entry_price"],
+                quantity=int(payload["quantity"]),
+                lotsize=max(int(payload["lotsize"] or 1), 1),
+            ),
+        ),
+    )
+
+
+def _assess_and_audit_account_governor(
+    *,
+    request: AccountGovernorRequest,
+) -> Dict[str, Any]:
+    assessment = _ACCOUNT_GOVERNOR.assess_package(request=request)
+    request_json = request.model_dump(mode="json")
+    assessment_json = assessment.model_dump(mode="json")
+    audit_persisted = write_auditlog(
+        entity_type="ACCOUNT_GOVERNOR",
+        entity_id=request.signal_id,
+        symbol=request.equity_ref,
+        userid=request.userid,
+        evaluation_stage="PACKAGE_AUTHORIZATION",
+        previous_state=None,
+        new_state=assessment.state.value,
+        action="ASSESS_PACKAGE",
+        reason_code=(
+            assessment.reason_codes[0]
+            if assessment.reason_codes
+            else "ACCOUNT_GOVERNOR_ASSESSED"
+        ),
+        reason_text=", ".join(assessment.reason_codes),
+        confidence=None,
+        ts=request.as_of,
+        payload_json={
+            "snapshot_time": request.as_of,
+            "request": request_json,
+            "assessment": assessment_json,
+        },
+        force_persist=True,
+    )
+    logger.info(
+        "ACCOUNT_GOVERNOR_ASSESSMENT | userid=%s signal_id=%s source=%s "
+        "availability=%s state=%s influence=%s new_entry_allowed=%s "
+        "force_flat=%s reasons=%s audit_persisted=%s",
+        request.userid,
+        request.signal_id,
+        request.source,
+        assessment.availability.value,
+        assessment.state.value,
+        assessment.influence.value,
+        assessment.new_entry_allowed,
+        assessment.force_flat,
+        list(assessment.reason_codes),
+        audit_persisted,
+    )
+    return {
+        "request": request_json,
+        "assessment": assessment_json,
+        "audit_persisted": bool(audit_persisted),
+    }
 
 
 # =============================================================================
@@ -2808,6 +2937,12 @@ class TradeGenHelper:
             "lotsize": lotsize_i,
         }
 
+        account_governor = _assess_and_audit_account_governor(
+            request=_account_governor_request_from_manual_payload(
+                payload=create_payload,
+            )
+        )
+
         try:
             created = UserTradePersister.persist(create_payload)
         except Exception:
@@ -2825,6 +2960,7 @@ class TradeGenHelper:
             "created_count": 1,
             "created": [f"{instrument_type}:{trade_symbol}"],
             "trade_ids": [getattr(created, "id", None)],
+            "account_governor": account_governor,
         }
 
     @staticmethod
@@ -2903,6 +3039,9 @@ class TradeGenHelper:
         if not isinstance(plan, TradePlan):
             return {"ok": False, "error": "PLAN_BUILD_FAILED"}
 
+        account_governor = _assess_and_audit_account_governor(
+            request=_account_governor_request_from_plan(plan)
+        )
         created_trades = TradeGenHelper._persist_plan(plan)
         if not created_trades:
             return {
@@ -2927,4 +3066,5 @@ class TradeGenHelper:
             ],
             "trade_ids": [getattr(t, "id", None) for t in created_trades],
             "validation": decision.to_dict(),
+            "account_governor": account_governor,
         }
