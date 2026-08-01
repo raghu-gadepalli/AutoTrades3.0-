@@ -8,13 +8,12 @@ signal/trade state.
 """
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 import sys
 import time
 from datetime import datetime, time as dtime, timedelta
-from typing import Optional, Sequence
+from typing import Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -32,16 +31,6 @@ START_TIME = dtime.fromisoformat(CONF.service_window_start)
 END_TIME = dtime.fromisoformat(CONF.service_window_end)
 
 logger: Optional[logging.Logger] = None
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the production StockRank service")
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run the latest eligible cadence once and exit",
-    )
-    return parser
 
 
 def _normalise_time(value: Optional[datetime]) -> Optional[datetime]:
@@ -125,7 +114,6 @@ def run_cycle(
     now: datetime,
     service: StockRankService,
     last_rank_time: Optional[datetime],
-    force: bool = False,
 ) -> Optional[datetime]:
     through_time = now - timedelta(seconds=CONF.snapshot_completion_lag_seconds)
     result = service.run(
@@ -134,7 +122,7 @@ def run_cycle(
         symbols=None,
         active_only=True,
         persist=True,
-        after_rank_time=None if force else last_rank_time,
+        after_rank_time=last_rank_time,
         minimum_interval_minutes=CONF.cadence_minutes,
         age_reference_time=now,
         maximum_rank_age_minutes=CONF.maximum_snapshot_age_minutes,
@@ -155,14 +143,13 @@ def run_cycle(
     return datetime.fromisoformat(summary["rank_time"])
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main() -> None:
     global logger
-    args = _build_parser().parse_args(argv)
     setup_logging(log_file=CONF.log_file)
     logger = logging.getLogger(__name__)
 
     if not allow_run_today(logger, "stock_rank"):
-        return 0
+        return
 
     logger.info(
         "=== StockRank Service starting | window=%s-%s cadence=%dm poll=%ds lag=%ds universe=ACTIVE ===",
@@ -173,25 +160,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         CONF.snapshot_completion_lag_seconds,
     )
 
-    service = StockRankService()
-    if args.once:
-        try:
-            run_cycle(
-                now=datetime.now(IST),
-                service=service,
-                last_rank_time=None,
-                force=True,
-            )
-            return 0
-        except Exception:
-            logger.exception("StockRank one-shot run failed")
-            return 1
-        finally:
-            logger.info("=== StockRank one-shot stopped ===")
-
     if not wait_for_window():
-        return 0
+        return
 
+    service = StockRankService()
     today = datetime.now(IST).date()
     last_rank_time = _normalise_time(StockRankSchema.fetch_latest_rank_time(today))
     if last_rank_time is not None:
@@ -221,8 +193,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("StockRank interrupted; stopping")
     finally:
         logger.info("=== StockRank Service stopped ===")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

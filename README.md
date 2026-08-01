@@ -83,7 +83,7 @@ The primary service entry points are under `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `run_stock_rank.py` | Reserved entry point for the six-minute StockRank runner; keep its systemd unit disabled until the StockRank service patch is applied |
+| `run_stock_rank.py` | Run the production six-minute StockRank service over the active EQ universe |
 | `gen_derivatives.py` | Generate derivatives-chain context |
 | `gen_snapshots.py` | Generate completed-candle snapshots |
 | `gen_signals.py` | Process unprocessed snapshots through SignalGenerator |
@@ -108,7 +108,7 @@ Occasional/manual workflows are under `operations/`:
 | `filter_stock_universe.py` | Review/apply whitelist, blacklist and minimum-price policy; owns `symbols.enabled` and refreshes the EQ quote price used by that policy |
 | `generate_stock_universe.py` | Review/apply long-horizon enabled-to-configured-limit curation; owns only `symbols.active` |
 
-The intended occasional operating cycle is: refresh broker instruments, refresh derivative symbols, review/apply the enabled universe, then review/apply the active universe. Membership operations default to review mode and require `--apply`; authoritative refresh operations apply directly unless their documented review option is used. The retired first-candle StockScan selector and its separate service module have been removed. StockRank remains a separate diagnostic/persistence concern and its production runner is implemented in a later patch.
+The intended occasional operating cycle is: refresh broker instruments, refresh derivative symbols, review/apply the enabled universe, then review/apply the active universe. Membership operations default to review mode and require `--apply`; authoritative refresh operations apply directly unless their documented review option is used. The retired first-candle StockScan selector and its separate service module have been removed. StockRank is the production intraday attention-ranking service and remains read-only with respect to symbol membership, signals and trades.
 
 ## Service window and failure handling
 
@@ -299,17 +299,13 @@ This program starts before snapshots exist and runs snapshot generation through 
 
 ## Day Prep
 
-Run on a normal trading day:
+Run through its one-shot service or directly on an allowed trading day:
 
 ```powershell
 python scripts/prepare_day.py
 ```
 
-For controlled weekend/testing execution:
-
-```powershell
-python scripts/prepare_day.py --force
-```
+The production runner has no command-line override surface. Controlled off-day tests should call `DayPrepService` from the test suite or use the configured run-control whitelist rather than bypassing the production day gate.
 
 Day Prep is a one-shot service/runner workflow. It performs mandatory verified
 archives before any current-state table is cleared:

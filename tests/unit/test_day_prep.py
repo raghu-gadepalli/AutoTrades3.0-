@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import UniqueConstraint
@@ -216,6 +217,46 @@ def test_user_access_token_contract_and_day_prep_migration() -> None:
     assert "VARCHAR(255) NOT NULL DEFAULT ''" in sql
     assert "uq_auditlog_history_live_ts" in sql
     assert "auditlog_id, ts" in sql
+
+
+def test_prepare_day_runner_has_no_command_line_override_surface() -> None:
+    import scripts.prepare_day as runner
+
+    assert not hasattr(runner, "_parser")
+
+
+def test_prepare_day_runner_returns_nonzero_without_reraising(monkeypatch) -> None:
+    import scripts.prepare_day as runner
+
+    logger = Mock()
+    monkeypatch.setattr(runner, "setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "logging",
+        SimpleNamespace(getLogger=lambda *_args: logger),
+    )
+    monkeypatch.setattr(runner, "allow_run_today", lambda *_args: True)
+
+    class FailingDayPrepService:
+        def prepare(self) -> None:
+            raise RuntimeError("archive verification failed")
+
+    monkeypatch.setattr(runner, "DayPrepService", FailingDayPrepService)
+
+    assert runner.main() == 1
+    logger.exception.assert_called_once_with("DAY_PREP_FAILED")
+
+
+def test_prepare_day_runner_returns_zero_on_success(monkeypatch) -> None:
+    import scripts.prepare_day as runner
+
+    service = Mock()
+    monkeypatch.setattr(runner, "setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "allow_run_today", lambda *_args: True)
+    monkeypatch.setattr(runner, "DayPrepService", lambda: service)
+
+    assert runner.main() == 0
+    service.prepare.assert_called_once_with()
 
 
 def test_obsolete_initializer_removed_and_prepare_day_runner_exists() -> None:

@@ -7,9 +7,8 @@ from unittest.mock import Mock
 import scripts.run_stock_rank as runner
 
 
-def test_runner_cli_defaults_to_production_active_loop() -> None:
-    args = runner._build_parser().parse_args([])
-    assert args.once is False
+def test_runner_has_no_command_line_override_surface() -> None:
+    assert not hasattr(runner, "_build_parser")
 
 
 def test_run_cycle_passes_production_cadence_contract() -> None:
