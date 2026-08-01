@@ -1,4 +1,4 @@
-# AutoTrades 2.0
+﻿# AutoTrades 2.0
 
 AutoTrades is an intraday trading platform that converts completed market snapshots into structural opportunities, signals, and optionally managed multi-leg trades. The current architecture is event-driven and uses the Auction engine as the authoritative interpreter of local market structure.
 
@@ -10,17 +10,17 @@ The authoritative signal path is:
 
 ```text
 Completed candle and snapshot facts
-→ Auction evidence construction
-→ persistent directional and balance episodes
-→ authoritative lifecycle events
-→ SetupEventRouter
-→ structural permission matrix
-→ setup-quality evaluator
-→ SetupManager selection
-→ StockAdvisor deployment review
-→ SignalGenerator persistence
-→ signals + stock_opportunities
-→ optional trade generation, execution, monitoring and exit
+â†’ Auction evidence construction
+â†’ persistent directional and balance episodes
+â†’ authoritative lifecycle events
+â†’ SetupEventRouter
+â†’ structural permission matrix
+â†’ setup-quality evaluator
+â†’ SetupManager selection
+â†’ StockAdvisor deployment review
+â†’ SignalGenerator persistence
+â†’ signals + stock_opportunities
+â†’ optional trade generation, execution, monitoring and exit
 ```
 
 ### Responsibility boundaries
@@ -108,11 +108,11 @@ Occasional/manual workflows are under `operations/`:
 | `filter_stock_universe.py` | Review/apply whitelist, blacklist and minimum-price policy; owns `symbols.enabled` and refreshes the EQ quote price used by that policy |
 | `generate_stock_universe.py` | Review/apply long-horizon enabled-to-configured-limit curation; owns only `symbols.active` |
 
-The intended occasional operating cycle is: refresh broker instruments, refresh derivative symbols, review/apply the enabled universe, then review/apply the active universe. Membership operations default to review mode and require `--apply`; authoritative refresh operations apply directly unless their documented review option is used. The retired first-candle StockScan selector and its separate service module have been removed. StockRank is the production intraday attention-ranking service and remains read-only with respect to symbol membership, signals and trades.
+The intended occasional operating cycle is: refresh broker instruments, refresh derivative symbols, review/apply the enabled universe, then review/apply the active universe. Membership operations default to review mode and require `--apply`; authoritative refresh operations apply directly unless their documented review option is used. StockRank is the production intraday attention-ranking service and remains read-only with respect to symbol membership, signals and trades.
 
 ## Service window and failure handling
 
-The normal market service window is approximately 09:15–15:30 IST on trading days.
+The normal market service window is approximately 09:15â€“15:30 IST on trading days.
 
 Per-record and per-trade exceptions must not terminate an otherwise safe service loop. Service boundaries should:
 
@@ -178,9 +178,9 @@ The repository separates automated tests, manual functionality checks, and chron
 
 ```text
 tests/
-├── unit/
-├── functionality/
-└── replays/
+â”œâ”€â”€ unit/
+â”œâ”€â”€ functionality/
+â””â”€â”€ replays/
 ```
 
 ### Unit tests
@@ -201,7 +201,7 @@ python -m pytest -q
 
 ### Functionality programs
 
-`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockScan, TradeGenerator, TradeExecutor, or TradeMonitor.
+`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockRamk, TradeGenerator, TradeExecutor, or TradeMonitor.
 
 Examples:
 
@@ -235,8 +235,8 @@ Replay programs use visible source defaults. Destructive cleanup must never be h
 Where a replay supports `CLEAR_DATA` or `--clear-data`:
 
 ```text
-False → preserve the configured database state
-True  → clear only the explicitly documented replay output tables
+False â†’ preserve the configured database state
+True  â†’ clear only the explicitly documented replay output tables
 ```
 
 The default is `False`.
@@ -412,3 +412,4 @@ Before freezing a release, remove generated residue, run the validation checklis
 ## Current project phase
 
 The core Auction-to-opportunity refactor and focused validation are complete. Remaining work is broad one-day and multi-day validation, followed by evidence-based tuning of setup quality or Advisor policy. Strategy thresholds, risk rules, and trade-management tuning should remain separate from repository cleanup.
+

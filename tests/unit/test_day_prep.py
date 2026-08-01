@@ -259,11 +259,7 @@ def test_prepare_day_runner_returns_zero_on_success(monkeypatch) -> None:
     service.prepare.assert_called_once_with()
 
 
-def test_obsolete_initializer_removed_and_prepare_day_runner_exists() -> None:
+def test_obsolete_initializer_removed_and_prepare_day_is_cron_runner() -> None:
     assert not (ROOT / "scripts" / "init_intraday_reset.py").exists()
     assert (ROOT / "scripts" / "prepare_day.py").exists()
-    unit = ROOT / "t_prepare_day.service"
-    assert unit.exists()
-    unit_text = unit.read_text(encoding="utf-8")
-    assert "Type=oneshot" in unit_text
-    assert "scripts/prepare_day.py" in unit_text
+    assert not (ROOT / "t_prepare_day.service").exists()
