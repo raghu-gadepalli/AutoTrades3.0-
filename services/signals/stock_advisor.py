@@ -17,6 +17,11 @@ from schemas.signal import SignalSchema
 from schemas.snapshot import SnapshotSchema
 from services.auction_engine.contracts import AdvisorDecision
 from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
+from services.advisor_context.service import (
+    AdvisorContextService,
+    StockAdvisorContextProviderProtocol,
+)
+from services.advisor_context.contracts import StockAdvisorContextAssessment
 from services.signals.stock_advisor_context import (
     AdvisorDayPathSummary,
     DeferredEntryFreshnessSummary,
@@ -55,9 +60,11 @@ class StockAdvisor:
         self,
         config: StockAdvisorPolicyConfig = STOCK_ADVISOR_CONFIG,
         history_provider: Optional[StockAdvisorHistoryProviderProtocol] = None,
+        context_provider: Optional[StockAdvisorContextProviderProtocol] = None,
     ) -> None:
         self.policy = config
         self.history_provider = history_provider or StockAdvisorHistoryProvider()
+        self.context_provider = context_provider or AdvisorContextService(config=config)
 
     def evaluate_authoritative(
         self,
@@ -65,6 +72,10 @@ class StockAdvisor:
         candidate: AuthoritativeSetupCandidate,
     ) -> AdvisorDecision:
         self._validate_candidate_inputs(snapshot, candidate)
+        advisor_context = self.context_provider.assess(
+            symbol=snapshot.symbol,
+            as_of=snapshot.snapshot_time,
+        )
         if not self.policy.enabled:
             return self._decision(
                 snapshot,
@@ -74,6 +85,7 @@ class StockAdvisor:
                 (),
                 range_context=None,
                 context_diagnostics={},
+                advisor_context=advisor_context,
             )
 
         observation = snapshot.auction.observation
@@ -208,6 +220,7 @@ class StockAdvisor:
                 "episode_history": episode_history.to_dict(),
                 "barrier": barrier.to_dict(),
             },
+            advisor_context=advisor_context,
         )
 
     def evaluate_deferred_entry(
@@ -234,6 +247,10 @@ class StockAdvisor:
         if signal.first_seen_time is None:
             raise ValueError("Deferred StockAdvisor requires signal.first_seen_time")
         side = TradeSide(str(getattr(signal.side, "value", signal.side)).upper())
+        advisor_context = self.context_provider.assess(
+            symbol=symbol,
+            as_of=snapshot.snapshot_time,
+        )
 
         if not self.policy.enabled or not self.policy.deferred_entry.enabled:
             summary = DeferredEntryFreshnessSummary(
@@ -289,6 +306,7 @@ class StockAdvisor:
                 "signal_setup": str(getattr(signal.setup, "value", signal.setup)),
                 "signal_side": side.value,
                 "freshness": summary.to_dict(),
+                "advisor_context": advisor_context.to_diagnostics(),
             },
         )
 
@@ -473,6 +491,7 @@ class StockAdvisor:
         *,
         range_context: _AdvisorRangeContext | None,
         context_diagnostics: Dict[str, Any],
+        advisor_context: StockAdvisorContextAssessment,
     ) -> AdvisorDecision:
         observation = snapshot.auction.observation
         diagnostics: Dict[str, Any] = {
@@ -486,6 +505,7 @@ class StockAdvisor:
                 {"configured_action": configured, "reason": reason}
                 for configured, reason in matches
             ],
+            "advisor_context": advisor_context.to_diagnostics(),
             **context_diagnostics,
         }
         if range_context is not None:

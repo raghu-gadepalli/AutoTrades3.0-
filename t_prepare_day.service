@@ -1,0 +1,14 @@
+[Unit]
+Description=autotrades Day Prep
+After=network.target
+
+[Service]
+Type=oneshot
+User=autotrades
+Group=www-data
+UMask=0002
+WorkingDirectory=/var/www/autotrades
+ExecStart=/var/www/autotrades/venv/bin/python /var/www/autotrades/scripts/prepare_day.py
+
+[Install]
+WantedBy=multi-user.target

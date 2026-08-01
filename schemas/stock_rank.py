@@ -5,9 +5,14 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from sqlalchemy import and_
 
 from database.database import get_trades_db
-from models.trade_models import StockRank as StockRankORM
+from models.trade_models import (
+    StockRank as StockRankORM,
+    StockRankHistory as StockRankHistoryORM,
+)
+from utils.datetime_utils import to_ist_naive
 from utils.json_utils import sanitize_json
 
 
@@ -196,10 +201,58 @@ class StockRankSchema(BaseModel):
             )
         return [StockRankSchema.model_validate(row) for row in rows]
 
+    @staticmethod
+    def fetch_latest_for_symbol_at_or_before(
+        *,
+        symbol: str,
+        through_time: datetime,
+    ) -> Optional["StockRankSchema"]:
+        """Return one causal current-day rank row for Advisor context."""
+        clean_symbol = str(symbol or "").strip().upper()
+        as_of = to_ist_naive(through_time)
+        if not clean_symbol:
+            raise ValueError("StockRank causal lookup requires symbol")
+        if as_of is None:
+            raise ValueError("StockRank causal lookup requires valid through_time")
+        with get_trades_db() as db:
+            row = (
+                db.query(StockRankORM)
+                .filter(StockRankORM.symbol == clean_symbol)
+                .filter(StockRankORM.trading_day == as_of.date())
+                .filter(StockRankORM.rank_time <= as_of)
+                .order_by(StockRankORM.rank_time.desc())
+                .limit(1)
+                .one_or_none()
+            )
+        return StockRankSchema.model_validate(row) if row is not None else None
+
     def report_row(self) -> Dict[str, Any]:
         row = self.model_dump(exclude={"id", "created_at", "updated_at"})
         row["metrics_json"] = sanitize_json(row["metrics_json"])
         return row
+
+
+    @staticmethod
+    def archive_current_rows():
+        """Archive all current ranks and verify symbol/cadence identity."""
+        from schemas.archive import ArchiveSpec, archive_rows
+
+        return archive_rows(
+            ArchiveSpec(
+                name="stock_rank",
+                source_model=StockRankORM,
+                history_model=StockRankHistoryORM,
+                target_to_source={"stock_rank_id": "id"},
+                excluded_target_columns=frozenset(
+                    {"history_id", "archived_on"}
+                ),
+                verification_condition=lambda source, target: and_(
+                    target.c.symbol == source.c.symbol,
+                    target.c.rank_time == source.c.rank_time,
+                ),
+            )
+        )
+
 
 
 __all__ = ["StockRankSchema"]

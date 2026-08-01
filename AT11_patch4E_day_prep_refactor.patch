@@ -1,0 +1,1756 @@
+diff --git a/README.md b/README.md
+index 5d587b1..4c44324 100644
+--- a/README.md
++++ b/README.md
+@@ -93,9 +93,9 @@ The primary service entry points are under `scripts/`:
+ | `event_handler.py` | Coordinate scheduled service execution |
+ | `run_broker_reconcile.py` | Reconcile broker and database state |
+ | `run_trade_backfill.py` | Backfill trade execution details where required |
+-| `init_intraday_reset.py` | Archive configured data and clear intraday operational tables |
++| `prepare_day.py` | Archive durable intraday rows, clear current operational state, and prepare users |
+ 
+-Systemd service templates are stored in the repository root with the `t_*.service` naming convention.
++Systemd service templates are stored in the repository root with the `t_*.service` naming convention. `t_prepare_day.service` is a one-shot unit; no automatic timer is installed by this repository.
+ 
+ ## Operational programs
+ 
+@@ -297,30 +297,50 @@ python tests/replays/replay_pipeline.py
+ 
+ This program starts before snapshots exist and runs snapshot generation through trade exits.
+ 
+-## Intraday reset
++## Day Prep
+ 
+-Run:
++Run on a normal trading day:
+ 
+ ```powershell
+-python scripts/init_intraday_reset.py
++python scripts/prepare_day.py
+ ```
+ 
+-The reset scope is explicitly configured in `SERVICE_CONFIG.init_reset.intraday_tables`. It currently includes:
++For controlled weekend/testing execution:
++
++```powershell
++python scripts/prepare_day.py --force
++```
++
++Day Prep is a one-shot service/runner workflow. It performs mandatory verified
++archives before any current-state table is cleared:
++
++```text
++signals       -> signals_history
++user_trades   -> user_trades_history
++stock_rank    -> stock_rank_history
++```
++
++Auditlog history is optional and disabled by default through
++`SERVICE_CONFIG.day_prep.archive_auditlog`. Whether archived or not, the
++current audit table is cleared during preparation.
++
++The following are intraday working state and are cleared without history:
+ 
+ ```text
+-user_trades
+ stock_opportunities
+-signals
+ snapshots
+ candles
+ derivativeschain
+-oms_funds_history
+-oms_positions_history
+-oms_orders_history
+ auditlog
+ ```
+ 
+-Signals and user trades may be archived according to reset configuration before truncation. Opportunity archival can be added later if required; the current table is cleared as intraday operational state.
++Current OMS projections (`oms_funds`, `oms_positions`, `oms_orders`) are also
++cleared when configured. Their history tables are never cleared.
++
++Day Prep does not read or modify `symbols`. Universe and generation flags
++remain owned by the operational universe programs. The service blocks before
++any archive or clear when unresolved trades are present, unless that strict
++preflight is explicitly disabled in configuration.
+ 
+ ## Validation checklist
+ 
+diff --git a/configs/service_config.py b/configs/service_config.py
+index a24d67b..c0d1813 100644
+--- a/configs/service_config.py
++++ b/configs/service_config.py
+@@ -42,42 +42,29 @@ class EventServiceConfig(BaseModel):
+     extras: EventExtrasConfig = Field(default_factory=EventExtrasConfig)
+ 
+ 
+-class InitResetConfig(BaseModel):
+-    log_file: str = "/var/www/autotrades/scripts/init_intraday_reset.log"
++class DayPrepConfig(BaseModel):
++    """One-shot beginning-of-day operational preparation."""
+ 
+-    archive_before_truncate: bool = True
+-    archive_auditlog: bool = True
+-    reset_eq_flags: bool = True
+-    reset_user_logins: bool = True
++    log_file: str = "/var/www/autotrades/scripts/prepare_day.log"
+ 
+-    virtual_autologin_userids: list[str] = Field(default_factory=lambda: ["ADMIN", "TCQ489"])
+-
+-    # Explicit reset scope. The reset runner must not infer table ownership or
+-    # silently fall back to a hard-coded list when configuration is incomplete.
+-    intraday_tables: list[str] = Field(default_factory=lambda: [
+-        "user_trades",
+-        "stock_opportunities",
+-        "signals",
+-        "snapshots",
+-        "candles",
+-        "derivativeschain",
+-        "oms_funds_history",
+-        "oms_positions_history",
+-        "oms_orders_history",
+-        "auditlog",
+-    ])
++    # Durable records are always archived before current-state tables clear.
++    # Audit history can be large, so it remains optional and is off by default.
++    archive_auditlog: bool = False
++
++    reset_user_logins: bool = True
++    clear_oms_current_state: bool = True
++    strict_unresolved_trade_check: bool = True
+ 
+-    # Retained for compatibility with the existing configuration surface.
+-    restart_identity: bool = True
+-    use_cascade: bool = False
+-    deactivate_types: list[str] = Field(default_factory=lambda: ["FUT", "CE", "PE"])
++    virtual_autologin_userids: list[str] = Field(
++        default_factory=lambda: ["ADMIN", "TCQ489"]
++    )
+ 
+ 
+ class ServiceConfig(BaseModel):
+     tz: str = "Asia/Kolkata"
+     run_control: RunControlConfig = Field(default_factory=RunControlConfig)
+     event: EventServiceConfig = Field(default_factory=EventServiceConfig)
+-    init_reset: InitResetConfig = Field(default_factory=InitResetConfig)
++    day_prep: DayPrepConfig = Field(default_factory=DayPrepConfig)
+ 
+ 
+ SERVICE_CONFIG = ServiceConfig()
+diff --git a/database/sql/20260801_align_live_schema_contracts.sql b/database/sql/20260801_align_live_schema_contracts.sql
+index 893bd7f..22d8480 100644
+--- a/database/sql/20260801_align_live_schema_contracts.sql
++++ b/database/sql/20260801_align_live_schema_contracts.sql
+@@ -180,7 +180,7 @@ ALTER TABLE users
+     MODIFY COLUMN broker_name VARCHAR(30) NOT NULL DEFAULT 'ZERODHA',
+     MODIFY COLUMN apikey VARCHAR(255) NOT NULL DEFAULT '',
+     MODIFY COLUMN secretkey VARCHAR(255) NOT NULL DEFAULT '',
+-    MODIFY COLUMN access_token VARCHAR(50) NOT NULL DEFAULT '',
++    MODIFY COLUMN access_token VARCHAR(255) NOT NULL DEFAULT '',
+     MODIFY COLUMN intraday_only TINYINT(1) NOT NULL DEFAULT 0,
+     MODIFY COLUMN stocks VARCHAR(255) NOT NULL DEFAULT '',
+     MODIFY COLUMN equity TINYINT(1) NOT NULL DEFAULT 1,
+diff --git a/database/sql/20260801_prepare_day_schema.sql b/database/sql/20260801_prepare_day_schema.sql
+new file mode 100644
+index 0000000..3ec258e
+--- /dev/null
++++ b/database/sql/20260801_prepare_day_schema.sql
+@@ -0,0 +1,53 @@
++-- Day Prep support migration.
++--
++-- Run once after 20260801_align_live_schema_contracts.sql. This migration:
++--   1. aligns users.access_token with the live 255-character broker token;
++--   2. makes optional auditlog archival idempotent by live ID + timestamp.
++
++DROP PROCEDURE IF EXISTS `_assert_day_prep_schema_ready`;
++DELIMITER //
++CREATE PROCEDURE `_assert_day_prep_schema_ready`()
++BEGIN
++    DECLARE v_count BIGINT DEFAULT 0;
++
++    SELECT COUNT(*) INTO v_count
++    FROM (
++        SELECT auditlog_id, ts
++        FROM auditlog_history
++        WHERE auditlog_id IS NOT NULL
++        GROUP BY auditlog_id, ts
++        HAVING COUNT(*) > 1
++    ) AS duplicates;
++
++    IF v_count > 0 THEN
++        SIGNAL SQLSTATE '45000'
++            SET MESSAGE_TEXT = 'auditlog_history contains duplicate auditlog_id/ts rows';
++    END IF;
++END//
++DELIMITER ;
++
++CALL `_assert_day_prep_schema_ready`();
++DROP PROCEDURE `_assert_day_prep_schema_ready`;
++
++UPDATE users
++SET access_token = ''
++WHERE access_token IS NULL;
++
++ALTER TABLE users
++    MODIFY COLUMN access_token VARCHAR(255) NOT NULL DEFAULT '';
++
++ALTER TABLE auditlog_history
++    ADD UNIQUE KEY uq_auditlog_history_live_ts (auditlog_id, ts);
++
++SELECT
++    table_name,
++    index_name,
++    non_unique,
++    GROUP_CONCAT(column_name ORDER BY seq_in_index) AS indexed_columns
++FROM information_schema.statistics
++WHERE table_schema = DATABASE()
++  AND table_name = 'auditlog_history'
++GROUP BY table_name, index_name, non_unique
++ORDER BY index_name;
++
++SHOW COLUMNS FROM users WHERE Field = 'access_token';
+diff --git a/models/trade_models.py b/models/trade_models.py
+index 2553c1c..28b8b0e 100644
+--- a/models/trade_models.py
++++ b/models/trade_models.py
+@@ -51,7 +51,7 @@ class User(Base):
+ 
+     apikey       = Column(String(255), nullable=False, server_default="")
+     secretkey    = Column(String(255), nullable=False, server_default="")
+-    access_token = Column(String(50),  nullable=False, server_default="")
++    access_token = Column(String(255), nullable=False, server_default="")
+ 
+     intraday_only = Column(Boolean, nullable=False, server_default="0")
+     stocks       = Column(String(255), nullable=False, server_default="")
+@@ -1245,7 +1245,7 @@ class AuditLog(Base):
+     symbol = Column(String(50), nullable=True)
+     userid = Column(String(50), nullable=True)
+ 
+-    evaluation_stage = Column(String(50), nullable=False) # resolver | trade_generator | trade_monitor | init_reset
++    evaluation_stage = Column(String(50), nullable=False) # resolver | trade_generator | trade_monitor | day_prep
+     previous_state = Column(String(80), nullable=True)
+     new_state = Column(String(80), nullable=True)
+     action = Column(String(80), nullable=True)
+@@ -1265,6 +1265,11 @@ class AuditLog(Base):
+ class AuditLogHistory(Base):
+     __tablename__ = "auditlog_history"
+     __table_args__ = (
++        UniqueConstraint(
++            "auditlog_id",
++            "ts",
++            name="uq_auditlog_history_live_ts",
++        ),
+         Index("idx_auditloghist_ts", "ts"),
+         Index("idx_auditloghist_entity", "entity_type", "entity_id"),
+         Index("idx_auditloghist_symbol_ts", "symbol", "ts"),
+diff --git a/schemas/archive.py b/schemas/archive.py
+new file mode 100644
+index 0000000..812af6b
+--- /dev/null
++++ b/schemas/archive.py
+@@ -0,0 +1,157 @@
++"""Reusable, verified current-table to history-table archival.
++
++Archive contracts derive the insert projection from SQLAlchemy model metadata.
++Only exceptional column names and the source/history identity join are declared
++by each domain schema. This keeps archive writes aligned when matching model
++columns evolve.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Callable, Mapping, Type
++
++from sqlalchemy import Table, func, insert, select
++from sqlalchemy.orm import DeclarativeBase
++
++from database.database import get_trades_db
++
++
++VerificationCondition = Callable[[Table, Table], object]
++
++
++@dataclass(frozen=True)
++class ArchiveSpec:
++    """Source/history contract for one idempotent archive operation."""
++
++    name: str
++    source_model: Type[DeclarativeBase]
++    history_model: Type[DeclarativeBase]
++    target_to_source: Mapping[str, str] = field(default_factory=dict)
++    excluded_target_columns: frozenset[str] = frozenset()
++    verification_condition: VerificationCondition | None = None
++
++
++@dataclass(frozen=True)
++class ArchiveResult:
++    name: str
++    source_rows: int
++    inserted_rows: int
++    verified_rows: int
++
++    @property
++    def duplicate_rows(self) -> int:
++        return max(0, self.source_rows - self.inserted_rows)
++
++    def as_dict(self) -> dict[str, int | str]:
++        return {
++            "name": self.name,
++            "source_rows": self.source_rows,
++            "inserted_rows": self.inserted_rows,
++            "duplicate_rows": self.duplicate_rows,
++            "verified_rows": self.verified_rows,
++        }
++
++
++def archive_columns(spec: ArchiveSpec) -> tuple[list, list]:
++    """Return target/source SQLAlchemy column projections for an archive."""
++
++    source = spec.source_model.__table__
++    target = spec.history_model.__table__
++    target_columns = []
++    source_columns = []
++
++    for target_column in target.columns:
++        name = target_column.name
++        if name in spec.excluded_target_columns:
++            continue
++        if target_column.computed is not None:
++            continue
++        if target_column.primary_key and target_column.autoincrement:
++            continue
++
++        source_name = spec.target_to_source.get(name, name)
++        if source_name in source.c:
++            target_columns.append(target_column)
++            source_columns.append(source.c[source_name])
++            continue
++
++        has_default = (
++            target_column.default is not None
++            or target_column.server_default is not None
++        )
++        if target_column.nullable or has_default:
++            continue
++
++        raise RuntimeError(
++            f"Archive contract {spec.name}: target column {name!r} has no "
++            "source mapping or database default"
++        )
++
++    if not target_columns:
++        raise RuntimeError(f"Archive contract {spec.name}: no insertable columns")
++    return target_columns, source_columns
++
++
++def archive_rows(spec: ArchiveSpec) -> ArchiveResult:
++    """Archive every source row and verify source/history identity coverage.
++
++    MySQL ``INSERT IGNORE`` makes a rerun idempotent when the history table has
++    the corresponding unique identity. Verification occurs before commit in
++    the same database session.
++    """
++
++    if spec.verification_condition is None:
++        raise RuntimeError(
++            f"Archive contract {spec.name}: verification condition required"
++        )
++
++    source = spec.source_model.__table__
++    target = spec.history_model.__table__
++    target_columns, source_columns = archive_columns(spec)
++
++    with get_trades_db() as db:
++        source_rows = int(
++            db.execute(select(func.count()).select_from(source)).scalar_one()
++        )
++        if source_rows == 0:
++            return ArchiveResult(spec.name, 0, 0, 0)
++
++        statement = (
++            insert(target)
++            .prefix_with("IGNORE")
++            .from_select(
++                target_columns,
++                select(*source_columns).select_from(source),
++            )
++        )
++        result = db.execute(statement)
++        inserted_rows = int(result.rowcount or 0)
++
++        condition = spec.verification_condition(source, target)
++        verified_rows = int(
++            db.execute(
++                select(func.count()).select_from(source.join(target, condition))
++            ).scalar_one()
++        )
++        if verified_rows != source_rows:
++            db.rollback()
++            raise RuntimeError(
++                f"Archive verification failed for {spec.name}: "
++                f"source={source_rows} verified={verified_rows}"
++            )
++        db.commit()
++
++    return ArchiveResult(
++        name=spec.name,
++        source_rows=source_rows,
++        inserted_rows=inserted_rows,
++        verified_rows=verified_rows,
++    )
++
++
++__all__ = [
++    "ArchiveResult",
++    "ArchiveSpec",
++    "archive_columns",
++    "archive_rows",
++]
+diff --git a/schemas/signal.py b/schemas/signal.py
+index 3d32fb9..1e998cc 100644
+--- a/schemas/signal.py
++++ b/schemas/signal.py
+@@ -15,11 +15,14 @@ from decimal import Decimal
+ from typing import Any, Dict, List, Optional
+ 
+ from pydantic import BaseModel, Field, field_validator
+-from sqlalchemy import func, or_
++from sqlalchemy import and_, func, or_
+ 
+ from database.database import get_trades_db
+ from enums.enums import SignalSide, LifecycleStage, SignalStatus
+-from models.trade_models import Signal as SignalORM
++from models.trade_models import (
++    Signal as SignalORM,
++    SignalHistory as SignalHistoryORM,
++)
+ from utils.json_utils import sanitize_json
+ from utils.datetime_utils import IST
+ 
+@@ -1258,4 +1261,24 @@ class SignalSchema(BaseModel):
+             min_pnl=min_pnl,
+             max_pnl_value=max_pnl_value,
+             min_pnl_value=min_pnl_value,
+-        )
+\ No newline at end of file
++        )
++
++    @staticmethod
++    def archive_current_rows():
++        """Archive all current signals and verify their history identity."""
++        from schemas.archive import ArchiveSpec, archive_rows
++
++        return archive_rows(
++            ArchiveSpec(
++                name="signals",
++                source_model=SignalORM,
++                history_model=SignalHistoryORM,
++                excluded_target_columns=frozenset(
++                    {"hist_id", "archived_on", "trading_date"}
++                ),
++                verification_condition=lambda source, target: and_(
++                    target.c.id == source.c.id,
++                    target.c.trading_date == func.date(source.c.last_eval_time),
++                ),
++            )
++        )
+diff --git a/schemas/stock_rank.py b/schemas/stock_rank.py
+index 3e0f0c6..8620752 100644
+--- a/schemas/stock_rank.py
++++ b/schemas/stock_rank.py
+@@ -5,9 +5,13 @@ from datetime import date, datetime
+ from typing import Any, Dict, Iterable, List, Literal, Optional
+ 
+ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
++from sqlalchemy import and_
+ 
+ from database.database import get_trades_db
+-from models.trade_models import StockRank as StockRankORM
++from models.trade_models import (
++    StockRank as StockRankORM,
++    StockRankHistory as StockRankHistoryORM,
++)
+ from utils.json_utils import sanitize_json
+ 
+ 
+@@ -202,4 +206,27 @@ class StockRankSchema(BaseModel):
+         return row
+ 
+ 
++    @staticmethod
++    def archive_current_rows():
++        """Archive all current ranks and verify symbol/cadence identity."""
++        from schemas.archive import ArchiveSpec, archive_rows
++
++        return archive_rows(
++            ArchiveSpec(
++                name="stock_rank",
++                source_model=StockRankORM,
++                history_model=StockRankHistoryORM,
++                target_to_source={"stock_rank_id": "id"},
++                excluded_target_columns=frozenset(
++                    {"history_id", "archived_on"}
++                ),
++                verification_condition=lambda source, target: and_(
++                    target.c.symbol == source.c.symbol,
++                    target.c.rank_time == source.c.rank_time,
++                ),
++            )
++        )
++
++
++
+ __all__ = ["StockRankSchema"]
+diff --git a/schemas/user_trade.py b/schemas/user_trade.py
+index 6a023b3..fbe02ef 100644
+--- a/schemas/user_trade.py
++++ b/schemas/user_trade.py
+@@ -19,11 +19,14 @@ from decimal import Decimal
+ from typing import Optional, List, Dict, Any, Literal, Set
+ 
+ from pydantic import BaseModel, Field
+-from sqlalchemy import bindparam, text, or_
++from sqlalchemy import and_, bindparam, func, text, or_
+ from sqlalchemy.exc import IntegrityError
+ 
+ from database.database import get_trades_db
+-from models.trade_models import UserTrade as UserTradeORM
++from models.trade_models import (
++    UserTrade as UserTradeORM,
++    UserTradeHistory as UserTradeHistoryORM,
++)
+ 
+ from utils.json_utils import sanitize_json
+ from utils.datetime_utils import IST
+@@ -1216,4 +1219,24 @@ class UserTradeSchema(BaseModel):
+                 "setup": r.get("setup"),
+             })
+ 
+-        return out
+\ No newline at end of file
++        return out
++
++    @staticmethod
++    def archive_current_rows():
++        """Archive all current trades and verify their history identity."""
++        from schemas.archive import ArchiveSpec, archive_rows
++
++        return archive_rows(
++            ArchiveSpec(
++                name="user_trades",
++                source_model=UserTradeORM,
++                history_model=UserTradeHistoryORM,
++                excluded_target_columns=frozenset(
++                    {"hist_id", "archived_on", "trading_date"}
++                ),
++                verification_condition=lambda source, target: and_(
++                    target.c.id == source.c.id,
++                    target.c.trading_date == func.date(source.c.entry_time),
++                ),
++            )
++        )
+diff --git a/scripts/init_intraday_reset.py b/scripts/init_intraday_reset.py
+deleted file mode 100644
+index d839c85..0000000
+--- a/scripts/init_intraday_reset.py
++++ /dev/null
+@@ -1,512 +0,0 @@
+-#!/usr/bin/env python3
+-"""
+-Init-day intraday reset (consistent logging like other runners)
+-
+-- Archive signals & user_trades to *_history (optional)
+-- Truncate intraday tables (stock_opportunities, signals, user_trades, snapshots, candles, derivativeschain)
+-- Reset daily EQ selection flags (enabled remains the monthly universe gate)
+-- Activate configured universe.whitelist symbols for the daily snapshot universe
+-- Reset user logins (logged_in=0, logged_time=NULL)
+-
+-Config: SERVICE_CONFIG.init_reset
+-All reset behavior and table scope are explicitly defined by InitResetConfig.
+-"""
+-
+-import os
+-import sys
+-import logging
+-from datetime import datetime
+-from zoneinfo import ZoneInfo
+-
+-# Project root on PYTHONPATH
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+-
+-from sqlalchemy import text, inspect as sqla_inspect
+-
+-from logconfig import setup_logging
+-from configs.service_config import SERVICE_CONFIG
+-from utils.universe_policy import universe_whitelist
+-from database.database import get_trades_db
+-
+-# centralized day gate (holidays/weekends/whitelist/blackout)
+-from utils.run_control import allow_run_today
+-
+-# ORM models (import ensures tables are mapped)
+-from models.trade_models import (
+-    Base,
+-    Signal,
+-    UserTrade,
+-    Snapshot,
+-    Candle,
+-    DerivativesChain,
+-    User as UserORM,
+-    AuditLog,
+-    AuditLogHistory,
+-)
+-from schemas.symbol import SymbolSchema
+-
+-# ---------------------------
+-# Config
+-# ---------------------------
+-TZ = SERVICE_CONFIG.tz
+-IST = ZoneInfo(TZ)
+-
+-CONF = SERVICE_CONFIG.init_reset
+-
+-LOG_FILE = CONF.log_file
+-ARCHIVE_BEFORE_TRUNCATE = bool(CONF.archive_before_truncate)
+-RESET_EQ_FLAGS = bool(CONF.reset_eq_flags)
+-RESET_USER_LOGS = bool(CONF.reset_user_logins)
+-ARCHIVE_AUDITLOG = bool(CONF.archive_auditlog)
+-AUTOLOGIN_VIRTUAL_USERS = list(CONF.virtual_autologin_userids)
+-INTRADAY_TABLES = frozenset(CONF.intraday_tables)
+-
+-logger: logging.Logger | None = None
+-
+-
+-# ---------------------------
+-# Helpers to discover DB/engine per mapped model
+-# ---------------------------
+-def _engine_db_for_model(session, model):
+-    """Return (engine, db_name, Table) for a mapped ORM model via this session."""
+-    mapper = sqla_inspect(model)
+-    engine = session.get_bind(mapper=mapper)
+-    if engine is None or not engine.url.database:
+-        raise RuntimeError(f"Could not resolve database for model {model.__name__}")
+-    db_name = engine.url.database
+-    table = mapper.local_table
+-    return engine, db_name, table
+-
+-
+-def _select_intraday_tables(session):
+-    """Pick only the intraday tables explicitly declared in InitResetConfig."""
+-    selected = []  # list of (engine, db_name, table_name, fq_name)
+-
+-    for mapper in Base.registry.mappers:
+-        table = mapper.local_table
+-        if table.name not in INTRADAY_TABLES:
+-            continue
+-
+-        model_cls = mapper.class_
+-        engine, db_name, _ = _engine_db_for_model(session, model_cls)
+-        fq = f"`{db_name}`.`{table.name}`"
+-        selected.append((engine, db_name, table.name, fq))
+-
+-    grouped = {}
+-    for eng, dbname, tname, fq in selected:
+-        grouped.setdefault((id(eng), eng, dbname), []).append((tname, fq))
+-    return grouped
+-
+-# ---------------------------
+-# Archiving before truncate
+-# ---------------------------
+-def archive_intraday_data():
+-    signals_sql = text(
+-        """
+-        INSERT IGNORE INTO signals_history (
+-          id,
+-          signal_id,
+-          equity_ref,
+-          symbol,
+-          lifecycle,
+-          setup,
+-          side,
+-          stage,
+-          status,
+-          status_reason,
+-          first_seen_time,
+-          created_price,
+-          last_eval_time,
+-          last_snapshot_time,
+-          stage_changed_time,
+-          status_changed_time,
+-          qualified_time,
+-          actionable_time,
+-          closed_time,
+-          closed_price,
+-          last_price,
+-          ltp,
+-          ltp_time,
+-          last_pnl,
+-          last_pnl_value,
+-          max_price,
+-          min_price,
+-          max_time,
+-          min_time,
+-          max_pnl,
+-          min_pnl,
+-          max_pnl_value,
+-          min_pnl_value,
+-          criteria_json,
+-          snapshot_json,
+-          meta_json
+-        )
+-        SELECT
+-          id,
+-          signal_id,
+-          equity_ref,
+-          symbol,
+-          lifecycle,
+-          setup,
+-          side,
+-          stage,
+-          status,
+-          status_reason,
+-          first_seen_time,
+-          created_price,
+-          last_eval_time,
+-          last_snapshot_time,
+-          stage_changed_time,
+-          status_changed_time,
+-          qualified_time,
+-          actionable_time,
+-          closed_time,
+-          closed_price,
+-          last_price,
+-          ltp,
+-          ltp_time,
+-          last_pnl,
+-          last_pnl_value,
+-          max_price,
+-          min_price,
+-          max_time,
+-          min_time,
+-          max_pnl,
+-          min_pnl,
+-          max_pnl_value,
+-          min_pnl_value,
+-          criteria_json,
+-          snapshot_json,
+-          meta_json
+-        FROM signals
+-        """
+-    )
+-
+-    user_trades_sql = text(
+-        """
+-        INSERT IGNORE INTO user_trades_history (
+-        id,
+-        userid,
+-        signal_id,
+-        source,
+-        message,
+-        entry_snapshot,
+-        last_snapshot,
+-        symbol,
+-        equity_ref,
+-        instrument_type,
+-        trade_type,
+-        position_style,
+-        hedged_symbol,
+-        entry_status,
+-        exit_status,
+-        execution_mode,
+-        intraday_only,
+-        entry_time,
+-        entry_intent_time,
+-        entry_exec_time,
+-        entry_reconciled_at,
+-        entry_price,
+-        executed_entry_price,
+-        executed_entry_qty,
+-        quantity,
+-        entry_order_id,
+-        entry_order_response_json,
+-        entry_retries,
+-
+-        trade_management,
+-
+-        exit_reason,
+-        exit_rule,
+-        exit_time,
+-        exit_intent_time,
+-        exit_exec_time,
+-        exit_reconciled_at,
+-        exit_price,
+-        executed_exit_price,
+-        executed_exit_qty,
+-        exit_order_id,
+-        exit_order_response_json,
+-        exit_retries,
+-        exit_pnl,
+-        last_time,
+-        last_price,
+-        last_pnl,
+-        last_pnl_value,
+-        max_price,
+-        min_price,
+-        max_time,
+-        min_time,
+-        exec_last_checked_at,
+-        exec_status,
+-        exec_status_message,
+-        reconcile_last_checked_at,
+-        reconcile_status,
+-        reconcile_status_message
+-        )
+-        SELECT
+-        id,
+-        userid,
+-        signal_id,
+-        source,
+-        message,
+-        entry_snapshot,
+-        last_snapshot,
+-        symbol,
+-        equity_ref,
+-        instrument_type,
+-        trade_type,
+-        position_style,
+-        hedged_symbol,
+-        entry_status,
+-        exit_status,
+-        execution_mode,
+-        intraday_only,
+-        entry_time,
+-        entry_intent_time,
+-        entry_exec_time,
+-        entry_reconciled_at,
+-        entry_price,
+-        executed_entry_price,
+-        executed_entry_qty,
+-        quantity,
+-        entry_order_id,
+-        entry_order_response_json,
+-        entry_retries,
+-
+-        trade_management,
+-
+-        exit_reason,
+-        exit_rule,
+-        exit_time,
+-        exit_intent_time,
+-        exit_exec_time,
+-        exit_reconciled_at,
+-        exit_price,
+-        executed_exit_price,
+-        executed_exit_qty,
+-        exit_order_id,
+-        exit_order_response_json,
+-        exit_retries,
+-        exit_pnl,
+-        last_time,
+-        last_price,
+-        last_pnl,
+-        last_pnl_value,
+-        max_price,
+-        min_price,
+-        max_time,
+-        min_time,
+-        exec_last_checked_at,
+-        exec_status,
+-        exec_status_message,
+-        reconcile_last_checked_at,
+-        reconcile_status,
+-        reconcile_status_message
+-        FROM user_trades
+-        """
+-    )
+-    with get_trades_db() as db:
+-        engine, dbname, _ = _engine_db_for_model(db, Signal)
+-        logger.info("Archiving into %s.signals_history ...", dbname)
+-        with engine.begin() as conn:
+-            res1 = conn.execute(signals_sql)
+-        logger.info("Archived signals rows inserted: %s", getattr(res1, "rowcount", "unknown"))
+-
+-        engine, dbname, _ = _engine_db_for_model(db, UserTrade)
+-        logger.info("Archiving into %s.user_trades_history ...", dbname)
+-        with engine.begin() as conn:
+-            res2 = conn.execute(user_trades_sql)
+-        logger.info("Archived user_trades rows inserted: %s", getattr(res2, "rowcount", "unknown"))
+-
+-# ---------------------------
+-# Auditlog archive before truncate
+-# ---------------------------
+-def archive_auditlog_data():
+-    """Archive auditlog rows to auditlog_history before auditlog is truncated."""
+-    auditlog_sql = text(
+-        """
+-        INSERT INTO auditlog_history (
+-          auditlog_id,
+-          ts,
+-          entity_type,
+-          entity_id,
+-          symbol,
+-          userid,
+-          evaluation_stage,
+-          previous_state,
+-          new_state,
+-          action,
+-          reason_code,
+-          reason_text,
+-          confidence,
+-          payload_json
+-        )
+-        SELECT
+-          id,
+-          ts,
+-          entity_type,
+-          entity_id,
+-          symbol,
+-          userid,
+-          evaluation_stage,
+-          previous_state,
+-          new_state,
+-          action,
+-          reason_code,
+-          reason_text,
+-          confidence,
+-          payload_json
+-        FROM auditlog
+-        """
+-    )
+-
+-    with get_trades_db() as db:
+-        engine, dbname, _ = _engine_db_for_model(db, AuditLog)
+-        logger.info("Archiving into %s.auditlog_history ...", dbname)
+-        with engine.begin() as conn:
+-            res = conn.execute(auditlog_sql)
+-        logger.info("Archived auditlog rows inserted: %s", getattr(res, "rowcount", "unknown"))
+-
+-
+-# ---------------------------
+-# Truncation
+-# ---------------------------
+-def truncate_intraday_tables():
+-    with get_trades_db() as db:
+-        grouped = _select_intraday_tables(db)
+-        for (_key, engine, dbname), items in grouped.items():
+-            fq_list = [fq for (_t, fq) in items]
+-            logger.info("Truncating (%s): %s", dbname, ", ".join(fq_list))
+-            with engine.begin() as conn:
+-                conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+-                for (_tname, fq) in items:
+-                    conn.execute(text(f"TRUNCATE TABLE {fq}"))
+-                conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+-    logger.info("Truncate completed.")
+-
+-
+-# ---------------------------
+-# Daily stock-selection reset
+-# ---------------------------
+-def reset_eq_processing_flags() -> int:
+-    whitelist_symbols = sorted(universe_whitelist())
+-    result = SymbolSchema.reset_daily_selection_flags(
+-        whitelist_symbols=whitelist_symbols,
+-        type_filter="EQ",
+-    )
+-    logger.info(
+-        "Reset daily selection flags | reset=%d whitelist_active=%d",
+-        int(result["reset_count"]),
+-        int(result["whitelist_active_count"]),
+-    )
+-    return int(result["reset_count"])
+-
+-
+-# ---------------------------
+-# User login reset
+-# ---------------------------
+-def reset_all_user_logins() -> int:
+-    with get_trades_db() as db:
+-        count = (
+-            db.query(UserORM)
+-            .update(
+-                {
+-                    "logged_in": 0,
+-                    "logged_time": None,
+-                },
+-                synchronize_session=False,
+-            )
+-        )
+-        db.commit()
+-        logger.info("Reset logged_in/logged_time for users: %d", int(count or 0))
+-        return int(count or 0)
+-
+-
+-# ---------------------------
+-# Virtual auto-login baseline user(s)
+-# ---------------------------
+-def enable_virtual_autologin_users() -> int:
+-    """
+-    Ensure configured virtual users are active/logged-in for the day.
+-
+-    This is intended for intraday virtual/autotrade testing so that trade
+-    records are generated even when no real user is actively logged in.
+-    """
+-    if not AUTOLOGIN_VIRTUAL_USERS:
+-        logger.info("No virtual_autologin_userids configured")
+-        return 0
+-
+-    now = datetime.now(IST).replace(tzinfo=None, microsecond=0)
+-    updated = 0
+-
+-    with get_trades_db() as db:
+-        for userid in AUTOLOGIN_VIRTUAL_USERS:
+-            user = db.query(UserORM).filter(UserORM.userid == userid).first()
+-            if not user:
+-                logger.warning("Virtual autologin user not found: %s", userid)
+-                continue
+-
+-            user.logged_in = True
+-            user.logged_time = now
+-            user.autotrade = True
+-            user.execution_mode = "VIRTUAL"
+-            user.broker_login = True
+-            user.intraday_only = True
+-            user.active = True
+-            updated += 1
+-
+-        db.commit()
+-
+-    logger.info("Enabled virtual autologin users: %d (%s)", updated, ", ".join(AUTOLOGIN_VIRTUAL_USERS))
+-    return updated
+-
+-
+-# ---------------------------
+-# Entry point
+-# ---------------------------
+-def main():
+-    global logger
+-    setup_logging(log_file=LOG_FILE)
+-    logger = logging.getLogger(__name__)
+-
+-    # global day gate
+-    if not allow_run_today(logger, "init_reset"):
+-        return
+-
+-    logger.info(
+-        "=== init_intraday_reset starting | tz=%s | archive=%s | archive_auditlog=%s | reset_eq=%s | reset_user=%s | virtual_users=%s ===",
+-        TZ, ARCHIVE_BEFORE_TRUNCATE, ARCHIVE_AUDITLOG, RESET_EQ_FLAGS, RESET_USER_LOGS, AUTOLOGIN_VIRTUAL_USERS,
+-    )
+-    reset_now = datetime.now(IST)
+-    logger.info("init_intraday_reset @ %s", reset_now.isoformat())
+-
+-    try:
+-        if ARCHIVE_BEFORE_TRUNCATE:
+-            try:
+-                archive_intraday_data()
+-                if ARCHIVE_AUDITLOG:
+-                    archive_auditlog_data()
+-            except Exception:
+-                logger.exception("Archiving failed (signals/user_trades/auditlog). Aborting reset to avoid data loss.")
+-                sys.exit(1)
+-
+-        truncate_intraday_tables()
+-
+-        if RESET_EQ_FLAGS:
+-            reset_eq_processing_flags()
+-
+-        if RESET_USER_LOGS:
+-            reset_all_user_logins()
+-
+-        enable_virtual_autologin_users()
+-
+-    except Exception:
+-        logger.exception("init_intraday_reset failed.")
+-        sys.exit(1)
+-
+-    logger.info("=== init_intraday_reset done ===")
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/prepare_day.py b/scripts/prepare_day.py
+new file mode 100755
+index 0000000..84ff6ed
+--- /dev/null
++++ b/scripts/prepare_day.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++"""One-shot runner for trading-day operational preparation."""
++from __future__ import annotations
++
++import argparse
++import json
++import logging
++import os
++import sys
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from configs.service_config import SERVICE_CONFIG
++from logconfig import setup_logging
++from services.operations.day_prep import DayPrepService
++from utils.run_control import allow_run_today
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        description="Archive durable intraday rows and prepare the next trading day."
++    )
++    parser.add_argument(
++        "--force",
++        action="store_true",
++        help="Bypass the trading-day gate for controlled testing or recovery.",
++    )
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = _parser().parse_args(argv)
++    setup_logging(log_file=SERVICE_CONFIG.day_prep.log_file)
++    logger = logging.getLogger(__name__)
++
++    if not args.force and not allow_run_today(logger, "day_prep"):
++        return 0
++
++    try:
++        summary = DayPrepService().prepare()
++    except Exception:
++        logger.exception("DAY_PREP_FAILED")
++        return 1
++
++    print(json.dumps(summary, sort_keys=True, default=str))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/services/operations/__init__.py b/services/operations/__init__.py
+new file mode 100644
+index 0000000..bd05a08
+--- /dev/null
++++ b/services/operations/__init__.py
+@@ -0,0 +1 @@
++"""One-shot operational services."""
+diff --git a/services/operations/day_prep.py b/services/operations/day_prep.py
+new file mode 100644
+index 0000000..a605c84
+--- /dev/null
++++ b/services/operations/day_prep.py
+@@ -0,0 +1,339 @@
++"""Prepare AutoTrades operational state for a new trading day."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++import logging
++from typing import Any
++from zoneinfo import ZoneInfo
++
++from sqlalchemy import and_, func, inspect, select, text
++
++from configs.service_config import SERVICE_CONFIG
++from database.database import get_trades_db
++from enums.enums import EntryStatus, ExitStatus
++from models.trade_models import (
++    AuditLog,
++    AuditLogHistory,
++    Candle,
++    DerivativesChain,
++    Signal,
++    SignalHistory,
++    Snapshot,
++    StockOpportunity,
++    StockRank,
++    StockRankHistory,
++    User,
++    UserFunds,
++    UserOrders,
++    UserPositions,
++    UserTrade,
++    UserTradeHistory,
++)
++from schemas.archive import ArchiveResult, ArchiveSpec, archive_rows
++from schemas.signal import SignalSchema
++from schemas.stock_rank import StockRankSchema
++from schemas.user_trade import UserTradeSchema
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class ClearResult:
++    table: str
++    rows_before: int
++    rows_after: int
++
++    def as_dict(self) -> dict[str, int | str]:
++        return {
++            "table": self.table,
++            "rows_before": self.rows_before,
++            "rows_after": self.rows_after,
++        }
++
++
++class DayPrepService:
++    """Archive durable rows, clear working state and prepare users.
++
++    Symbol membership and generation flags are deliberately outside this
++    service. They are owned by the verified universe operations.
++    """
++
++    def __init__(self, config=None):
++        self.config = config or SERVICE_CONFIG.day_prep
++        self.tz = ZoneInfo(SERVICE_CONFIG.tz)
++
++    @staticmethod
++    def _audit_archive_spec() -> ArchiveSpec:
++        return ArchiveSpec(
++            name="auditlog",
++            source_model=AuditLog,
++            history_model=AuditLogHistory,
++            target_to_source={"auditlog_id": "id"},
++            excluded_target_columns=frozenset({"history_id"}),
++            verification_condition=lambda source, target: and_(
++                target.c.auditlog_id == source.c.id,
++                target.c.ts == source.c.ts,
++            ),
++        )
++
++    def _required_models(self) -> tuple[type, ...]:
++        models: list[type] = [
++            Signal,
++            SignalHistory,
++            UserTrade,
++            UserTradeHistory,
++            StockRank,
++            StockRankHistory,
++            StockOpportunity,
++            Snapshot,
++            Candle,
++            DerivativesChain,
++            AuditLog,
++            User,
++        ]
++        if self.config.archive_auditlog:
++            models.append(AuditLogHistory)
++        if self.config.clear_oms_current_state:
++            models.extend([UserFunds, UserPositions, UserOrders])
++        return tuple(models)
++
++    def _verify_tables_exist(self) -> None:
++        with get_trades_db() as db:
++            db_inspector = inspect(db.get_bind())
++            missing = sorted(
++                {
++                    model.__table__.name
++                    for model in self._required_models()
++                    if not db_inspector.has_table(model.__table__.name)
++                }
++            )
++        if missing:
++            raise RuntimeError(f"Day Prep required tables missing: {missing}")
++
++    @staticmethod
++    def _is_terminal_trade(entry_status: str, exit_status: str) -> bool:
++        terminal_without_position = {
++            EntryStatus.EXPIRED.value,
++            EntryStatus.CANCELLED.value,
++            EntryStatus.REJECTED.value,
++            EntryStatus.INVALID.value,
++        }
++        if entry_status in terminal_without_position:
++            return True
++        return (
++            entry_status == EntryStatus.FILLED.value
++            and exit_status == ExitStatus.FILLED.value
++        )
++
++    def _unresolved_trade_rows(self) -> list[dict[str, Any]]:
++        with get_trades_db() as db:
++            rows = (
++                db.query(
++                    UserTrade.id,
++                    UserTrade.userid,
++                    UserTrade.symbol,
++                    UserTrade.entry_status,
++                    UserTrade.exit_status,
++                )
++                .order_by(UserTrade.id.asc())
++                .all()
++            )
++
++        unresolved = []
++        for row in rows:
++            entry_status = str(row.entry_status or "").upper()
++            exit_status = str(row.exit_status or ExitStatus.NONE.value).upper()
++            if self._is_terminal_trade(entry_status, exit_status):
++                continue
++            unresolved.append(
++                {
++                    "id": int(row.id),
++                    "userid": row.userid,
++                    "symbol": row.symbol,
++                    "entry_status": entry_status,
++                    "exit_status": exit_status,
++                }
++            )
++        return unresolved
++
++    @staticmethod
++    def _opportunity_state_counts() -> dict[str, int]:
++        with get_trades_db() as db:
++            rows = (
++                db.query(
++                    StockOpportunity.lifecycle_state,
++                    func.count(StockOpportunity.id),
++                )
++                .group_by(StockOpportunity.lifecycle_state)
++                .order_by(StockOpportunity.lifecycle_state.asc())
++                .all()
++            )
++        return {str(state): int(count) for state, count in rows}
++
++    @staticmethod
++    def _clear_model(model: type) -> ClearResult:
++        table_name = model.__table__.name
++        with get_trades_db() as db:
++            rows_before = int(
++                db.execute(
++                    select(func.count()).select_from(model.__table__)
++                ).scalar_one()
++            )
++            db.execute(text(f"TRUNCATE TABLE `{table_name}`"))
++            db.commit()
++            rows_after = int(
++                db.execute(
++                    select(func.count()).select_from(model.__table__)
++                ).scalar_one()
++            )
++        if rows_after != 0:
++            raise RuntimeError(
++                f"Day Prep failed to clear {table_name}: rows_after={rows_after}"
++            )
++        return ClearResult(table_name, rows_before, rows_after)
++
++    def _clear_models(self) -> tuple[type, ...]:
++        models: list[type] = [
++            UserTrade,
++            Signal,
++            StockRank,
++            StockOpportunity,
++            Snapshot,
++            Candle,
++            DerivativesChain,
++            AuditLog,
++        ]
++        if self.config.clear_oms_current_state:
++            models.extend([UserFunds, UserPositions, UserOrders])
++        return tuple(models)
++
++    @staticmethod
++    def _reset_user_logins() -> int:
++        with get_trades_db() as db:
++            count = db.query(User).update(
++                {"logged_in": False, "logged_time": None},
++                synchronize_session=False,
++            )
++            db.commit()
++        return int(count or 0)
++
++    def _enable_virtual_users(self) -> tuple[int, list[str]]:
++        requested = [
++            str(userid).strip()
++            for userid in self.config.virtual_autologin_userids
++            if str(userid).strip()
++        ]
++        if not requested:
++            return 0, []
++
++        now = datetime.now(self.tz).replace(tzinfo=None, microsecond=0)
++        enabled = 0
++        missing: list[str] = []
++        with get_trades_db() as db:
++            for userid in requested:
++                user = db.query(User).filter(User.userid == userid).one_or_none()
++                if user is None:
++                    missing.append(userid)
++                    continue
++                user.logged_in = True
++                user.logged_time = now
++                user.autotrade = True
++                user.execution_mode = "VIRTUAL"
++                user.broker_login = True
++                user.intraday_only = True
++                user.active = True
++                enabled += 1
++            db.commit()
++        return enabled, missing
++
++    def _archive_rows(self) -> dict[str, dict[str, Any]]:
++        results: list[ArchiveResult] = [
++            SignalSchema.archive_current_rows(),
++            UserTradeSchema.archive_current_rows(),
++            StockRankSchema.archive_current_rows(),
++        ]
++        if self.config.archive_auditlog:
++            results.append(archive_rows(self._audit_archive_spec()))
++
++        archives: dict[str, dict[str, Any]] = {}
++        for result in results:
++            archives[result.name] = result.as_dict()
++            logger.info("DAY_PREP_ARCHIVE | %s", result.as_dict())
++        return archives
++
++    def prepare(self) -> dict[str, Any]:
++        started_at = datetime.now(self.tz)
++        logger.info(
++            "DAY_PREP_START | archive_auditlog=%s | clear_oms=%s | "
++            "strict_unresolved_trades=%s | virtual_users=%s",
++            bool(self.config.archive_auditlog),
++            bool(self.config.clear_oms_current_state),
++            bool(self.config.strict_unresolved_trade_check),
++            list(self.config.virtual_autologin_userids),
++        )
++
++        self._verify_tables_exist()
++        unresolved = self._unresolved_trade_rows()
++        if unresolved and self.config.strict_unresolved_trade_check:
++            raise RuntimeError(
++                "Day Prep blocked by unresolved trades: "
++                f"count={len(unresolved)} sample={unresolved[:20]}"
++            )
++        if unresolved:
++            logger.warning(
++                "DAY_PREP_UNRESOLVED_TRADES | count=%d | rows=%s",
++                len(unresolved),
++                unresolved[:20],
++            )
++
++        opportunity_states = self._opportunity_state_counts()
++        logger.info(
++            "DAY_PREP_OPPORTUNITIES | rows=%d | states=%s",
++            sum(opportunity_states.values()),
++            opportunity_states,
++        )
++
++        # All mandatory archives must verify before any current table is cleared.
++        archives = self._archive_rows()
++
++        cleared: dict[str, dict[str, Any]] = {}
++        for model in self._clear_models():
++            result = self._clear_model(model)
++            cleared[result.table] = result.as_dict()
++            logger.info("DAY_PREP_CLEAR | %s", result.as_dict())
++
++        users_reset = (
++            self._reset_user_logins() if self.config.reset_user_logins else 0
++        )
++        virtual_users_enabled, missing_virtual_users = self._enable_virtual_users()
++        logger.info(
++            "DAY_PREP_USERS | reset=%d | virtual_enabled=%d | missing=%s",
++            users_reset,
++            virtual_users_enabled,
++            missing_virtual_users,
++        )
++
++        finished_at = datetime.now(self.tz)
++        summary = {
++            "success": True,
++            "started_at": started_at.isoformat(),
++            "finished_at": finished_at.isoformat(),
++            "duration_seconds": round(
++                (finished_at - started_at).total_seconds(), 3
++            ),
++            "archives": archives,
++            "auditlog_archive_enabled": bool(self.config.archive_auditlog),
++            "cleared": cleared,
++            "stock_opportunity_states_before_clear": opportunity_states,
++            "unresolved_trade_count": len(unresolved),
++            "unresolved_trades": unresolved,
++            "users_reset": users_reset,
++            "virtual_users_enabled": virtual_users_enabled,
++            "missing_virtual_users": missing_virtual_users,
++        }
++        logger.info("DAY_PREP_SUMMARY | %s", summary)
++        return summary
++
++
++__all__ = ["ClearResult", "DayPrepService"]
+diff --git a/t_prepare_day.service b/t_prepare_day.service
+new file mode 100644
+index 0000000..aaad454
+--- /dev/null
++++ b/t_prepare_day.service
+@@ -0,0 +1,14 @@
++[Unit]
++Description=autotrades Day Prep
++After=network.target
++
++[Service]
++Type=oneshot
++User=autotrades
++Group=www-data
++UMask=0002
++WorkingDirectory=/var/www/autotrades
++ExecStart=/var/www/autotrades/venv/bin/python /var/www/autotrades/scripts/prepare_day.py
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/tests/unit/test_database_schema_contracts.py b/tests/unit/test_database_schema_contracts.py
+index 5599828..b0fbdf3 100644
+--- a/tests/unit/test_database_schema_contracts.py
++++ b/tests/unit/test_database_schema_contracts.py
+@@ -5,6 +5,7 @@ from sqlalchemy import BigInteger, Date, Numeric, UniqueConstraint
+ 
+ from models.trade_models import (
+     Alert,
++    AuditLogHistory,
+     Base,
+     Candle,
+     DerivativesChain,
+@@ -208,6 +209,13 @@ def test_user_trade_history_has_generated_day_and_archive_defaults() -> None:
+     assert UserTradeHistory.__table__.c.trading_date.computed is not None
+ 
+ 
++
++def test_user_access_token_and_optional_audit_archive_identity() -> None:
++    assert User.__table__.c.access_token.type.length == 255
++    audit_unique = _unique_columns(AuditLogHistory)
++    assert ("auditlog_id", "ts") in audit_unique
++
++
+ def test_alignment_migration_contains_all_critical_table_repairs() -> None:
+     sql = MIGRATION.read_text(encoding="utf-8")
+     for fragment in (
+diff --git a/tests/unit/test_day_prep.py b/tests/unit/test_day_prep.py
+new file mode 100644
+index 0000000..f0b9f65
+--- /dev/null
++++ b/tests/unit/test_day_prep.py
+@@ -0,0 +1,228 @@
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from sqlalchemy import UniqueConstraint
++
++import schemas.archive as archive_module
++from configs.service_config import DayPrepConfig, SERVICE_CONFIG
++from enums.enums import EntryStatus, ExitStatus
++from models.trade_models import (
++    AuditLog,
++    AuditLogHistory,
++    Candle,
++    DerivativesChain,
++    Signal,
++    Snapshot,
++    StockOpportunity,
++    StockRank,
++    User,
++    UserFunds,
++    UserOrders,
++    UserPositions,
++    UserTrade,
++)
++from schemas.archive import ArchiveResult, archive_columns
++from schemas.signal import SignalSchema
++from schemas.stock_rank import StockRankSchema
++from schemas.user_trade import UserTradeSchema
++from services.operations.day_prep import ClearResult, DayPrepService
++
++
++ROOT = Path(__file__).resolve().parents[2]
++MIGRATION = ROOT / "database" / "sql" / "20260801_prepare_day_schema.sql"
++
++
++def _capture_archive_spec(monkeypatch, schema_method):
++    monkeypatch.setattr(archive_module, "archive_rows", lambda spec: spec)
++    return schema_method()
++
++
++def test_day_prep_config_is_explicit_and_audit_archive_is_off() -> None:
++    config = DayPrepConfig()
++    assert config.archive_auditlog is False
++    assert config.reset_user_logins is True
++    assert config.clear_oms_current_state is True
++    assert config.strict_unresolved_trade_check is True
++    assert SERVICE_CONFIG.day_prep.log_file.endswith("prepare_day.log")
++    assert not hasattr(SERVICE_CONFIG, "init_reset")
++
++
++def test_day_prep_never_owns_symbol_state() -> None:
++    service = DayPrepService(DayPrepConfig())
++    required = {model.__table__.name for model in service._required_models()}
++    cleared = {model.__table__.name for model in service._clear_models()}
++
++    assert "symbols" not in required
++    assert "symbols" not in cleared
++    assert cleared == {
++        "user_trades",
++        "signals",
++        "stock_rank",
++        "stock_opportunities",
++        "snapshots",
++        "candles",
++        "derivativeschain",
++        "auditlog",
++        "oms_funds",
++        "oms_positions",
++        "oms_orders",
++    }
++    assert not {
++        "signals_history",
++        "user_trades_history",
++        "stock_rank_history",
++        "auditlog_history",
++        "oms_funds_history",
++        "oms_positions_history",
++        "oms_orders_history",
++    } & cleared
++
++
++def test_archive_specs_derive_complete_matching_payloads(monkeypatch) -> None:
++    specs = (
++        _capture_archive_spec(monkeypatch, SignalSchema.archive_current_rows),
++        _capture_archive_spec(monkeypatch, UserTradeSchema.archive_current_rows),
++        _capture_archive_spec(monkeypatch, StockRankSchema.archive_current_rows),
++    )
++
++    expected = {
++        "signals": (Signal, {"hist_id", "archived_on", "trading_date"}),
++        "user_trades": (UserTrade, {"hist_id", "archived_on", "trading_date"}),
++        "stock_rank": (StockRank, {"history_id", "archived_on"}),
++    }
++
++    for spec in specs:
++        target_columns, source_columns = archive_columns(spec)
++        source_model, excluded = expected[spec.name]
++        assert len(target_columns) == len(source_columns)
++        assert {column.name for column in source_columns} == {
++            column.name for column in source_model.__table__.columns
++        }
++        assert excluded.isdisjoint({column.name for column in target_columns})
++
++    rank_spec = specs[-1]
++    target_columns, source_columns = archive_columns(rank_spec)
++    mapping = dict(zip(
++        (column.name for column in target_columns),
++        (column.name for column in source_columns),
++    ))
++    assert mapping["stock_rank_id"] == "id"
++
++
++def test_audit_archive_is_optional_but_idempotent_when_enabled() -> None:
++    service = DayPrepService(DayPrepConfig(archive_auditlog=True))
++    required = {model.__table__.name for model in service._required_models()}
++    assert "auditlog_history" in required
++
++    unique_columns = {
++        tuple(column.name for column in constraint.columns)
++        for constraint in AuditLogHistory.__table__.constraints
++        if isinstance(constraint, UniqueConstraint)
++    }
++    assert ("auditlog_id", "ts") in unique_columns
++
++
++def test_terminal_trade_contract_is_strict() -> None:
++    is_terminal = DayPrepService._is_terminal_trade
++
++    for status in (
++        EntryStatus.EXPIRED.value,
++        EntryStatus.CANCELLED.value,
++        EntryStatus.REJECTED.value,
++        EntryStatus.INVALID.value,
++    ):
++        assert is_terminal(status, ExitStatus.NONE.value)
++
++    assert is_terminal(EntryStatus.FILLED.value, ExitStatus.FILLED.value)
++    assert not is_terminal(EntryStatus.CREATED.value, ExitStatus.NONE.value)
++    assert not is_terminal(EntryStatus.READY.value, ExitStatus.NONE.value)
++    assert not is_terminal(EntryStatus.SUBMITTED.value, ExitStatus.NONE.value)
++    assert not is_terminal(EntryStatus.FILLED.value, ExitStatus.NONE.value)
++    assert not is_terminal(EntryStatus.FILLED.value, ExitStatus.CANCELLED.value)
++    assert not is_terminal(EntryStatus.FILLED.value, ExitStatus.FAILED.value)
++
++
++def test_prepare_archives_every_durable_table_before_any_clear(monkeypatch) -> None:
++    config = DayPrepConfig(
++        archive_auditlog=False,
++        clear_oms_current_state=False,
++        virtual_autologin_userids=[],
++    )
++    service = DayPrepService(config)
++    events: list[str] = []
++
++    monkeypatch.setattr(service, "_verify_tables_exist", lambda: events.append("preflight"))
++    monkeypatch.setattr(service, "_unresolved_trade_rows", lambda: [])
++    monkeypatch.setattr(service, "_opportunity_state_counts", lambda: {"OBSERVING": 2})
++
++    def archive_all():
++        events.extend(["archive:signals", "archive:user_trades", "archive:stock_rank"])
++        return {
++            name: ArchiveResult(name, 1, 1, 1).as_dict()
++            for name in ("signals", "user_trades", "stock_rank")
++        }
++
++    monkeypatch.setattr(service, "_archive_rows", archive_all)
++    monkeypatch.setattr(service, "_clear_models", lambda: (Signal, StockRank))
++
++    def clear_model(model):
++        events.append(f"clear:{model.__table__.name}")
++        return ClearResult(model.__table__.name, 1, 0)
++
++    monkeypatch.setattr(service, "_clear_model", clear_model)
++    monkeypatch.setattr(service, "_reset_user_logins", lambda: 0)
++    monkeypatch.setattr(service, "_enable_virtual_users", lambda: (0, []))
++
++    summary = service.prepare()
++
++    assert summary["success"] is True
++    first_clear = min(i for i, event in enumerate(events) if event.startswith("clear:"))
++    last_archive = max(i for i, event in enumerate(events) if event.startswith("archive:"))
++    assert last_archive < first_clear
++    assert summary["stock_opportunity_states_before_clear"] == {"OBSERVING": 2}
++
++
++def test_prepare_blocks_before_archive_when_unresolved_trades_exist(monkeypatch) -> None:
++    service = DayPrepService(
++        DayPrepConfig(
++            strict_unresolved_trade_check=True,
++            virtual_autologin_userids=[],
++        )
++    )
++    events: list[str] = []
++    monkeypatch.setattr(service, "_verify_tables_exist", lambda: None)
++    monkeypatch.setattr(
++        service,
++        "_unresolved_trade_rows",
++        lambda: [{"id": 7, "entry_status": "FILLED", "exit_status": "NONE"}],
++    )
++    monkeypatch.setattr(service, "_archive_rows", lambda: events.append("archive"))
++
++    with pytest.raises(RuntimeError, match="unresolved trades"):
++        service.prepare()
++    assert events == []
++
++
++def test_user_access_token_contract_and_day_prep_migration() -> None:
++    access_token = User.__table__.c.access_token
++    assert access_token.type.length == 255
++    assert access_token.nullable is False
++    assert access_token.server_default is not None
++
++    sql = MIGRATION.read_text(encoding="utf-8")
++    assert "VARCHAR(255) NOT NULL DEFAULT ''" in sql
++    assert "uq_auditlog_history_live_ts" in sql
++    assert "auditlog_id, ts" in sql
++
++
++def test_obsolete_initializer_removed_and_prepare_day_runner_exists() -> None:
++    assert not (ROOT / "scripts" / "init_intraday_reset.py").exists()
++    assert (ROOT / "scripts" / "prepare_day.py").exists()
++    unit = ROOT / "t_prepare_day.service"
++    assert unit.exists()
++    unit_text = unit.read_text(encoding="utf-8")
++    assert "Type=oneshot" in unit_text
++    assert "scripts/prepare_day.py" in unit_text

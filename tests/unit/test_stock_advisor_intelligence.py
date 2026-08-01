@@ -17,6 +17,7 @@ from services.signals.stock_advisor import StockAdvisor
 from services.signals.stock_advisor_context import evaluate_deferred_entry_freshness
 from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG
 from tests.unit.test_event_driven_setup_engine import TS, _event_snapshot
+from tests.unit.advisor_context_test_fixtures import StaticAdvisorContextProvider
 
 
 class _StaticHistoryProvider:
@@ -119,6 +120,7 @@ def test_mature_narrow_range_churn_blocks_candidate() -> None:
     decision = StockAdvisor(
         config=config,
         history_provider=_StaticHistoryProvider(snapshots=history),
+        context_provider=StaticAdvisorContextProvider(),
     ).evaluate_authoritative(current, _candidate(current))
 
     assert decision.action is AdvisorAction.BLOCK
@@ -141,7 +143,8 @@ def test_uncleared_major_barrier_watches_candidate() -> None:
     levels = current.levels.model_copy(update={"opening_range": opening_range})
     current = current.model_copy(update={"levels": levels})
     decision = StockAdvisor(
-        history_provider=_StaticHistoryProvider()
+        history_provider=_StaticHistoryProvider(),
+        context_provider=StaticAdvisorContextProvider(),
     ).evaluate_authoritative(current, _candidate(current))
 
     assert decision.action is AdvisorAction.WATCH
@@ -165,7 +168,8 @@ def test_repeated_exhausted_same_episode_deployment_blocks() -> None:
         side="BUY",
     )
     decision = StockAdvisor(
-        history_provider=_StaticHistoryProvider(opportunities=[prior])
+        history_provider=_StaticHistoryProvider(opportunities=[prior]),
+        context_provider=StaticAdvisorContextProvider(),
     ).evaluate_authoritative(current, _candidate(current))
 
     assert decision.action is AdvisorAction.BLOCK

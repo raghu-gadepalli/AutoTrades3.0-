@@ -42,42 +42,29 @@ class EventServiceConfig(BaseModel):
     extras: EventExtrasConfig = Field(default_factory=EventExtrasConfig)
 
 
-class InitResetConfig(BaseModel):
-    log_file: str = "/var/www/autotrades/scripts/init_intraday_reset.log"
+class DayPrepConfig(BaseModel):
+    """One-shot beginning-of-day operational preparation."""
 
-    archive_before_truncate: bool = True
-    archive_auditlog: bool = True
-    reset_eq_flags: bool = True
+    log_file: str = "/var/www/autotrades/scripts/prepare_day.log"
+
+    # Durable records are always archived before current-state tables clear.
+    # Audit history can be large, so it remains optional and is off by default.
+    archive_auditlog: bool = False
+
     reset_user_logins: bool = True
+    clear_oms_current_state: bool = True
+    strict_unresolved_trade_check: bool = True
 
-    virtual_autologin_userids: list[str] = Field(default_factory=lambda: ["ADMIN", "TCQ489"])
-
-    # Explicit reset scope. The reset runner must not infer table ownership or
-    # silently fall back to a hard-coded list when configuration is incomplete.
-    intraday_tables: list[str] = Field(default_factory=lambda: [
-        "user_trades",
-        "stock_opportunities",
-        "signals",
-        "snapshots",
-        "candles",
-        "derivativeschain",
-        "oms_funds_history",
-        "oms_positions_history",
-        "oms_orders_history",
-        "auditlog",
-    ])
-
-    # Retained for compatibility with the existing configuration surface.
-    restart_identity: bool = True
-    use_cascade: bool = False
-    deactivate_types: list[str] = Field(default_factory=lambda: ["FUT", "CE", "PE"])
+    virtual_autologin_userids: list[str] = Field(
+        default_factory=lambda: ["ADMIN", "TCQ489"]
+    )
 
 
 class ServiceConfig(BaseModel):
     tz: str = "Asia/Kolkata"
     run_control: RunControlConfig = Field(default_factory=RunControlConfig)
     event: EventServiceConfig = Field(default_factory=EventServiceConfig)
-    init_reset: InitResetConfig = Field(default_factory=InitResetConfig)
+    day_prep: DayPrepConfig = Field(default_factory=DayPrepConfig)
 
 
 SERVICE_CONFIG = ServiceConfig()

@@ -15,11 +15,14 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from database.database import get_trades_db
 from enums.enums import SignalSide, LifecycleStage, SignalStatus
-from models.trade_models import Signal as SignalORM
+from models.trade_models import (
+    Signal as SignalORM,
+    SignalHistory as SignalHistoryORM,
+)
 from utils.json_utils import sanitize_json
 from utils.datetime_utils import IST
 
@@ -1258,4 +1261,24 @@ class SignalSchema(BaseModel):
             min_pnl=min_pnl,
             max_pnl_value=max_pnl_value,
             min_pnl_value=min_pnl_value,
+        )
+
+    @staticmethod
+    def archive_current_rows():
+        """Archive all current signals and verify their history identity."""
+        from schemas.archive import ArchiveSpec, archive_rows
+
+        return archive_rows(
+            ArchiveSpec(
+                name="signals",
+                source_model=SignalORM,
+                history_model=SignalHistoryORM,
+                excluded_target_columns=frozenset(
+                    {"hist_id", "archived_on", "trading_date"}
+                ),
+                verification_condition=lambda source, target: and_(
+                    target.c.id == source.c.id,
+                    target.c.trading_date == func.date(source.c.last_eval_time),
+                ),
+            )
         )

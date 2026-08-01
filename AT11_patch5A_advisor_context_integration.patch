@@ -1,0 +1,1117 @@
+diff --git a/configs/stock_advisor_config.py b/configs/stock_advisor_config.py
+index 766c772..1af3348 100644
+--- a/configs/stock_advisor_config.py
++++ b/configs/stock_advisor_config.py
+@@ -19,6 +19,22 @@ STRICT_CONFIG = ConfigDict(
+ )
+ 
+ AdvisorRuleAction = Literal["ALLOW", "WATCH", "BLOCK"]
++AdvisorContextInfluence = Literal["NONE", "DIAGNOSTIC", "WEIGHTED"]
++
++
++class StockRankAdvisorContextConfig(BaseModel):
++    model_config = STRICT_CONFIG
++
++    enabled: bool = True
++    max_age_seconds: float = Field(default=540.0, gt=0.0)
++    influence: AdvisorContextInfluence = "DIAGNOSTIC"
++
++
++class MarketRegimeAdvisorContextConfig(BaseModel):
++    model_config = STRICT_CONFIG
++
++    enabled: bool = True
++    influence: AdvisorContextInfluence = "NONE"
+ 
+ 
+ class MatureRangeChurnPolicyConfig(BaseModel):
+@@ -125,6 +141,13 @@ class StockAdvisorPolicyConfig(BaseModel):
+     day_history_limit: int = Field(default=160, ge=10)
+     prior_opportunity_limit: int = Field(default=50, ge=1)
+ 
++    stock_rank_context: StockRankAdvisorContextConfig = Field(
++        default_factory=StockRankAdvisorContextConfig
++    )
++    market_regime_context: MarketRegimeAdvisorContextConfig = Field(
++        default_factory=MarketRegimeAdvisorContextConfig
++    )
++
+     mature_range_churn: MatureRangeChurnPolicyConfig = Field(
+         default_factory=MatureRangeChurnPolicyConfig
+     )
+@@ -149,6 +172,14 @@ class StockAdvisorPolicyConfig(BaseModel):
+             raise ValueError("barriers.action must remain WATCH")
+         if self.deferred_entry.action != "WATCH":
+             raise ValueError("deferred_entry.action must remain WATCH")
++        if self.stock_rank_context.influence != "DIAGNOSTIC":
++            raise ValueError(
++                "stock_rank_context.influence must remain DIAGNOSTIC until replay validation"
++            )
++        if self.market_regime_context.influence != "NONE":
++            raise ValueError(
++                "market_regime_context.influence must remain NONE until regime implementation"
++            )
+         return self
+ 
+ 
+@@ -157,6 +188,9 @@ STOCK_ADVISOR_CONFIG = StockAdvisorPolicyConfig()
+ 
+ __all__ = [
+     "AdvisorRuleAction",
++    "AdvisorContextInfluence",
++    "StockRankAdvisorContextConfig",
++    "MarketRegimeAdvisorContextConfig",
+     "MatureRangeChurnPolicyConfig",
+     "BarrierPolicyConfig",
+     "RepeatedEpisodePolicyConfig",
+diff --git a/enums/advisor_context.py b/enums/advisor_context.py
+new file mode 100644
+index 0000000..f02c2a7
+--- /dev/null
++++ b/enums/advisor_context.py
+@@ -0,0 +1,51 @@
++"""Domain enums for StockAdvisor contextual intelligence.
++
++These enums are intentionally separate from ``enums.auction_engine``. Auction
++owns stock-level observation and setup authority; this module owns external
++context supplied to StockAdvisor by StockRank and Market Regime services.
++"""
++from __future__ import annotations
++
++from enum import Enum
++
++
++class _StringEnum(str, Enum):
++    def __str__(self) -> str:  # pragma: no cover - trivial
++        return self.value
++
++
++class ContextAvailability(_StringEnum):
++    AVAILABLE = "AVAILABLE"
++    STALE = "STALE"
++    UNAVAILABLE = "UNAVAILABLE"
++
++
++class ContextInfluence(_StringEnum):
++    NONE = "NONE"
++    DIAGNOSTIC = "DIAGNOSTIC"
++    WEIGHTED = "WEIGHTED"
++
++
++class StockRankTier(_StringEnum):
++    PRIORITY = "PRIORITY"
++    SECONDARY = "SECONDARY"
++    SUPPRESSED = "SUPPRESSED"
++
++
++class MarketRegimeState(_StringEnum):
++    UNKNOWN = "UNKNOWN"
++    TREND_UP = "TREND_UP"
++    TREND_DOWN = "TREND_DOWN"
++    HIGH_VOLATILITY_TREND = "HIGH_VOLATILITY_TREND"
++    LOW_VOLATILITY_BALANCE = "LOW_VOLATILITY_BALANCE"
++    RISK_OFF = "RISK_OFF"
++    REVERSAL_PRONE = "REVERSAL_PRONE"
++    MIXED_UNCERTAIN = "MIXED_UNCERTAIN"
++
++
++__all__ = [
++    "ContextAvailability",
++    "ContextInfluence",
++    "StockRankTier",
++    "MarketRegimeState",
++]
+diff --git a/schemas/stock_rank.py b/schemas/stock_rank.py
+index 8620752..870bc06 100644
+--- a/schemas/stock_rank.py
++++ b/schemas/stock_rank.py
+@@ -12,6 +12,7 @@ from models.trade_models import (
+     StockRank as StockRankORM,
+     StockRankHistory as StockRankHistoryORM,
+ )
++from utils.datetime_utils import to_ist_naive
+ from utils.json_utils import sanitize_json
+ 
+ 
+@@ -200,6 +201,31 @@ class StockRankSchema(BaseModel):
+             )
+         return [StockRankSchema.model_validate(row) for row in rows]
+ 
++    @staticmethod
++    def fetch_latest_for_symbol_at_or_before(
++        *,
++        symbol: str,
++        through_time: datetime,
++    ) -> Optional["StockRankSchema"]:
++        """Return one causal current-day rank row for Advisor context."""
++        clean_symbol = str(symbol or "").strip().upper()
++        as_of = to_ist_naive(through_time)
++        if not clean_symbol:
++            raise ValueError("StockRank causal lookup requires symbol")
++        if as_of is None:
++            raise ValueError("StockRank causal lookup requires valid through_time")
++        with get_trades_db() as db:
++            row = (
++                db.query(StockRankORM)
++                .filter(StockRankORM.symbol == clean_symbol)
++                .filter(StockRankORM.trading_day == as_of.date())
++                .filter(StockRankORM.rank_time <= as_of)
++                .order_by(StockRankORM.rank_time.desc())
++                .limit(1)
++                .one_or_none()
++            )
++        return StockRankSchema.model_validate(row) if row is not None else None
++
+     def report_row(self) -> Dict[str, Any]:
+         row = self.model_dump(exclude={"id", "created_at", "updated_at"})
+         row["metrics_json"] = sanitize_json(row["metrics_json"])
+diff --git a/scripts/prepare_day.py b/scripts/prepare_day.py
+index 84ff6ed..8d38615 100755
+--- a/scripts/prepare_day.py
++++ b/scripts/prepare_day.py
+@@ -3,7 +3,6 @@
+ from __future__ import annotations
+ 
+ import argparse
+-import json
+ import logging
+ import os
+ import sys
+@@ -37,12 +36,11 @@ def main(argv: list[str] | None = None) -> int:
+         return 0
+ 
+     try:
+-        summary = DayPrepService().prepare()
++        DayPrepService().prepare()
+     except Exception:
+         logger.exception("DAY_PREP_FAILED")
+         return 1
+ 
+-    print(json.dumps(summary, sort_keys=True, default=str))
+     return 0
+ 
+ 
+diff --git a/services/advisor_context/__init__.py b/services/advisor_context/__init__.py
+new file mode 100644
+index 0000000..7c7beec
+--- /dev/null
++++ b/services/advisor_context/__init__.py
+@@ -0,0 +1 @@
++"""Typed external context supplied to StockAdvisor."""
+diff --git a/services/advisor_context/contracts.py b/services/advisor_context/contracts.py
+new file mode 100644
+index 0000000..95fb1e6
+--- /dev/null
++++ b/services/advisor_context/contracts.py
+@@ -0,0 +1,261 @@
++"""Strict immutable contracts for context supplied to StockAdvisor."""
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any, Dict, Optional, Tuple
++
++from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
++
++from enums.advisor_context import (
++    ContextAvailability,
++    ContextInfluence,
++    MarketRegimeState,
++    StockRankTier,
++)
++from utils.datetime_utils import to_ist_naive
++
++
++class _ContextContract(BaseModel):
++    model_config = ConfigDict(
++        extra="forbid",
++        frozen=True,
++        validate_assignment=True,
++        validate_default=True,
++        allow_inf_nan=False,
++    )
++
++
++class StockRankAssessment(_ContextContract):
++    symbol: str = Field(min_length=1, max_length=32)
++    as_of: datetime
++    availability: ContextAvailability
++    rank_time: Optional[datetime] = None
++    age_seconds: Optional[float] = Field(default=None, ge=0.0)
++    fresh: bool = False
++
++    rank_position: Optional[int] = Field(default=None, ge=1)
++    universe_size: Optional[int] = Field(default=None, ge=1)
++    attention_tier: Optional[StockRankTier] = None
++    direction: Optional[str] = None
++    classification: Optional[str] = None
++
++    total_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
++    movement_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
++    quality_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
++    range_penalty: Optional[float] = Field(default=None, ge=0.0, le=100.0)
++    stall_penalty: Optional[float] = Field(default=None, ge=0.0, le=100.0)
++    reason_codes: Tuple[str, ...] = ()
++
++    @field_validator("symbol", mode="before")
++    @classmethod
++    def _normalise_symbol(cls, value: object) -> str:
++        symbol = str(value or "").strip().upper()
++        if not symbol:
++            raise ValueError("StockRankAssessment symbol is required")
++        return symbol
++
++    @field_validator("direction", "classification", mode="before")
++    @classmethod
++    def _normalise_optional_text(cls, value: object) -> Optional[str]:
++        if value is None:
++            return None
++        text = str(value).strip().upper()
++        return text or None
++
++    @field_validator("reason_codes", mode="before")
++    @classmethod
++    def _normalise_reasons(cls, value: object) -> Tuple[str, ...]:
++        return tuple(str(item).strip().upper() for item in (value or ()) if str(item).strip())
++
++    @model_validator(mode="after")
++    def _validate_assessment(self) -> "StockRankAssessment":
++        if len(self.reason_codes) != len(set(self.reason_codes)):
++            raise ValueError("StockRankAssessment reason codes must be unique")
++
++        populated = (
++            self.rank_time,
++            self.age_seconds,
++            self.rank_position,
++            self.universe_size,
++            self.attention_tier,
++            self.direction,
++            self.classification,
++            self.total_score,
++            self.movement_score,
++            self.quality_score,
++            self.range_penalty,
++            self.stall_penalty,
++        )
++        if self.availability is ContextAvailability.UNAVAILABLE:
++            if self.fresh or any(item is not None for item in populated):
++                raise ValueError("Unavailable StockRank assessment cannot contain rank data")
++            return self
++
++        if any(item is None for item in populated):
++            raise ValueError("Available or stale StockRank assessment requires complete rank data")
++        assert self.rank_time is not None
++        assert self.rank_position is not None
++        assert self.universe_size is not None
++        if self.rank_position > self.universe_size:
++            raise ValueError("StockRankAssessment rank_position exceeds universe_size")
++        rank_time = to_ist_naive(self.rank_time)
++        as_of = to_ist_naive(self.as_of)
++        if rank_time is None or as_of is None:
++            raise ValueError("StockRankAssessment timestamps must be valid datetimes")
++        if rank_time > as_of:
++            raise ValueError("StockRankAssessment rank_time cannot be in the future")
++        if self.availability is ContextAvailability.AVAILABLE and not self.fresh:
++            raise ValueError("Available StockRank assessment must be fresh")
++        if self.availability is ContextAvailability.STALE and self.fresh:
++            raise ValueError("Stale StockRank assessment cannot be fresh")
++        return self
++
++
++class MarketRegimeEvidence(_ContextContract):
++    code: str = Field(min_length=1)
++    source: str = Field(min_length=1)
++    observed_at: datetime
++    value: Any = None
++    details: Dict[str, Any] = Field(default_factory=dict)
++
++    @field_validator("code", mode="before")
++    @classmethod
++    def _normalise_code(cls, value: object) -> str:
++        code = str(value or "").strip().upper()
++        if not code:
++            raise ValueError("MarketRegimeEvidence code is required")
++        return code
++
++    @field_validator("source", mode="before")
++    @classmethod
++    def _normalise_source(cls, value: object) -> str:
++        source = str(value or "").strip().upper()
++        if not source:
++            raise ValueError("MarketRegimeEvidence source is required")
++        return source
++
++
++class MarketRegimeHysteresis(_ContextContract):
++    state_started_at: Optional[datetime] = None
++    candidate_state: Optional[MarketRegimeState] = None
++    candidate_since: Optional[datetime] = None
++    candidate_confirmations: int = Field(default=0, ge=0)
++    required_confirmations: int = Field(default=0, ge=0)
++    transition_pending: bool = False
++
++    @model_validator(mode="after")
++    def _validate_hysteresis(self) -> "MarketRegimeHysteresis":
++        candidate_fields = (
++            self.candidate_state,
++            self.candidate_since,
++        )
++        if self.transition_pending and any(item is None for item in candidate_fields):
++            raise ValueError("Pending regime transition requires candidate state and time")
++        if not self.transition_pending and any(item is not None for item in candidate_fields):
++            raise ValueError("Non-pending regime transition cannot contain candidate state")
++        if self.candidate_confirmations > self.required_confirmations and self.required_confirmations > 0:
++            raise ValueError("Regime confirmations cannot exceed required confirmations")
++        return self
++
++
++class MarketRegimeAssessment(_ContextContract):
++    as_of: datetime
++    availability: ContextAvailability
++    state: MarketRegimeState
++    confidence: float = Field(ge=0.0, le=1.0)
++    age_seconds: Optional[float] = Field(default=None, ge=0.0)
++
++    buy_support: float = Field(default=0.0, ge=0.0, le=1.0)
++    sell_support: float = Field(default=0.0, ge=0.0, le=1.0)
++    continuation_support: float = Field(default=0.0, ge=0.0, le=1.0)
++    reversal_support: float = Field(default=0.0, ge=0.0, le=1.0)
++
++    evidence: Tuple[MarketRegimeEvidence, ...] = ()
++    reason_codes: Tuple[str, ...] = ()
++    hysteresis: MarketRegimeHysteresis = Field(default_factory=MarketRegimeHysteresis)
++    metrics: Dict[str, Any] = Field(default_factory=dict)
++
++    @field_validator("reason_codes", mode="before")
++    @classmethod
++    def _normalise_reasons(cls, value: object) -> Tuple[str, ...]:
++        return tuple(str(item).strip().upper() for item in (value or ()) if str(item).strip())
++
++    @model_validator(mode="after")
++    def _validate_assessment(self) -> "MarketRegimeAssessment":
++        if len(self.reason_codes) != len(set(self.reason_codes)):
++            raise ValueError("MarketRegimeAssessment reason codes must be unique")
++        as_of = to_ist_naive(self.as_of)
++        if as_of is None:
++            raise ValueError("MarketRegimeAssessment as_of must be valid")
++        for fact in self.evidence:
++            observed_at = to_ist_naive(fact.observed_at)
++            if observed_at is None or observed_at > as_of:
++                raise ValueError("MarketRegime evidence must be causal")
++
++        if self.availability is ContextAvailability.UNAVAILABLE:
++            if self.state is not MarketRegimeState.UNKNOWN:
++                raise ValueError("Unavailable market regime must be UNKNOWN")
++            if self.confidence != 0.0 or self.age_seconds is not None:
++                raise ValueError("Unavailable market regime cannot claim confidence or age")
++            if any(
++                value != 0.0
++                for value in (
++                    self.buy_support,
++                    self.sell_support,
++                    self.continuation_support,
++                    self.reversal_support,
++                )
++            ):
++                raise ValueError("Unavailable market regime cannot claim directional support")
++            if self.evidence:
++                raise ValueError("Unavailable market regime cannot contain evaluated evidence")
++            return self
++
++        if self.state is MarketRegimeState.UNKNOWN:
++            raise ValueError("Available or stale market regime cannot be UNKNOWN")
++        if self.age_seconds is None or self.hysteresis.state_started_at is None:
++            raise ValueError("Available or stale market regime requires state age and start time")
++        started = to_ist_naive(self.hysteresis.state_started_at)
++        if started is None or started > as_of:
++            raise ValueError("Market regime state start must be causal")
++        return self
++
++
++class StockAdvisorContextAssessment(_ContextContract):
++    symbol: str = Field(min_length=1, max_length=32)
++    as_of: datetime
++    stock_rank: StockRankAssessment
++    market_regime: MarketRegimeAssessment
++    stock_rank_influence: ContextInfluence
++    market_regime_influence: ContextInfluence
++
++    @field_validator("symbol", mode="before")
++    @classmethod
++    def _normalise_symbol(cls, value: object) -> str:
++        symbol = str(value or "").strip().upper()
++        if not symbol:
++            raise ValueError("StockAdvisor context symbol is required")
++        return symbol
++
++    @model_validator(mode="after")
++    def _validate_context(self) -> "StockAdvisorContextAssessment":
++        if self.stock_rank.symbol != self.symbol:
++            raise ValueError("StockAdvisor context/StockRank symbol mismatch")
++        as_of = to_ist_naive(self.as_of)
++        rank_as_of = to_ist_naive(self.stock_rank.as_of)
++        regime_as_of = to_ist_naive(self.market_regime.as_of)
++        if as_of is None or rank_as_of != as_of or regime_as_of != as_of:
++            raise ValueError("StockAdvisor context timestamps must match")
++        return self
++
++    def to_diagnostics(self) -> Dict[str, Any]:
++        return self.model_dump(mode="json", exclude_none=False)
++
++
++__all__ = [
++    "StockRankAssessment",
++    "MarketRegimeEvidence",
++    "MarketRegimeHysteresis",
++    "MarketRegimeAssessment",
++    "StockAdvisorContextAssessment",
++]
+diff --git a/services/advisor_context/service.py b/services/advisor_context/service.py
+new file mode 100644
+index 0000000..f2231ac
+--- /dev/null
++++ b/services/advisor_context/service.py
+@@ -0,0 +1,183 @@
++"""Causal StockRank and Market Regime context assembly for StockAdvisor."""
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Optional, Protocol
++
++from configs.stock_advisor_config import StockAdvisorPolicyConfig
++from enums.advisor_context import ContextAvailability, ContextInfluence, StockRankTier
++from schemas.stock_rank import StockRankSchema
++from services.market.market_regime import MarketRegimeProviderProtocol, MarketRegimeService
++from services.advisor_context.contracts import (
++    StockAdvisorContextAssessment,
++    StockRankAssessment,
++)
++from utils.datetime_utils import to_ist_naive
++
++
++class StockRankContextProviderProtocol(Protocol):
++    def assess(
++        self,
++        *,
++        symbol: str,
++        as_of: datetime,
++        max_age_seconds: float,
++    ) -> StockRankAssessment:
++        ...
++
++
++class StockAdvisorContextProviderProtocol(Protocol):
++    def assess(self, *, symbol: str, as_of: datetime) -> StockAdvisorContextAssessment:
++        ...
++
++
++class StockRankContextProvider:
++    """Read the latest causal StockRank row for one symbol."""
++
++    def assess(
++        self,
++        *,
++        symbol: str,
++        as_of: datetime,
++        max_age_seconds: float,
++    ) -> StockRankAssessment:
++        clean_symbol = str(symbol or "").strip().upper()
++        assessment_time = to_ist_naive(as_of)
++        if not clean_symbol:
++            raise ValueError("StockRank context requires symbol")
++        if assessment_time is None:
++            raise ValueError("StockRank context requires valid as_of datetime")
++        row = StockRankSchema.fetch_latest_for_symbol_at_or_before(
++            symbol=clean_symbol,
++            through_time=assessment_time,
++        )
++        if row is None:
++            return self.unavailable(
++                symbol=clean_symbol,
++                as_of=assessment_time,
++                reason="STOCK_RANK_NOT_AVAILABLE",
++            )
++
++        rank_time = to_ist_naive(row.rank_time)
++        if rank_time is None:
++            raise ValueError("Persisted StockRank row has invalid rank_time")
++        age_seconds = (assessment_time - rank_time).total_seconds()
++        if age_seconds < 0.0:
++            raise ValueError("Causal StockRank lookup returned a future row")
++        fresh = age_seconds <= float(max_age_seconds)
++        availability = (
++            ContextAvailability.AVAILABLE if fresh else ContextAvailability.STALE
++        )
++        return StockRankAssessment(
++            symbol=clean_symbol,
++            as_of=assessment_time,
++            availability=availability,
++            rank_time=rank_time,
++            age_seconds=round(age_seconds, 3),
++            fresh=fresh,
++            rank_position=row.rank_position,
++            universe_size=row.universe_size,
++            attention_tier=StockRankTier(row.attention_tier),
++            direction=row.direction,
++            classification=row.classification,
++            total_score=row.total_score,
++            movement_score=row.movement_score,
++            quality_score=row.quality_score,
++            range_penalty=row.range_penalty,
++            stall_penalty=row.stall_penalty,
++            reason_codes=(
++                "STOCK_RANK_AVAILABLE" if fresh else "STOCK_RANK_STALE",
++            ),
++        )
++
++    @staticmethod
++    def unavailable(*, symbol: str, as_of: datetime, reason: str) -> StockRankAssessment:
++        return StockRankAssessment(
++            symbol=symbol,
++            as_of=as_of,
++            availability=ContextAvailability.UNAVAILABLE,
++            rank_time=None,
++            age_seconds=None,
++            fresh=False,
++            rank_position=None,
++            universe_size=None,
++            attention_tier=None,
++            direction=None,
++            classification=None,
++            total_score=None,
++            movement_score=None,
++            quality_score=None,
++            range_penalty=None,
++            stall_penalty=None,
++            reason_codes=(reason,),
++        )
++
++
++class AdvisorContextService:
++    """Assemble all external context consumed by StockAdvisor."""
++
++    def __init__(
++        self,
++        *,
++        config: StockAdvisorPolicyConfig,
++        stock_rank_provider: Optional[StockRankContextProviderProtocol] = None,
++        market_regime_provider: Optional[MarketRegimeProviderProtocol] = None,
++    ) -> None:
++        self.config = config
++        if config.stock_rank_context.influence != "DIAGNOSTIC":
++            raise ValueError(
++                "StockRank Advisor context must remain DIAGNOSTIC in this patch"
++            )
++        if config.market_regime_context.influence != "NONE":
++            raise ValueError(
++                "Market Regime Advisor context must remain NONE in this patch"
++            )
++        self.stock_rank_provider = stock_rank_provider or StockRankContextProvider()
++        self.market_regime_provider = market_regime_provider or MarketRegimeService()
++
++    def assess(self, *, symbol: str, as_of: datetime) -> StockAdvisorContextAssessment:
++        clean_symbol = str(symbol or "").strip().upper()
++        assessment_time = to_ist_naive(as_of)
++        if not clean_symbol:
++            raise ValueError("AdvisorContextService requires symbol")
++        if assessment_time is None:
++            raise ValueError("AdvisorContextService requires valid as_of datetime")
++
++        rank_policy = self.config.stock_rank_context
++        if rank_policy.enabled:
++            stock_rank = self.stock_rank_provider.assess(
++                symbol=clean_symbol,
++                as_of=assessment_time,
++                max_age_seconds=rank_policy.max_age_seconds,
++            )
++        else:
++            stock_rank = StockRankContextProvider.unavailable(
++                symbol=clean_symbol,
++                as_of=assessment_time,
++                reason="STOCK_RANK_CONTEXT_DISABLED",
++            )
++
++        regime_policy = self.config.market_regime_context
++        if regime_policy.enabled:
++            market_regime = self.market_regime_provider.assess(as_of=assessment_time)
++        else:
++            market_regime = MarketRegimeService().assess(as_of=assessment_time).model_copy(
++                update={"reason_codes": ("MARKET_REGIME_CONTEXT_DISABLED",)}
++            )
++
++        return StockAdvisorContextAssessment(
++            symbol=clean_symbol,
++            as_of=assessment_time,
++            stock_rank=stock_rank,
++            market_regime=market_regime,
++            stock_rank_influence=ContextInfluence(rank_policy.influence),
++            market_regime_influence=ContextInfluence(regime_policy.influence),
++        )
++
++
++__all__ = [
++    "StockRankContextProviderProtocol",
++    "StockAdvisorContextProviderProtocol",
++    "StockRankContextProvider",
++    "AdvisorContextService",
++]
+diff --git a/services/market/__init__.py b/services/market/__init__.py
+new file mode 100644
+index 0000000..897dbd5
+--- /dev/null
++++ b/services/market/__init__.py
+@@ -0,0 +1 @@
++"""Market-level contextual intelligence services."""
+diff --git a/services/market/market_regime.py b/services/market/market_regime.py
+new file mode 100644
+index 0000000..3d9d98c
+--- /dev/null
++++ b/services/market/market_regime.py
+@@ -0,0 +1,57 @@
++"""Market Regime service contract and initial neutral implementation.
++
++The service is intentionally non-influential in this patch. It freezes the
++causal assessment contract and returns explicit UNAVAILABLE/UNKNOWN context
++until the market-intelligence evaluator is implemented and replay-validated.
++"""
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Dict, Protocol
++
++from enums.advisor_context import ContextAvailability, MarketRegimeState
++from services.advisor_context.contracts import (
++    MarketRegimeAssessment,
++    MarketRegimeHysteresis,
++)
++from utils.datetime_utils import to_ist_naive
++
++
++class MarketRegimeProviderProtocol(Protocol):
++    def assess(self, *, as_of: datetime) -> MarketRegimeAssessment:
++        ...
++
++
++class MarketRegimeService:
++    """Current neutral provider; future implementation keeps this contract."""
++
++    def __init__(self) -> None:
++        self._cache: Dict[datetime, MarketRegimeAssessment] = {}
++
++    def assess(self, *, as_of: datetime) -> MarketRegimeAssessment:
++        assessment_time = to_ist_naive(as_of)
++        if assessment_time is None:
++            raise ValueError("MarketRegimeService requires a valid as_of datetime")
++        cached = self._cache.get(assessment_time)
++        if cached is not None:
++            return cached
++        assessment = MarketRegimeAssessment(
++            as_of=assessment_time,
++            availability=ContextAvailability.UNAVAILABLE,
++            state=MarketRegimeState.UNKNOWN,
++            confidence=0.0,
++            age_seconds=None,
++            buy_support=0.0,
++            sell_support=0.0,
++            continuation_support=0.0,
++            reversal_support=0.0,
++            evidence=(),
++            reason_codes=("MARKET_REGIME_NOT_IMPLEMENTED",),
++            hysteresis=MarketRegimeHysteresis(),
++            metrics={},
++        )
++        self._cache[assessment_time] = assessment
++        return assessment
++
++
++__all__ = ["MarketRegimeProviderProtocol", "MarketRegimeService"]
+diff --git a/services/signals/stock_advisor.py b/services/signals/stock_advisor.py
+index abc9340..1930b62 100644
+--- a/services/signals/stock_advisor.py
++++ b/services/signals/stock_advisor.py
+@@ -17,6 +17,11 @@ from schemas.signal import SignalSchema
+ from schemas.snapshot import SnapshotSchema
+ from services.auction_engine.contracts import AdvisorDecision
+ from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
++from services.advisor_context.service import (
++    AdvisorContextService,
++    StockAdvisorContextProviderProtocol,
++)
++from services.advisor_context.contracts import StockAdvisorContextAssessment
+ from services.signals.stock_advisor_context import (
+     AdvisorDayPathSummary,
+     DeferredEntryFreshnessSummary,
+@@ -55,9 +60,11 @@ class StockAdvisor:
+         self,
+         config: StockAdvisorPolicyConfig = STOCK_ADVISOR_CONFIG,
+         history_provider: Optional[StockAdvisorHistoryProviderProtocol] = None,
++        context_provider: Optional[StockAdvisorContextProviderProtocol] = None,
+     ) -> None:
+         self.policy = config
+         self.history_provider = history_provider or StockAdvisorHistoryProvider()
++        self.context_provider = context_provider or AdvisorContextService(config=config)
+ 
+     def evaluate_authoritative(
+         self,
+@@ -65,6 +72,10 @@ class StockAdvisor:
+         candidate: AuthoritativeSetupCandidate,
+     ) -> AdvisorDecision:
+         self._validate_candidate_inputs(snapshot, candidate)
++        advisor_context = self.context_provider.assess(
++            symbol=snapshot.symbol,
++            as_of=snapshot.snapshot_time,
++        )
+         if not self.policy.enabled:
+             return self._decision(
+                 snapshot,
+@@ -74,6 +85,7 @@ class StockAdvisor:
+                 (),
+                 range_context=None,
+                 context_diagnostics={},
++                advisor_context=advisor_context,
+             )
+ 
+         observation = snapshot.auction.observation
+@@ -208,6 +220,7 @@ class StockAdvisor:
+                 "episode_history": episode_history.to_dict(),
+                 "barrier": barrier.to_dict(),
+             },
++            advisor_context=advisor_context,
+         )
+ 
+     def evaluate_deferred_entry(
+@@ -234,6 +247,10 @@ class StockAdvisor:
+         if signal.first_seen_time is None:
+             raise ValueError("Deferred StockAdvisor requires signal.first_seen_time")
+         side = TradeSide(str(getattr(signal.side, "value", signal.side)).upper())
++        advisor_context = self.context_provider.assess(
++            symbol=symbol,
++            as_of=snapshot.snapshot_time,
++        )
+ 
+         if not self.policy.enabled or not self.policy.deferred_entry.enabled:
+             summary = DeferredEntryFreshnessSummary(
+@@ -289,6 +306,7 @@ class StockAdvisor:
+                 "signal_setup": str(getattr(signal.setup, "value", signal.setup)),
+                 "signal_side": side.value,
+                 "freshness": summary.to_dict(),
++                "advisor_context": advisor_context.to_diagnostics(),
+             },
+         )
+ 
+@@ -473,6 +491,7 @@ class StockAdvisor:
+         *,
+         range_context: _AdvisorRangeContext | None,
+         context_diagnostics: Dict[str, Any],
++        advisor_context: StockAdvisorContextAssessment,
+     ) -> AdvisorDecision:
+         observation = snapshot.auction.observation
+         diagnostics: Dict[str, Any] = {
+@@ -486,6 +505,7 @@ class StockAdvisor:
+                 {"configured_action": configured, "reason": reason}
+                 for configured, reason in matches
+             ],
++            "advisor_context": advisor_context.to_diagnostics(),
+             **context_diagnostics,
+         }
+         if range_context is not None:
+diff --git a/tests/unit/advisor_context_test_fixtures.py b/tests/unit/advisor_context_test_fixtures.py
+new file mode 100644
+index 0000000..4bb6576
+--- /dev/null
++++ b/tests/unit/advisor_context_test_fixtures.py
+@@ -0,0 +1,55 @@
++from __future__ import annotations
++
++from datetime import datetime
++
++from enums.advisor_context import (
++    ContextAvailability,
++    ContextInfluence,
++    MarketRegimeState,
++)
++from services.advisor_context.contracts import (
++    MarketRegimeAssessment,
++    MarketRegimeHysteresis,
++    StockAdvisorContextAssessment,
++    StockRankAssessment,
++)
++from utils.datetime_utils import to_ist_naive
++
++
++class StaticAdvisorContextProvider:
++    def __init__(
++        self,
++        *,
++        stock_rank: StockRankAssessment | None = None,
++        market_regime: MarketRegimeAssessment | None = None,
++    ) -> None:
++        self.stock_rank = stock_rank
++        self.market_regime = market_regime
++
++    def assess(self, *, symbol: str, as_of: datetime) -> StockAdvisorContextAssessment:
++        clean_symbol = str(symbol).strip().upper()
++        assessment_time = to_ist_naive(as_of)
++        assert assessment_time is not None
++        stock_rank = self.stock_rank or StockRankAssessment(
++            symbol=clean_symbol,
++            as_of=assessment_time,
++            availability=ContextAvailability.UNAVAILABLE,
++            fresh=False,
++            reason_codes=("TEST_STOCK_RANK_UNAVAILABLE",),
++        )
++        market_regime = self.market_regime or MarketRegimeAssessment(
++            as_of=assessment_time,
++            availability=ContextAvailability.UNAVAILABLE,
++            state=MarketRegimeState.UNKNOWN,
++            confidence=0.0,
++            reason_codes=("TEST_MARKET_REGIME_UNAVAILABLE",),
++            hysteresis=MarketRegimeHysteresis(),
++        )
++        return StockAdvisorContextAssessment(
++            symbol=clean_symbol,
++            as_of=assessment_time,
++            stock_rank=stock_rank,
++            market_regime=market_regime,
++            stock_rank_influence=ContextInfluence.DIAGNOSTIC,
++            market_regime_influence=ContextInfluence.NONE,
++        )
+diff --git a/tests/unit/test_advisor_context_integration.py b/tests/unit/test_advisor_context_integration.py
+new file mode 100644
+index 0000000..47dfb9f
+--- /dev/null
++++ b/tests/unit/test_advisor_context_integration.py
+@@ -0,0 +1,170 @@
++from __future__ import annotations
++
++from datetime import timedelta
++from types import SimpleNamespace
++
++import pytest
++
++from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG
++from enums.advisor_context import (
++    ContextAvailability,
++    ContextInfluence,
++    MarketRegimeState,
++    StockRankTier,
++)
++from enums.auction_engine import AdvisorAction, AuctionEventType, DirectionalBias, SetupFamily
++from services.auction_engine.event_driven_setup_engine import EventDrivenSetupEngine
++from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
++from services.market.market_regime import MarketRegimeService
++from services.advisor_context.service import AdvisorContextService, StockRankContextProvider
++from services.advisor_context.contracts import StockRankAssessment
++from services.signals.stock_advisor import StockAdvisor
++from tests.unit.advisor_context_test_fixtures import StaticAdvisorContextProvider
++from tests.unit.test_event_driven_setup_engine import TS, _event_snapshot
++
++
++class _EmptyHistoryProvider:
++    def fetch_prior_opportunities(self, **kwargs):
++        return []
++
++    def fetch_day_snapshots(self, **kwargs):
++        return []
++
++
++def _candidate(snapshot):
++    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
++    evaluations = EventDrivenSetupEngine().evaluate(snapshot, routes)
++    approved = [item for item in evaluations if item.approved]
++    assert len(approved) == 1
++    assert approved[0].candidate is not None
++    return approved[0].candidate
++
++
++def _rank_row(*, rank_time):
++    return SimpleNamespace(
++        rank_time=rank_time,
++        rank_position=7,
++        universe_size=80,
++        attention_tier="PRIORITY",
++        direction="UP",
++        classification="MOVING_UP",
++        total_score=48.5,
++        movement_score=51.0,
++        quality_score=43.0,
++        range_penalty=5.0,
++        stall_penalty=2.0,
++    )
++
++
++def test_market_regime_service_freezes_neutral_contract_and_caches() -> None:
++    service = MarketRegimeService()
++
++    first = service.assess(as_of=TS)
++    second = service.assess(as_of=TS)
++
++    assert first is second
++    assert first.availability is ContextAvailability.UNAVAILABLE
++    assert first.state is MarketRegimeState.UNKNOWN
++    assert first.confidence == 0.0
++    assert first.reason_codes == ("MARKET_REGIME_NOT_IMPLEMENTED",)
++    assert first.hysteresis.transition_pending is False
++
++
++def test_stock_rank_context_provider_maps_fresh_and_stale(monkeypatch) -> None:
++    provider = StockRankContextProvider()
++    current = _rank_row(rank_time=TS - timedelta(minutes=6))
++    monkeypatch.setattr(
++        "services.advisor_context.service.StockRankSchema.fetch_latest_for_symbol_at_or_before",
++        lambda **kwargs: current,
++    )
++
++    fresh = provider.assess(symbol="test", as_of=TS, max_age_seconds=540.0)
++    stale = provider.assess(symbol="test", as_of=TS, max_age_seconds=300.0)
++
++    assert fresh.availability is ContextAvailability.AVAILABLE
++    assert fresh.fresh is True
++    assert fresh.rank_position == 7
++    assert fresh.attention_tier is StockRankTier.PRIORITY
++    assert fresh.reason_codes == ("STOCK_RANK_AVAILABLE",)
++
++    assert stale.availability is ContextAvailability.STALE
++    assert stale.fresh is False
++    assert stale.age_seconds == 360.0
++    assert stale.reason_codes == ("STOCK_RANK_STALE",)
++
++
++def test_stock_rank_context_provider_reports_explicit_unavailable(monkeypatch) -> None:
++    monkeypatch.setattr(
++        "services.advisor_context.service.StockRankSchema.fetch_latest_for_symbol_at_or_before",
++        lambda **kwargs: None,
++    )
++
++    result = StockRankContextProvider().assess(
++        symbol="TEST",
++        as_of=TS,
++        max_age_seconds=540.0,
++    )
++
++    assert result.availability is ContextAvailability.UNAVAILABLE
++    assert result.rank_time is None
++    assert result.rank_position is None
++    assert result.reason_codes == ("STOCK_RANK_NOT_AVAILABLE",)
++
++
++def test_advisor_persists_both_contexts_without_changing_action() -> None:
++    snapshot = _event_snapshot(
++        AuctionEventType.BALANCE_ESCAPE_STARTED,
++        SetupFamily.BREAKOUT_INITIATION,
++        direction=DirectionalBias.UP,
++        close=101.2,
++        data={"frozen_low": 99.0, "frozen_high": 101.0},
++    )
++    rank = StockRankAssessment(
++        symbol=snapshot.symbol,
++        as_of=snapshot.snapshot_time,
++        availability=ContextAvailability.AVAILABLE,
++        rank_time=snapshot.snapshot_time - timedelta(minutes=3),
++        age_seconds=180.0,
++        fresh=True,
++        rank_position=7,
++        universe_size=80,
++        attention_tier=StockRankTier.PRIORITY,
++        direction="UP",
++        classification="MOVING_UP",
++        total_score=48.5,
++        movement_score=51.0,
++        quality_score=43.0,
++        range_penalty=5.0,
++        stall_penalty=2.0,
++        reason_codes=("STOCK_RANK_AVAILABLE",),
++    )
++    advisor = StockAdvisor(
++        history_provider=_EmptyHistoryProvider(),
++        context_provider=StaticAdvisorContextProvider(stock_rank=rank),
++    )
++
++    decision = advisor.evaluate_authoritative(snapshot, _candidate(snapshot))
++
++    assert decision.action is AdvisorAction.ALLOW
++    context = decision.diagnostics["advisor_context"]
++    assert context["stock_rank_influence"] == ContextInfluence.DIAGNOSTIC.value
++    assert context["market_regime_influence"] == ContextInfluence.NONE.value
++    assert context["stock_rank"]["rank_position"] == 7
++    assert context["stock_rank"]["attention_tier"] == StockRankTier.PRIORITY.value
++    assert context["market_regime"]["state"] == MarketRegimeState.UNKNOWN.value
++    assert context["market_regime"]["availability"] == ContextAvailability.UNAVAILABLE.value
++
++
++def test_context_policy_cannot_influence_decisions_in_initial_patch() -> None:
++    assert STOCK_ADVISOR_CONFIG.stock_rank_context.influence == "DIAGNOSTIC"
++    assert STOCK_ADVISOR_CONFIG.market_regime_context.influence == "NONE"
++
++    invalid = STOCK_ADVISOR_CONFIG.model_copy(
++        update={
++            "stock_rank_context": STOCK_ADVISOR_CONFIG.stock_rank_context.model_copy(
++                update={"influence": "WEIGHTED"}
++            )
++        }
++    )
++    with pytest.raises(ValueError, match="must remain DIAGNOSTIC"):
++        AdvisorContextService(config=invalid)
+diff --git a/tests/unit/test_stock_advisor.py b/tests/unit/test_stock_advisor.py
+index 81d9ed3..62b57cb 100644
+--- a/tests/unit/test_stock_advisor.py
++++ b/tests/unit/test_stock_advisor.py
+@@ -10,6 +10,7 @@ from schemas.snapshot import SnapshotSchema
+ from services.auction_engine.event_driven_setup_engine import EventDrivenSetupEngine
+ from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
+ from services.signals.stock_advisor import StockAdvisor
++from tests.unit.advisor_context_test_fixtures import StaticAdvisorContextProvider
+ from tests.unit.test_event_driven_setup_engine import _event_snapshot
+ 
+ 
+@@ -22,7 +23,10 @@ class _EmptyHistoryProvider:
+ 
+ 
+ def _advisor() -> StockAdvisor:
+-    return StockAdvisor(history_provider=_EmptyHistoryProvider())
++    return StockAdvisor(
++        history_provider=_EmptyHistoryProvider(),
++        context_provider=StaticAdvisorContextProvider(),
++    )
+ 
+ 
+ def _snapshot_with_observation_range(
+diff --git a/tests/unit/test_stock_advisor_intelligence.py b/tests/unit/test_stock_advisor_intelligence.py
+index e83fbe3..3e8c7af 100644
+--- a/tests/unit/test_stock_advisor_intelligence.py
++++ b/tests/unit/test_stock_advisor_intelligence.py
+@@ -17,6 +17,7 @@ from services.signals.stock_advisor import StockAdvisor
+ from services.signals.stock_advisor_context import evaluate_deferred_entry_freshness
+ from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG
+ from tests.unit.test_event_driven_setup_engine import TS, _event_snapshot
++from tests.unit.advisor_context_test_fixtures import StaticAdvisorContextProvider
+ 
+ 
+ class _StaticHistoryProvider:
+@@ -119,6 +120,7 @@ def test_mature_narrow_range_churn_blocks_candidate() -> None:
+     decision = StockAdvisor(
+         config=config,
+         history_provider=_StaticHistoryProvider(snapshots=history),
++        context_provider=StaticAdvisorContextProvider(),
+     ).evaluate_authoritative(current, _candidate(current))
+ 
+     assert decision.action is AdvisorAction.BLOCK
+@@ -141,7 +143,8 @@ def test_uncleared_major_barrier_watches_candidate() -> None:
+     levels = current.levels.model_copy(update={"opening_range": opening_range})
+     current = current.model_copy(update={"levels": levels})
+     decision = StockAdvisor(
+-        history_provider=_StaticHistoryProvider()
++        history_provider=_StaticHistoryProvider(),
++        context_provider=StaticAdvisorContextProvider(),
+     ).evaluate_authoritative(current, _candidate(current))
+ 
+     assert decision.action is AdvisorAction.WATCH
+@@ -165,7 +168,8 @@ def test_repeated_exhausted_same_episode_deployment_blocks() -> None:
+         side="BUY",
+     )
+     decision = StockAdvisor(
+-        history_provider=_StaticHistoryProvider(opportunities=[prior])
++        history_provider=_StaticHistoryProvider(opportunities=[prior]),
++        context_provider=StaticAdvisorContextProvider(),
+     ).evaluate_authoritative(current, _candidate(current))
+ 
+     assert decision.action is AdvisorAction.BLOCK

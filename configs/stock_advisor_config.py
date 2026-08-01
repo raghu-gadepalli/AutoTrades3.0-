@@ -19,6 +19,22 @@ STRICT_CONFIG = ConfigDict(
 )
 
 AdvisorRuleAction = Literal["ALLOW", "WATCH", "BLOCK"]
+AdvisorContextInfluence = Literal["NONE", "DIAGNOSTIC", "WEIGHTED"]
+
+
+class StockRankAdvisorContextConfig(BaseModel):
+    model_config = STRICT_CONFIG
+
+    enabled: bool = True
+    max_age_seconds: float = Field(default=540.0, gt=0.0)
+    influence: AdvisorContextInfluence = "DIAGNOSTIC"
+
+
+class MarketRegimeAdvisorContextConfig(BaseModel):
+    model_config = STRICT_CONFIG
+
+    enabled: bool = True
+    influence: AdvisorContextInfluence = "NONE"
 
 
 class MatureRangeChurnPolicyConfig(BaseModel):
@@ -125,6 +141,13 @@ class StockAdvisorPolicyConfig(BaseModel):
     day_history_limit: int = Field(default=160, ge=10)
     prior_opportunity_limit: int = Field(default=50, ge=1)
 
+    stock_rank_context: StockRankAdvisorContextConfig = Field(
+        default_factory=StockRankAdvisorContextConfig
+    )
+    market_regime_context: MarketRegimeAdvisorContextConfig = Field(
+        default_factory=MarketRegimeAdvisorContextConfig
+    )
+
     mature_range_churn: MatureRangeChurnPolicyConfig = Field(
         default_factory=MatureRangeChurnPolicyConfig
     )
@@ -149,6 +172,14 @@ class StockAdvisorPolicyConfig(BaseModel):
             raise ValueError("barriers.action must remain WATCH")
         if self.deferred_entry.action != "WATCH":
             raise ValueError("deferred_entry.action must remain WATCH")
+        if self.stock_rank_context.influence != "DIAGNOSTIC":
+            raise ValueError(
+                "stock_rank_context.influence must remain DIAGNOSTIC until replay validation"
+            )
+        if self.market_regime_context.influence != "NONE":
+            raise ValueError(
+                "market_regime_context.influence must remain NONE until regime implementation"
+            )
         return self
 
 
@@ -157,6 +188,9 @@ STOCK_ADVISOR_CONFIG = StockAdvisorPolicyConfig()
 
 __all__ = [
     "AdvisorRuleAction",
+    "AdvisorContextInfluence",
+    "StockRankAdvisorContextConfig",
+    "MarketRegimeAdvisorContextConfig",
     "MatureRangeChurnPolicyConfig",
     "BarrierPolicyConfig",
     "RepeatedEpisodePolicyConfig",

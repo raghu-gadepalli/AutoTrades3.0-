@@ -19,11 +19,14 @@ from decimal import Decimal
 from typing import Optional, List, Dict, Any, Literal, Set
 
 from pydantic import BaseModel, Field
-from sqlalchemy import bindparam, text, or_
+from sqlalchemy import and_, bindparam, func, text, or_
 from sqlalchemy.exc import IntegrityError
 
 from database.database import get_trades_db
-from models.trade_models import UserTrade as UserTradeORM
+from models.trade_models import (
+    UserTrade as UserTradeORM,
+    UserTradeHistory as UserTradeHistoryORM,
+)
 
 from utils.json_utils import sanitize_json
 from utils.datetime_utils import IST
@@ -1217,3 +1220,23 @@ class UserTradeSchema(BaseModel):
             })
 
         return out
+
+    @staticmethod
+    def archive_current_rows():
+        """Archive all current trades and verify their history identity."""
+        from schemas.archive import ArchiveSpec, archive_rows
+
+        return archive_rows(
+            ArchiveSpec(
+                name="user_trades",
+                source_model=UserTradeORM,
+                history_model=UserTradeHistoryORM,
+                excluded_target_columns=frozenset(
+                    {"hist_id", "archived_on", "trading_date"}
+                ),
+                verification_condition=lambda source, target: and_(
+                    target.c.id == source.c.id,
+                    target.c.trading_date == func.date(source.c.entry_time),
+                ),
+            )
+        )

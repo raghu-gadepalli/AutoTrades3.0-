@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from models.trade_models import StockRank
+from models.trade_models import StockRank, StockRankHistory
 from services.selection.stock_rank import StockRankEvaluator
 
 
@@ -104,6 +104,43 @@ def test_stock_rank_model_has_required_identity_and_indexes() -> None:
         "idx_stock_rank_day_tier",
         "idx_stock_rank_day_score",
     }.issubset(index_names)
+
+
+def test_stock_rank_history_model_preserves_archive_identity_and_indexes() -> None:
+    table = StockRankHistory.__table__
+    unique_names = {constraint.name for constraint in table.constraints if constraint.name}
+    index_names = {index.name for index in table.indexes}
+
+    assert table.primary_key.columns.keys() == ["history_id"]
+    assert "stock_rank_id" in table.columns
+    assert "archived_on" in table.columns
+    assert "uq_stock_rank_history_symbol_time" in unique_names
+    assert table.info == {"intraday": False}
+    assert {
+        "idx_stock_rank_history_live_id",
+        "idx_stock_rank_history_run",
+        "idx_stock_rank_history_time_position",
+        "idx_stock_rank_history_day_symbol",
+        "idx_stock_rank_history_day_class",
+        "idx_stock_rank_history_day_tier",
+        "idx_stock_rank_history_day_score",
+        "idx_stock_rank_history_archived_on",
+    }.issubset(index_names)
+
+
+def test_stock_rank_history_carries_all_live_payload_columns() -> None:
+    operational_columns = {
+        column.name
+        for column in StockRank.__table__.columns
+        if column.name != "id"
+    }
+    history_columns = {
+        column.name
+        for column in StockRankHistory.__table__.columns
+        if column.name not in {"history_id", "stock_rank_id", "archived_on"}
+    }
+
+    assert history_columns == operational_columns
 
 
 def test_clean_directional_mover_outranks_stalled_gap_range() -> None:

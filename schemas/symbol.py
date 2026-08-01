@@ -45,7 +45,7 @@ class SymbolSchema(BaseModel, frozen=True):
 
     # Long-lived flags (policy + listing)
     active:             bool
-    enabled:            bool = True       # policy/universe gate (implicit everywhere)
+    enabled:            bool = False      # filter_stock_universe owns this gate
 
     # Promotion/demotion timestamps (store consistently as IST-naive or UTC-naive)
     promoted_when:      Optional[datetime]

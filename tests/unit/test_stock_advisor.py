@@ -10,6 +10,7 @@ from schemas.snapshot import SnapshotSchema
 from services.auction_engine.event_driven_setup_engine import EventDrivenSetupEngine
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
 from services.signals.stock_advisor import StockAdvisor
+from tests.unit.advisor_context_test_fixtures import StaticAdvisorContextProvider
 from tests.unit.test_event_driven_setup_engine import _event_snapshot
 
 
@@ -22,7 +23,10 @@ class _EmptyHistoryProvider:
 
 
 def _advisor() -> StockAdvisor:
-    return StockAdvisor(history_provider=_EmptyHistoryProvider())
+    return StockAdvisor(
+        history_provider=_EmptyHistoryProvider(),
+        context_provider=StaticAdvisorContextProvider(),
+    )
 
 
 def _snapshot_with_observation_range(

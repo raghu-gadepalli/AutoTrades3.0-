@@ -12,7 +12,6 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
-    Float,
     Text,
     UniqueConstraint,
     JSON,
@@ -35,26 +34,30 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("mobile", name="uq_users_mobile"),
+        UniqueConstraint("userid", name="username"),
+    )
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
-    userid       = Column(String(50), unique=True, nullable=False)
+    userid       = Column(String(50), nullable=False)
     name         = Column(String(30), nullable=False)
     email        = Column(String(50), nullable=False)
-    mobile       = Column(String(10), nullable=False, unique=True)
+    mobile       = Column(String(10), nullable=False)
     password     = Column(String(50), nullable=False)
 
     broker_login = Column(Boolean, nullable=False, server_default="0")
-    broker_name  = Column(String(30), nullable=True, server_default="ZERODHA")
+    broker_name  = Column(String(30), nullable=False, server_default="ZERODHA")
 
     apikey       = Column(String(255), nullable=False, server_default="")
     secretkey    = Column(String(255), nullable=False, server_default="")
-    access_token = Column(String(50),  nullable=False, server_default="")
+    access_token = Column(String(255), nullable=False, server_default="")
 
     intraday_only = Column(Boolean, nullable=False, server_default="0")
     stocks       = Column(String(255), nullable=False, server_default="")
-    equity       = Column(Integer, nullable=False, server_default="1")
-    futures      = Column(Integer, nullable=False, server_default="1")
-    options      = Column(Integer, nullable=False, server_default="1")
+    equity       = Column(Boolean, nullable=False, server_default="1")
+    futures      = Column(Boolean, nullable=False, server_default="1")
+    options      = Column(Boolean, nullable=False, server_default="1")
 
     execution_mode = Column(String(8), nullable=False, server_default="VIRTUAL")
     autotrade    = Column(Boolean, nullable=False, server_default="0")
@@ -320,10 +323,21 @@ class UserOrdersHistory(Base):
 
 class Symbol(Base):
     __tablename__ = "symbols"
+    __table_args__ = (
+        UniqueConstraint("symbol", name="uq_symbols_symbol"),
+        Index("idx_symbols_type_enabled_active", "type", "enabled", "active"),
+        Index(
+            "idx_symbols_derivative_lookup",
+            "equity_ref",
+            "type",
+            "expiry",
+            "enabled",
+            "strike_price",
+        ),
+    )
 
-    # DB PK remains 'symbol'; 'id' stays unique/auto-increment
-    id                   = Column(Integer, autoincrement=True, unique=True)
-    symbol               = Column(String(50), primary_key=True)
+    id                   = Column(Integer, primary_key=True, autoincrement=True)
+    symbol               = Column(String(50), nullable=False)
 
     token                = Column(String(50), nullable=True)
     name                 = Column(String(50), nullable=True)
@@ -331,48 +345,64 @@ class Symbol(Base):
     price                = Column(Numeric(13, 2), nullable=True)
     exchange             = Column(String(20), nullable=True)
     segment              = Column(String(20), nullable=True)
-    signal_profile       = Column(String(1000), nullable=False, default="DEFAULT")
-    lotsize              = Column(Integer, nullable=False, default=1)
+    signal_profile       = Column(
+        String(1000), nullable=False, default="DEFAULT", server_default="DEFAULT"
+    )
+    lotsize              = Column(Integer, nullable=False, default=1, server_default="1")
     expiry               = Column(Date, nullable=True)
     strike_price         = Column(Numeric(13, 2), nullable=True)
     tick_size            = Column(Numeric(13, 2), nullable=True)
-    equity_ref           = Column(String(50), nullable=True, index=True)
+    equity_ref           = Column(String(50), nullable=True)
 
     last_time            = Column(DateTime, nullable=True)
     last_snapshot        = Column(JSON, nullable=True)
 
     # Intraday dynamic flags
-    generate_candles     = Column(Boolean, nullable=False, default=False)
-    merge_candles        = Column(Boolean, nullable=False, default=False)
-    update_performance   = Column(Boolean, nullable=False, default=False)
-    generate_signals     = Column(Boolean, nullable=False, default=False)
-    processed            = Column(Boolean, nullable=False, default=False)
+    generate_candles     = Column(Boolean, nullable=False, default=False, server_default="0")
+    merge_candles        = Column(Boolean, nullable=False, server_default="0")
+    update_performance   = Column(Boolean, nullable=False, default=False, server_default="0")
+    generate_signals     = Column(Boolean, nullable=False, default=False, server_default="0")
+    processed            = Column(Boolean, nullable=False, default=False, server_default="0")
 
     # Long-lived flags
-    active               = Column(Boolean, nullable=False, default=False)   # curated observed universe
-    enabled              = Column(Boolean, nullable=False, default=True)    # policy/universe gate
+    active               = Column(Boolean, nullable=False, default=False, server_default="0")
+    enabled              = Column(Boolean, nullable=False, default=False, server_default="0")
 
     # Promotion/demotion timestamps
     promoted_when        = Column(DateTime, nullable=True)
     demoted_when         = Column(DateTime, nullable=True)
 
     def __repr__(self):
-        return f"<Symbol {self.symbol}>"
+        return f"<Symbol id={self.id} symbol={self.symbol}>"
 
 
 class Instrument(Base):
     __tablename__ = "instruments"
+    __table_args__ = (
+        UniqueConstraint("instrument_token", name="instrument_token"),
+        Index("exchange", "exchange"),
+        Index("expiry", "expiry"),
+        Index("instrument_type", "instrument_type"),
+        Index("name", "name"),
+        Index("tradingsymbol", "tradingsymbol"),
+        Index(
+            "idx_instruments_underlying_expiry",
+            "name",
+            "instrument_type",
+            "expiry",
+        ),
+    )
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    instrument_token = Column(String(50), nullable=False)
-    exchange_token = Column(String(50), nullable=False)
-    tradingsymbol = Column(String(50), nullable=False)
-    name = Column(String(50), nullable=False)
-    last_price = Column(Float, nullable=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    instrument_token = Column(String(20), nullable=False)
+    exchange_token = Column(String(20), nullable=False)
+    tradingsymbol = Column(String(100), nullable=False)
+    name = Column(String(100), nullable=False)
+    last_price = Column(Numeric(13, 2), nullable=True)
     expiry = Column(Date, nullable=True)
-    strike = Column(Float, nullable=True)
-    tick_size = Column(Float, nullable=True)
-    lot_size = Column(Float, nullable=True)
+    strike = Column(Numeric(13, 2), nullable=True)
+    tick_size = Column(Numeric(13, 2), nullable=True)
+    lot_size = Column(Numeric(13, 0), nullable=True)
     instrument_type = Column(String(10), nullable=False)
     segment = Column(String(10), nullable=False)
     exchange = Column(String(10), nullable=False)
@@ -383,18 +413,26 @@ class Instrument(Base):
 
 class Candle(Base):
     __tablename__ = "candles"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "frequency", "candle_time",
+            name="symbol_frequency_ctime",
+        ),
+        Index("ctime_idx", "candle_time"),
+        Index("frequency_idx", "frequency"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(50), nullable=False)
     frequency = Column(Integer, nullable=False)
     candle_time = Column(DateTime, nullable=False)
-    open = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    high = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    low = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    close = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    volume = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    oi = Column(DECIMAL(13, 2), nullable=False)
-    active = Column(Boolean, nullable=False, default=True)
+    open = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    high = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    low = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    close = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    volume = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    oi = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    active = Column(Boolean, nullable=False, default=True, server_default="1")
 
     def __repr__(self):
         return f"<Candle {self.symbol} - {self.frequency} - {self.candle_time}>"
@@ -402,6 +440,10 @@ class Candle(Base):
 
 class Snapshot(Base):
     __tablename__ = "snapshots"
+    __table_args__ = (
+        Index("idx_snapshots_time_symbol", "snapshot_time", "symbol"),
+        Index("idx_snapshots_unprocessed", "processed", "snapshot_time", "symbol"),
+    )
 
     symbol = Column(String(50), primary_key=True, nullable=False)
     snapshot_time = Column(DateTime, primary_key=True, nullable=False)
@@ -411,7 +453,7 @@ class Snapshot(Base):
     ltp_time = Column(DateTime, nullable=True)
 
     data = Column(JSON, nullable=True)
-    processed = Column(Boolean, nullable=False, default=False)
+    processed = Column(Boolean, nullable=False, default=False, server_default="0")
 
     def __repr__(self):
         return f"<Snapshot {self.symbol} - {self.snapshot_time}>"
@@ -419,6 +461,9 @@ class Snapshot(Base):
 
 class DerivativesChain(Base):
     __tablename__ = "derivativeschain"
+    __table_args__ = (
+        Index("idx_deriv_v2_time", "snapshot_time"),
+    )
 
     symbol = Column(String(50), primary_key=True, nullable=False)
     snapshot_time = Column(DateTime, primary_key=True, nullable=False)
@@ -532,6 +577,118 @@ class StockRank(Base):
         )
 
 
+class StockRankHistory(Base):
+    """Archived StockRank row from a completed operational day.
+
+    ``stock_rank`` remains the current-day working table.  This table keeps the
+    complete cadence history without changing the live row identity contract.
+    Repeated archival is idempotent by ``(symbol, rank_time)``.
+    """
+
+    __tablename__ = "stock_rank_history"
+
+    history_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    stock_rank_id = Column(BigInteger, nullable=False)
+
+    run_id = Column(String(64), nullable=False)
+    trading_day = Column(Date, nullable=False)
+    rank_time = Column(DateTime, nullable=False)
+    symbol = Column(String(32), nullable=False)
+    rank_position = Column(Integer, nullable=False)
+    universe_size = Column(Integer, nullable=False)
+
+    direction = Column(String(8), nullable=False)
+    classification = Column(String(32), nullable=False)
+    attention_tier = Column(String(16), nullable=False)
+
+    total_score = Column(DECIMAL(10, 4), nullable=False)
+    movement_score = Column(DECIMAL(10, 4), nullable=False)
+    quality_score = Column(DECIMAL(10, 4), nullable=False)
+    range_penalty = Column(DECIMAL(10, 4), nullable=False)
+    stall_penalty = Column(DECIMAL(10, 4), nullable=False)
+
+    close_price = Column(DECIMAL(16, 6), nullable=False)
+    previous_close = Column(DECIMAL(16, 6), nullable=True)
+    today_open = Column(DECIMAL(16, 6), nullable=True)
+    gap_pct = Column(DECIMAL(12, 6), nullable=True)
+    session_move_pct = Column(DECIMAL(12, 6), nullable=True)
+    post_open_move_pct = Column(DECIMAL(12, 6), nullable=True)
+
+    move_15m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_30m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_60m_pct = Column(DECIMAL(12, 6), nullable=True)
+    move_15m_atr = Column(DECIMAL(12, 6), nullable=True)
+    move_30m_atr = Column(DECIMAL(12, 6), nullable=True)
+    move_60m_atr = Column(DECIMAL(12, 6), nullable=True)
+
+    atr_value = Column(DECIMAL(16, 6), nullable=False)
+    atr_pct = Column(DECIMAL(12, 6), nullable=True)
+    directional_efficiency = Column(DECIMAL(12, 6), nullable=True)
+    recent_efficiency = Column(DECIMAL(12, 6), nullable=True)
+    direction_consistency = Column(DECIMAL(12, 6), nullable=False)
+    acceleration_score = Column(DECIMAL(12, 6), nullable=False)
+    volume_ratio = Column(DECIMAL(12, 6), nullable=True)
+    freshness_score = Column(DECIMAL(12, 6), nullable=False)
+    bars_since_extreme = Column(Integer, nullable=False)
+
+    range_active = Column(Boolean, nullable=False, default=False)
+    range_episode_id = Column(String(128), nullable=True)
+    range_id = Column(String(128), nullable=True)
+    range_age_bars = Column(Integer, nullable=False, default=0)
+    range_width_pct = Column(DECIMAL(12, 6), nullable=True)
+    containment_ratio = Column(DECIMAL(12, 6), nullable=True)
+    midpoint_crossings = Column(Integer, nullable=False, default=0)
+    vwap_crossings = Column(Integer, nullable=False, default=0)
+    failed_escape_count = Column(Integer, nullable=False, default=0)
+    rearm_required = Column(Boolean, nullable=False, default=False)
+    attempt_limit_reached = Column(Boolean, nullable=False, default=False)
+
+    metrics_json = Column(JSON, nullable=False)
+
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+    archived_on = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "rank_time",
+            name="uq_stock_rank_history_symbol_time",
+        ),
+        Index("idx_stock_rank_history_live_id", "stock_rank_id"),
+        Index("idx_stock_rank_history_run", "run_id"),
+        Index(
+            "idx_stock_rank_history_time_position",
+            "rank_time",
+            "rank_position",
+        ),
+        Index("idx_stock_rank_history_day_symbol", "trading_day", "symbol"),
+        Index(
+            "idx_stock_rank_history_day_class",
+            "trading_day",
+            "classification",
+        ),
+        Index(
+            "idx_stock_rank_history_day_tier",
+            "trading_day",
+            "attention_tier",
+        ),
+        Index("idx_stock_rank_history_day_score", "trading_day", "total_score"),
+        Index("idx_stock_rank_history_archived_on", "archived_on"),
+        {"info": {"intraday": False}},
+    )
+
+    def __repr__(self):
+        return (
+            f"<StockRankHistory {self.symbol} rank={self.rank_position} "
+            f"time={self.rank_time} score={self.total_score}>"
+        )
+
+
 # -----------------------------------
 # Signals (lifecycle-based)
 # -----------------------------------
@@ -555,8 +712,8 @@ class Signal(Base):
     side = Column(String(8), nullable=False)  # BUY / SELL
 
     # Lifecycle
-    stage = Column(String(32), nullable=False, default="TRACKING")
-    status = Column(String(16), nullable=False, default="OPEN")
+    stage = Column(String(32), nullable=False, default="TRACKING", server_default="TRACKING")
+    status = Column(String(16), nullable=False, default="OPEN", server_default="OPEN")
     status_reason = Column(String(255), nullable=True)
 
     # Timing
@@ -586,20 +743,20 @@ class Signal(Base):
     # Signal Analytics / Excursion
     # -----------------------------------
 
-    last_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000)
-    last_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00)
+    last_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000, server_default="0.0000")
+    last_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
 
-    max_price = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    min_price = Column(DECIMAL(13, 2), nullable=False, default=0.00)
+    max_price = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    min_price = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
 
     max_time = Column(DateTime, nullable=True)
     min_time = Column(DateTime, nullable=True)
 
-    max_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000)
-    min_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000)
+    max_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000, server_default="0.0000")
+    min_pnl = Column(DECIMAL(10, 4), nullable=False, default=0.0000, server_default="0.0000")
 
-    max_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00)
-    min_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00)
+    max_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
+    min_pnl_value = Column(DECIMAL(13, 2), nullable=False, default=0.00, server_default="0.00")
 
     # JSON payloads
     criteria_json = Column(JSON, nullable=False)
@@ -610,11 +767,13 @@ class Signal(Base):
         UniqueConstraint("signal_id", name="uq_signal_id"),
 
         Index("idx_active_lookup", "equity_ref", "lifecycle", "status", "last_eval_time"),
-        Index("idx_lifecycle_status_time", "lifecycle", "status", "last_eval_time"),
+        Index("idx_strategy_status_time", "lifecycle", "status", "last_eval_time"),
         Index("idx_setup_status_time", "setup", "status", "last_eval_time"),
         Index("idx_equity_time", "equity_ref", "last_eval_time"),
         Index("idx_ltp_time", "ltp_time"),
         Index("idx_status_stage_time", "status", "stage", "last_eval_time"),
+        Index("idx_signals_status_eval_id", "status", "last_eval_time", "id"),
+        Index("idx_signals_eval_id", "last_eval_time", "id"),
     )
 
     def __repr__(self):
@@ -822,25 +981,31 @@ class SignalHistory(Base):
 class UserTrade(Base):
     __tablename__ = "user_trades"
     __table_args__ = (
-        # A signal may deploy at most one row per user/instrument type.  This is
-        # the final race-safe guard behind the application-level deployment
-        # check.  Re-entry, if ever introduced, must use a new explicit model.
+        # The symbol constraint protects exact duplicate legs, while the
+        # instrument-type constraint is the race-safe deployment guard.
+        UniqueConstraint(
+            "userid", "signal_id", "symbol", name="uq_user_opp_symbol"
+        ),
         UniqueConstraint(
             "userid",
             "signal_id",
             "instrument_type",
             name="uq_user_trade_user_signal_instrument",
         ),
+        Index("idx_entry_pickup", "entry_status", "execution_mode"),
+        Index("idx_exit_pickup", "exit_status", "execution_mode"),
+        Index("idx_equity_ref", "equity_ref"),
+        Index("idx_signal_id", "signal_id"),
     )
 
     # =============================
     # 1) Identity & provenance
     # =============================
     id              = Column(Integer, primary_key=True, autoincrement=True)
-    userid          = Column(String(50),  nullable=False, index=True)
+    userid          = Column(String(50),  nullable=False)
 
     # Originating lifecycle signal reference (not a FK)
-    signal_id  = Column(String(100), nullable=False, index=True)
+    signal_id  = Column(String(100), nullable=False)
 
     source          = Column(String(50),  nullable=False, default="")
     message         = Column(Text,        nullable=True)
@@ -852,7 +1017,7 @@ class UserTrade(Base):
     # 2) Instrument & trade type
     # =============================
     symbol          = Column(String(255), nullable=False)
-    equity_ref      = Column(String(50),  nullable=False, index=True)
+    equity_ref      = Column(String(50),  nullable=False)
 
     instrument_type = Column(String(20),  nullable=False)   # EQ | FUT | CE | PE
     trade_type      = Column(String(10),  nullable=False)   # BUY | SELL
@@ -864,10 +1029,10 @@ class UserTrade(Base):
     # =============================
     # 3) Lifecycle control (ENTRY + EXIT)
     # =============================
-    entry_status    = Column(String(30),  nullable=False, default="CREATED", index=True)
+    entry_status    = Column(String(30),  nullable=False, default="CREATED")
     # CREATED | READY | SUBMITTED | FILLED | EXPIRED | CANCELLED | REJECTED | INVALID
 
-    exit_status     = Column(String(30),  nullable=False, default="NONE", index=True)
+    exit_status     = Column(String(30),  nullable=False, default="NONE")
     # NONE | READY | SUBMITTED | FILLED | CANCELLED | FAILED
 
     execution_mode  = Column(String(10),  nullable=False, server_default="VIRTUAL")  # REAL | VIRTUAL
@@ -1080,7 +1245,7 @@ class AuditLog(Base):
     symbol = Column(String(50), nullable=True)
     userid = Column(String(50), nullable=True)
 
-    evaluation_stage = Column(String(50), nullable=False) # resolver | trade_generator | trade_monitor | init_reset
+    evaluation_stage = Column(String(50), nullable=False) # resolver | trade_generator | trade_monitor | day_prep
     previous_state = Column(String(80), nullable=True)
     new_state = Column(String(80), nullable=True)
     action = Column(String(80), nullable=True)
@@ -1100,6 +1265,11 @@ class AuditLog(Base):
 class AuditLogHistory(Base):
     __tablename__ = "auditlog_history"
     __table_args__ = (
+        UniqueConstraint(
+            "auditlog_id",
+            "ts",
+            name="uq_auditlog_history_live_ts",
+        ),
         Index("idx_auditloghist_ts", "ts"),
         Index("idx_auditloghist_entity", "entity_type", "entity_id"),
         Index("idx_auditloghist_symbol_ts", "symbol", "ts"),
@@ -1144,8 +1314,8 @@ class Event(Base):
     aggregate_key = Column(String(128), nullable=False)
     correlation_id = Column(String(64), nullable=True)
     payload = Column(JSON, nullable=True)
-    status = Column(String(32), nullable=False, default="pending")
-    attempts = Column(Integer, nullable=False, default=0)
+    status = Column(String(32), nullable=False, default="pending", server_default="pending")
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(Text, nullable=True)
     available_at = Column(DateTime, nullable=False, server_default=func.now())
     created_at = Column(DateTime, nullable=False, server_default=func.now())
@@ -1173,7 +1343,7 @@ class Alert(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     etime = Column(DateTime, nullable=True)
     message = Column(String(500), nullable=False)
-    processed = Column(Boolean, default=False)
+    processed = Column(Boolean, nullable=False, default=False, server_default="0")
 
     def __repr__(self):
         return f"<Alert id={self.id} etime={self.etime} message='{self.message}'>"

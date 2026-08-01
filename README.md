@@ -83,7 +83,7 @@ The primary service entry points are under `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `run_stock_rank.py` | Six-minute StockRank service over a common completed active-universe snapshot cadence; persists ranks and logs summaries without CSV output |
+| `run_stock_rank.py` | Reserved entry point for the six-minute StockRank runner; keep its systemd unit disabled until the StockRank service patch is applied |
 | `gen_derivatives.py` | Generate derivatives-chain context |
 | `gen_snapshots.py` | Generate completed-candle snapshots |
 | `gen_signals.py` | Process unprocessed snapshots through SignalGenerator |
@@ -93,9 +93,9 @@ The primary service entry points are under `scripts/`:
 | `event_handler.py` | Coordinate scheduled service execution |
 | `run_broker_reconcile.py` | Reconcile broker and database state |
 | `run_trade_backfill.py` | Backfill trade execution details where required |
-| `init_intraday_reset.py` | Archive configured data and clear intraday operational tables |
+| `prepare_day.py` | Archive durable intraday rows, clear current operational state, and prepare users |
 
-Systemd service templates are stored in the repository root with the `t_*.service` naming convention.
+Systemd service templates are stored in the repository root with the `t_*.service` naming convention. `t_prepare_day.service` is a one-shot unit; no automatic timer is installed by this repository.
 
 ## Operational programs
 
@@ -103,20 +103,12 @@ Occasional/manual workflows are under `operations/`:
 
 | Program | Responsibility |
 |---|---|
-| `filter_stock_universe.py` | Review/apply whitelist and blacklist policy; owns only `symbols.enabled` |
-| `generate_stock_universe.py` | Review/apply long-horizon 150-to-100 curation; owns only `symbols.active` |
-| `refresh_broker_instruments.py` | Refresh raw NSE/NFO broker instruments |
-| `refresh_derivative_symbols.py` | Truncate and rebuild EQ plus configured current/near/far FUT/OPT symbols from broker instruments |
+| `refresh_broker_instruments.py` | Directly replace the authoritative raw NSE/NFO broker instrument master after complete fetch/structure validation |
+| `refresh_derivative_symbols.py` | Upsert application EQ/FUT/CE/PE symbols for the configured front, near and far published expiries; applies by default and supports `--review-only` |
+| `filter_stock_universe.py` | Review/apply whitelist, blacklist and minimum-price policy; owns `symbols.enabled` and refreshes the EQ quote price used by that policy |
+| `generate_stock_universe.py` | Review/apply long-horizon enabled-to-configured-limit curation; owns only `symbols.active` |
 
-Universe operations default to review mode and require `--apply` for membership writes. `refresh_derivative_symbols.py` applies by default: it builds and validates the complete plan first, truncates `symbols`, recreates EQ rows with generation flags enabled but `enabled=False` and `active=False`, and recreates current/near/far derivatives as enabled. Run `filter_stock_universe.py` and `generate_stock_universe.py` immediately afterwards to restore EQ policy and active membership. The retired first-candle StockScan selector and its separate service module have been removed. StockRank runs every six minutes over the active universe, owns only `stock_rank` rows, and remains diagnostic until StockAdvisor integration.
-
-## StockRank
-
-StockRank measures current cross-sectional attention-worthiness across the curated active universe. Snapshots remain on a three-minute cadence; StockRank persists a common-cadence ranking every six minutes after a configured completion lag. Each row records movement quality, range/stall penalties, movement classification, absolute score, cross-sectional rank and an attention tier (`PRIORITY`, `SECONDARY` or `SUPPRESSED`).
-
-StockRank does not alter `enabled`, `active`, signals, opportunities or trades. The production runner writes database rows and concise logs only. Detailed CSV diagnostics belong to `tests/functionality/test_stock_rank.py`; historical consolidated analysis belongs to `tests/replays/replay_stock_rank.py`.
-
-If `stock_rank` was created before the attention-tier field was added, run `database/sql/20260801_add_stock_rank_attention_tier.sql` once before starting the service.
+The intended occasional operating cycle is: refresh broker instruments, refresh derivative symbols, review/apply the enabled universe, then review/apply the active universe. Membership operations default to review mode and require `--apply`; authoritative refresh operations apply directly unless their documented review option is used. The retired first-candle StockScan selector and its separate service module have been removed. StockRank remains a separate diagnostic/persistence concern and its production runner is implemented in a later patch.
 
 ## Service window and failure handling
 
@@ -209,14 +201,13 @@ python -m pytest -q
 
 ### Functionality programs
 
-`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockRank, TradeGenerator, TradeExecutor, or TradeMonitor.
+`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockScan, TradeGenerator, TradeExecutor, or TradeMonitor.
 
 Examples:
 
 ```powershell
 python tests/functionality/test_snapshot_generator.py
 python tests/functionality/test_derivatives.py
-python tests/functionality/test_stock_rank.py
 python tests/functionality/test_trade_generator.py
 ```
 
@@ -234,7 +225,6 @@ These are not intended to be collected and run together as unit tests. Some requ
 | `replay_pipeline.py` | Generate snapshots and run the complete end-to-end pipeline |
 | `replay_signal_generator.py` | Focused signal and opportunity lifecycle diagnostics from stored snapshots |
 | `replay_signal_trade_pipeline.py` | Strict downstream validation through trade creation, execution, monitoring, and exits |
-| `replay_stock_rank.py` | Causal multi-cadence StockRank replay with consolidated cadence, row and symbol reports |
 
 The sequential and multi-worker unprocessed replays are intentionally retained separately for now. They may be compared and merged later after equivalent behaviour is established.
 
@@ -307,30 +297,50 @@ python tests/replays/replay_pipeline.py
 
 This program starts before snapshots exist and runs snapshot generation through trade exits.
 
-## Intraday reset
+## Day Prep
 
-Run:
+Run on a normal trading day:
 
 ```powershell
-python scripts/init_intraday_reset.py
+python scripts/prepare_day.py
 ```
 
-The reset scope is explicitly configured in `SERVICE_CONFIG.init_reset.intraday_tables`. It currently includes:
+For controlled weekend/testing execution:
+
+```powershell
+python scripts/prepare_day.py --force
+```
+
+Day Prep is a one-shot service/runner workflow. It performs mandatory verified
+archives before any current-state table is cleared:
 
 ```text
-user_trades
+signals       -> signals_history
+user_trades   -> user_trades_history
+stock_rank    -> stock_rank_history
+```
+
+Auditlog history is optional and disabled by default through
+`SERVICE_CONFIG.day_prep.archive_auditlog`. Whether archived or not, the
+current audit table is cleared during preparation.
+
+The following are intraday working state and are cleared without history:
+
+```text
 stock_opportunities
-signals
 snapshots
 candles
 derivativeschain
-oms_funds_history
-oms_positions_history
-oms_orders_history
 auditlog
 ```
 
-Signals and user trades may be archived according to reset configuration before truncation. Opportunity archival can be added later if required; the current table is cleared as intraday operational state.
+Current OMS projections (`oms_funds`, `oms_positions`, `oms_orders`) are also
+cleared when configured. Their history tables are never cleared.
+
+Day Prep does not read or modify `symbols`. Universe and generation flags
+remain owned by the operational universe programs. The service blocks before
+any archive or clear when unresolved trades are present, unless that strict
+preflight is explicitly disabled in configuration.
 
 ## Validation checklist
 
