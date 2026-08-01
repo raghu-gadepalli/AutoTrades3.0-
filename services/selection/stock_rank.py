@@ -1,58 +1,26 @@
-#!/usr/bin/env python3
-"""Diagnostic rolling stock movement ranking from completed snapshots.
+"""Causal cross-sectional StockRank evaluation and persistence.
 
-The service reads one common completed snapshot cadence for the active/enabled
-EQ universe, computes a cross-sectional movement-quality ranking, persists one
-``stock_rank`` row per symbol, exports the same run to ``reports/`` and logs an
-end-of-run summary.
-
-This first version is observation-only.  It does not change symbols.active,
-generate_signals, Auction, StockAdvisor, signals, opportunities or trades.
+This module contains reusable ranking/domain logic plus database orchestration.
+It deliberately has no command-line parser, service loop, logging setup or CSV
+export. Production, functionality and replay entry points live elsewhere.
+StockRank owns only ``stock_rank`` rows and never changes universe membership,
+signals, opportunities or trades.
 """
 from __future__ import annotations
 
-import argparse
-import csv
-import json
 import logging
 import math
-import os
-import sys
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time as dtime
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-# Allow direct execution: python services/selection/stock_rank.py
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from configs.stock_rank_config import STOCK_RANK_CONFIG, StockRankConfig
-from logconfig import setup_logging
 from schemas.snapshot import SnapshotSchema
 from schemas.stock_rank import StockRankSchema
 from schemas.symbol import SymbolSchema
 from utils.datetime_utils import IST, business_now
 
 logger = logging.getLogger(__name__)
-
-# =============================================================================
-# SOURCE DEFAULTS
-# =============================================================================
-# These defaults are intentionally visible in the program, matching the replay
-# utilities.  Every value can be overridden from the command line.
-#
-# None for date/time means:
-#   - current IST business day
-#   - latest common completed snapshot cadence at or before the run time
-DEFAULT_TRADING_DAY: Optional[str] = None
-DEFAULT_AS_OF: Optional[str] = None
-DEFAULT_SYMBOLS: Optional[str] = None
-DEFAULT_ALL_ENABLED = False
-DEFAULT_REPORT_DIR = "reports"
-DEFAULT_LOG_FILE: Optional[str] = "/var/www/autotrades/scripts/stock_rank.log"
-
 
 @dataclass(frozen=True)
 class RangeContext:
@@ -81,6 +49,7 @@ class StockRankResult:
     universe_size: int
     direction: str
     classification: str
+    attention_tier: str
     total_score: float
     movement_score: float
     quality_score: float
@@ -121,6 +90,7 @@ class StockRankResult:
             universe_size=self.universe_size,
             direction=self.direction,
             classification=self.classification,
+            attention_tier=self.attention_tier,
             total_score=self.total_score,
             movement_score=self.movement_score,
             quality_score=self.quality_score,
@@ -613,6 +583,7 @@ class StockRankEvaluator:
             universe_size=1,
             direction=direction,
             classification=classification,
+            attention_tier="SUPPRESSED",
             total_score=total_score,
             movement_score=movement_score,
             quality_score=quality_score,
@@ -661,58 +632,187 @@ class StockRankEvaluator:
             )
         )
         size = len(evaluated)
-        return [
-            replace(row, rank_position=index, universe_size=size)
-            for index, row in enumerate(evaluated, start=1)
-        ]
+        ranked: List[StockRankResult] = []
+        for index, row in enumerate(evaluated, start=1):
+            actionable = row.classification.startswith(("MOVING_", "DEVELOPING_"))
+            if (
+                actionable
+                and index <= self.config.priority_rank_max
+                and row.total_score >= self.config.priority_score_min
+            ):
+                tier = "PRIORITY"
+            elif (
+                actionable
+                and index <= self.config.secondary_rank_max
+                and row.total_score >= self.config.secondary_score_min
+            ):
+                tier = "SECONDARY"
+            else:
+                tier = "SUPPRESSED"
+            metrics = dict(row.metrics)
+            metrics["attention"] = {
+                "attention_score": row.total_score,
+                "attention_rank": index,
+                "attention_tier": tier,
+                "rank_asof": row.rank_time,
+                "universe_size": size,
+                "tier_version": "STOCK_RANK_ATTENTION_V1",
+            }
+            ranked.append(
+                replace(
+                    row,
+                    rank_position=index,
+                    universe_size=size,
+                    attention_tier=tier,
+                    metrics=metrics,
+                )
+            )
+        return ranked
 
 
 class StockRankService:
-    """Database/report orchestration around the pure evaluator."""
+    """Database orchestration around the pure evaluator."""
 
     def __init__(self, config: StockRankConfig = STOCK_RANK_CONFIG) -> None:
         self.config = config
         self.evaluator = StockRankEvaluator(config)
 
-    def _symbols(self, *, active_only: bool) -> List[str]:
-        rows = SymbolSchema.fetch_symbols(
-            active=1 if active_only else None,
-            type_filter="EQ",
-        ) or []
-        symbols = sorted({row.symbol.strip().upper() for row in rows if row.symbol.strip()})
-        if not symbols:
-            raise ValueError("StockRank found no enabled EQ symbols")
-        return symbols
+    def resolve_symbols(
+        self,
+        *,
+        symbols: Optional[Sequence[str]] = None,
+        active_only: Optional[bool] = None,
+    ) -> List[str]:
+        if symbols is not None:
+            resolved = sorted(
+                {
+                    str(symbol or "").strip().upper()
+                    for symbol in symbols
+                    if str(symbol or "").strip()
+                }
+            )
+        else:
+            use_active = (
+                self.config.active_symbols_only
+                if active_only is None
+                else bool(active_only)
+            )
+            rows = SymbolSchema.fetch_symbols(
+                active=1 if use_active else None,
+                type_filter="EQ",
+            ) or []
+            resolved = sorted(
+                {
+                    row.symbol.strip().upper()
+                    for row in rows
+                    if row.symbol.strip()
+                }
+            )
+        if not resolved:
+            raise ValueError("StockRank found no eligible EQ symbols")
+        return resolved
 
     def run(
         self,
         *,
         trading_day: Optional[date] = None,
         through_time: Optional[datetime] = None,
+        rank_time: Optional[datetime] = None,
         symbols: Optional[Sequence[str]] = None,
         active_only: Optional[bool] = None,
-        report_dir: Optional[str] = None,
+        persist: bool = True,
+        after_rank_time: Optional[datetime] = None,
+        minimum_interval_minutes: Optional[int] = None,
+        age_reference_time: Optional[datetime] = None,
+        maximum_rank_age_minutes: Optional[float] = None,
     ) -> Dict[str, Any]:
         if not self.config.enabled:
             raise RuntimeError("StockRank is disabled")
+        if rank_time is not None and through_time is not None:
+            raise ValueError("Use rank_time or through_time, not both")
 
         trading_day = trading_day or business_now().date()
-        use_active = self.config.active_symbols_only if active_only is None else bool(active_only)
-        requested_symbols = sorted(
-            {
-                str(symbol or "").strip().upper()
-                for symbol in (symbols or self._symbols(active_only=use_active))
-                if str(symbol or "").strip()
-            }
+        requested_symbols = self.resolve_symbols(
+            symbols=symbols,
+            active_only=active_only,
         )
-        rank_time, cadence_coverage, requested_count = SnapshotSchema.fetch_latest_rankable_time(
-            trading_day=trading_day,
-            symbols=requested_symbols,
-            minimum_coverage_ratio=self.config.minimum_snapshot_coverage_ratio,
-            through_time=(_to_ist_naive(through_time) if through_time is not None else None),
+        requested_count = len(requested_symbols)
+
+        if rank_time is None:
+            selected_time, cadence_coverage, _ = SnapshotSchema.fetch_latest_rankable_time(
+                trading_day=trading_day,
+                symbols=requested_symbols,
+                minimum_coverage_ratio=self.config.minimum_snapshot_coverage_ratio,
+                through_time=(
+                    _to_ist_naive(through_time)
+                    if through_time is not None
+                    else None
+                ),
+            )
+        else:
+            selected_time = _to_ist_naive(rank_time)
+            if selected_time.date() != trading_day:
+                raise ValueError("rank_time must belong to trading_day")
+            exact = SnapshotSchema.fetch_rank_snapshots_at_time(
+                rank_time=selected_time,
+                symbols=requested_symbols,
+            )
+            cadence_coverage = len(exact)
+            required = max(
+                1,
+                math.ceil(
+                    requested_count * self.config.minimum_snapshot_coverage_ratio
+                ),
+            )
+            if cadence_coverage < required:
+                raise ValueError(
+                    "Exact StockRank cadence has insufficient coverage "
+                    f"coverage={cadence_coverage}/{requested_count} required={required}"
+                )
+
+        selected_time = _to_ist_naive(selected_time)
+        previous_time = (
+            _to_ist_naive(after_rank_time)
+            if after_rank_time is not None
+            else None
         )
+        if previous_time is not None:
+            elapsed_minutes = (selected_time - previous_time).total_seconds() / 60.0
+            minimum_minutes = float(minimum_interval_minutes or 0)
+            if selected_time <= previous_time or elapsed_minutes < minimum_minutes:
+                return {
+                    "summary": {
+                        "status": "NO_NEW_CADENCE",
+                        "trading_day": trading_day.isoformat(),
+                        "rank_time": selected_time.isoformat(sep=" "),
+                        "requested_symbols": requested_count,
+                        "cadence_coverage": cadence_coverage,
+                        "ranked_symbols": 0,
+                        "persisted": False,
+                    },
+                    "rows": [],
+                }
+
+        if maximum_rank_age_minutes is not None:
+            reference = _to_ist_naive(age_reference_time or business_now())
+            rank_age = (reference - selected_time).total_seconds() / 60.0
+            if rank_age > float(maximum_rank_age_minutes):
+                return {
+                    "summary": {
+                        "status": "STALE_CADENCE",
+                        "trading_day": trading_day.isoformat(),
+                        "rank_time": selected_time.isoformat(sep=" "),
+                        "requested_symbols": requested_count,
+                        "cadence_coverage": cadence_coverage,
+                        "ranked_symbols": 0,
+                        "rank_age_minutes": round(rank_age, 4),
+                        "persisted": False,
+                    },
+                    "rows": [],
+                }
+
         snapshots = SnapshotSchema.fetch_rank_snapshots_at_time(
-            rank_time=rank_time,
+            rank_time=selected_time,
             symbols=requested_symbols,
         )
         actual_symbols = {snapshot.symbol.strip().upper() for snapshot in snapshots}
@@ -735,7 +835,7 @@ class StockRankService:
             except Exception as exc:
                 failures[symbol] = f"{type(exc).__name__}: {exc}"
                 logger.exception(
-                    "StockRank failed causal snapshot history for %s @ %s",
+                    "StockRank failed causal snapshot history | symbol=%s rank_time=%s",
                     symbol,
                     snapshot.snapshot_time,
                 )
@@ -744,277 +844,41 @@ class StockRankService:
         if not ranked:
             raise RuntimeError("StockRank produced no valid rankings")
 
-        rank_time_naive = _to_ist_naive(rank_time)
-        run_id = f"STOCK_RANK:{rank_time_naive.strftime('%Y%m%dT%H%M%S')}"
+        run_id = f"STOCK_RANK:{selected_time.strftime('%Y%m%dT%H%M%S')}"
         schemas = [row.to_schema(run_id=run_id) for row in ranked]
-        persisted = StockRankSchema.upsert_many(schemas)
-        report_path = self._export_report(
-            rows=persisted,
-            report_dir=report_dir or self.config.report_dir,
-        )
+        output_rows = StockRankSchema.upsert_many(schemas) if persist else schemas
 
         summary = {
+            "status": "COMPLETED",
             "run_id": run_id,
             "trading_day": trading_day.isoformat(),
-            "rank_time": rank_time_naive.isoformat(sep=" "),
+            "rank_time": selected_time.isoformat(sep=" "),
             "requested_symbols": requested_count,
-            "cadence_coverage": cadence_coverage,
-            "ranked_symbols": len(persisted),
+            "cadence_coverage": int(cadence_coverage),
+            "ranked_symbols": len(output_rows),
             "missing_symbols": missing_symbols,
             "failed_symbols": failures,
+            "priority_count": sum(row.attention_tier == "PRIORITY" for row in output_rows),
+            "secondary_count": sum(row.attention_tier == "SECONDARY" for row in output_rows),
+            "suppressed_count": sum(row.attention_tier == "SUPPRESSED" for row in output_rows),
             "range_bound_count": sum(
-                1
-                for row in persisted
-                if row.classification in {"RANGE_BOUND", "STALLED_GAP_RANGE"}
+                row.classification in {"RANGE_BOUND", "STALLED_GAP_RANGE"}
+                for row in output_rows
             ),
             "moving_count": sum(
-                1 for row in persisted if row.classification.startswith("MOVING_")
+                row.classification.startswith("MOVING_") for row in output_rows
             ),
             "developing_count": sum(
-                1 for row in persisted if row.classification.startswith("DEVELOPING_")
+                row.classification.startswith("DEVELOPING_") for row in output_rows
             ),
-            "report_path": str(report_path),
+            "persisted": bool(persist),
         }
-        self._log_summary(summary, persisted)
-        return {"summary": summary, "rows": persisted}
-
-    def _resolve_report_dir(self, report_dir: str) -> Path:
-        path = Path(report_dir)
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _export_report(
-        self,
-        *,
-        rows: Sequence[StockRankSchema],
-        report_dir: str,
-    ) -> Path:
-        target_dir = self._resolve_report_dir(report_dir)
-        rank_time = rows[0].rank_time
-        filename = f"stock_rank_{rank_time.strftime('%Y%m%d_%H%M%S')}.csv"
-        path = target_dir / filename
-
-        report_rows: List[Dict[str, Any]] = []
-        for row in rows:
-            payload = row.report_row()
-            payload["metrics_json"] = json.dumps(
-                payload["metrics_json"],
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-            report_rows.append(payload)
-
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(report_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(report_rows)
-        return path
-
-    def _log_summary(
-        self,
-        summary: Dict[str, Any],
-        rows: Sequence[StockRankSchema],
-    ) -> None:
-        logger.info(
-            "STOCK_RANK_SUMMARY | run_id=%s rank_time=%s requested=%d coverage=%d ranked=%d moving=%d developing=%d range_bound=%d missing=%d failed=%d report=%s",
-            summary["run_id"],
-            summary["rank_time"],
-            summary["requested_symbols"],
-            summary["cadence_coverage"],
-            summary["ranked_symbols"],
-            summary["moving_count"],
-            summary["developing_count"],
-            summary["range_bound_count"],
-            len(summary["missing_symbols"]),
-            len(summary["failed_symbols"]),
-            summary["report_path"],
-        )
-
-        for row in rows[: self.config.top_log_count]:
-            logger.info(
-                "STOCK_RANK_TOP | rank=%d symbol=%s score=%.2f class=%s dir=%s move15=%s move30=%s move60=%s efficiency=%s range_penalty=%.2f stall_penalty=%.2f",
-                row.rank_position,
-                row.symbol,
-                row.total_score,
-                row.classification,
-                row.direction,
-                _format_metric(row.move_15m_pct),
-                _format_metric(row.move_30m_pct),
-                _format_metric(row.move_60m_pct),
-                _format_metric(row.recent_efficiency),
-                row.range_penalty,
-                row.stall_penalty,
-            )
-
-        range_rows = [
-            row
-            for row in rows
-            if row.classification in {"RANGE_BOUND", "STALLED_GAP_RANGE"}
-        ][: self.config.range_log_count]
-        for row in range_rows:
-            logger.info(
-                "STOCK_RANK_RANGE | rank=%d symbol=%s class=%s score=%.2f gap=%s move30=%s range_age=%d width=%s containment=%s midpoint_cross=%d vwap_cross=%d failures=%d penalty=%.2f",
-                row.rank_position,
-                row.symbol,
-                row.classification,
-                row.total_score,
-                _format_metric(row.gap_pct),
-                _format_metric(row.move_30m_pct),
-                row.range_age_bars,
-                _format_metric(row.range_width_pct),
-                _format_metric(row.containment_ratio),
-                row.midpoint_crossings,
-                row.vwap_crossings,
-                row.failed_escape_count,
-                row.range_penalty,
-            )
-
-        if summary["missing_symbols"]:
-            logger.warning(
-                "STOCK_RANK_MISSING | symbols=%s",
-                ",".join(summary["missing_symbols"]),
-            )
-        if summary["failed_symbols"]:
-            logger.warning(
-                "STOCK_RANK_FAILED | %s",
-                summary["failed_symbols"],
-            )
-
-
-def _format_metric(value: Optional[float]) -> str:
-    return "NA" if value is None else f"{float(value):.4f}"
-
-
-def _parse_day(value: Optional[str]) -> Optional[date]:
-    if not value:
-        return None
-    return date.fromisoformat(value)
-
-
-def _parse_as_of(value: Optional[str], trading_day: date) -> Optional[datetime]:
-    if not value:
-        return None
-    text = value.strip()
-    if "T" in text or " " in text:
-        parsed = datetime.fromisoformat(text)
-    else:
-        parsed = datetime.combine(trading_day, dtime.fromisoformat(text))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=IST)
-    return parsed
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Persist and export diagnostic snapshot-based stock ranking. "
-            "All options have visible source defaults and command-line overrides."
-        )
-    )
-    parser.add_argument(
-        "--trading-day",
-        default=DEFAULT_TRADING_DAY,
-        help=(
-            "Trading day YYYY-MM-DD "
-            "(default: current IST business day)"
-            if DEFAULT_TRADING_DAY is None
-            else f"Trading day YYYY-MM-DD (default: {DEFAULT_TRADING_DAY})"
-        ),
-    )
-    parser.add_argument(
-        "--as-of",
-        default=DEFAULT_AS_OF,
-        help=(
-            "HH:MM:SS or ISO datetime upper bound for rank cadence "
-            "(default: latest common completed cadence)"
-            if DEFAULT_AS_OF is None
-            else f"Rank cadence upper bound (default: {DEFAULT_AS_OF})"
-        ),
-    )
-    parser.add_argument(
-        "--symbols",
-        default=DEFAULT_SYMBOLS,
-        help=(
-            "Comma-separated symbols "
-            "(default: universe selected by --all-enabled/--no-all-enabled)"
-            if DEFAULT_SYMBOLS is None
-            else f"Comma-separated symbols (default: {DEFAULT_SYMBOLS})"
-        ),
-    )
-    parser.add_argument(
-        "--all-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_ALL_ENABLED,
-        help=(
-            "Rank all enabled EQ symbols; use --no-all-enabled for active-only "
-            f"(default: {DEFAULT_ALL_ENABLED})"
-        ),
-    )
-    parser.add_argument(
-        "--report-dir",
-        default=DEFAULT_REPORT_DIR,
-        help=f"Report directory (default: {DEFAULT_REPORT_DIR})",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=DEFAULT_LOG_FILE,
-        help=f"Log file (default: {DEFAULT_LOG_FILE})",
-    )
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _build_parser().parse_args(argv)
-    setup_logging(log_file=args.log_file)
-    run_logger = logging.getLogger(__name__)
-
-    trading_day = _parse_day(args.trading_day) or business_now().date()
-    through_time = _parse_as_of(args.as_of, trading_day)
-    symbols = (
-        [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
-        if args.symbols
-        else None
-    )
-
-    run_logger.info(
-        "=== StockRank diagnostic run starting | day=%s as_of=%s universe=%s ===",
-        trading_day,
-        through_time,
-        "ALL_ENABLED" if args.all_enabled else "ACTIVE",
-    )
-    try:
-        StockRankService().run(
-            trading_day=trading_day,
-            through_time=through_time,
-            symbols=symbols,
-            active_only=not args.all_enabled,
-            report_dir=args.report_dir,
-        )
-        return 0
-    except Exception:
-        run_logger.exception("StockRank diagnostic run failed")
-        return 1
-    finally:
-        run_logger.info("=== StockRank diagnostic run stopped ===")
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        return {"summary": summary, "rows": output_rows}
 
 
 __all__ = [
-    "DEFAULT_TRADING_DAY",
-    "DEFAULT_AS_OF",
-    "DEFAULT_SYMBOLS",
-    "DEFAULT_ALL_ENABLED",
-    "DEFAULT_REPORT_DIR",
-    "DEFAULT_LOG_FILE",
     "RangeContext",
     "StockRankResult",
     "StockRankEvaluator",
     "StockRankService",
-    "main",
 ]

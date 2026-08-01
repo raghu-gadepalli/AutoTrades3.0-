@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -29,6 +29,7 @@ class StockRankSchema(BaseModel):
 
     direction: str
     classification: str
+    attention_tier: Literal["PRIORITY", "SECONDARY", "SUPPRESSED"]
 
     total_score: float = Field(ge=0.0, le=100.0)
     movement_score: float = Field(ge=0.0, le=100.0)
@@ -108,20 +109,35 @@ class StockRankSchema(BaseModel):
             return []
 
         rank_times = {row.rank_time for row in payloads}
+        run_ids = {row.run_id for row in payloads}
+        trading_days = {row.trading_day for row in payloads}
+        universe_sizes = {row.universe_size for row in payloads}
         if len(rank_times) != 1:
             raise ValueError("StockRank bulk upsert requires one common rank_time")
+        if len(run_ids) != 1 or len(trading_days) != 1 or len(universe_sizes) != 1:
+            raise ValueError("StockRank bulk upsert requires one coherent run")
         symbols = [row.symbol for row in payloads]
+        positions = [row.rank_position for row in payloads]
         if len(symbols) != len(set(symbols)):
             raise ValueError("StockRank bulk upsert contains duplicate symbols")
+        if sorted(positions) != list(range(1, len(payloads) + 1)):
+            raise ValueError("StockRank bulk upsert requires contiguous rank positions")
+        if next(iter(universe_sizes)) != len(payloads):
+            raise ValueError("StockRank universe_size must match payload count")
 
+        rank_time = payloads[0].rank_time
         with get_trades_db() as db:
+            existing_rows = (
+                db.query(StockRankORM)
+                .filter(StockRankORM.rank_time == rank_time)
+                .all()
+            )
+            existing_by_symbol = {row.symbol: row for row in existing_rows}
+            for stale in existing_rows:
+                if stale.symbol not in symbols:
+                    db.delete(stale)
             for row in payloads:
-                rec = (
-                    db.query(StockRankORM)
-                    .filter(StockRankORM.symbol == row.symbol)
-                    .filter(StockRankORM.rank_time == row.rank_time)
-                    .one_or_none()
-                )
+                rec = existing_by_symbol.get(row.symbol)
                 values = row.orm_values()
                 if rec is None:
                     db.add(StockRankORM(**values))
@@ -132,10 +148,14 @@ class StockRankSchema(BaseModel):
 
             persisted = (
                 db.query(StockRankORM)
-                .filter(StockRankORM.rank_time == payloads[0].rank_time)
-                .filter(StockRankORM.symbol.in_(symbols))
+                .filter(StockRankORM.rank_time == rank_time)
                 .order_by(StockRankORM.rank_position.asc())
                 .all()
+            )
+        if len(persisted) != len(payloads):
+            raise RuntimeError(
+                "StockRank persistence verification failed "
+                f"expected={len(payloads)} actual={len(persisted)}"
             )
         return [StockRankSchema.model_validate(row) for row in persisted]
 
@@ -148,6 +168,29 @@ class StockRankSchema(BaseModel):
             rows = (
                 db.query(StockRankORM)
                 .filter(StockRankORM.run_id == clean)
+                .order_by(StockRankORM.rank_position.asc())
+                .all()
+            )
+        return [StockRankSchema.model_validate(row) for row in rows]
+
+    @staticmethod
+    def fetch_latest_rank_time(trading_day: date) -> Optional[datetime]:
+        with get_trades_db() as db:
+            value = (
+                db.query(StockRankORM.rank_time)
+                .filter(StockRankORM.trading_day == trading_day)
+                .order_by(StockRankORM.rank_time.desc())
+                .limit(1)
+                .scalar()
+            )
+        return value
+
+    @staticmethod
+    def fetch_for_time(rank_time: datetime) -> List["StockRankSchema"]:
+        with get_trades_db() as db:
+            rows = (
+                db.query(StockRankORM)
+                .filter(StockRankORM.rank_time == rank_time)
                 .order_by(StockRankORM.rank_position.asc())
                 .all()
             )

@@ -23,10 +23,17 @@ class StockRankConfig(BaseModel):
 
     enabled: bool = True
 
-    # Runtime / report behaviour.
+    # Production service behaviour.
     log_file: str = "/var/www/autotrades/scripts/stock_rank.log"
     report_dir: str = "reports"
     active_symbols_only: bool = True
+    service_window_start: str = "09:30:00"
+    service_window_end: str = "15:31:00"
+    cadence_minutes: int = Field(default=6, ge=3, le=60)
+    poll_interval_seconds: int = Field(default=15, ge=5, le=300)
+    snapshot_completion_lag_seconds: int = Field(default=300, ge=0, le=900)
+    maximum_snapshot_age_minutes: int = Field(default=12, ge=3, le=60)
+    error_backoff_seconds: int = Field(default=30, ge=1, le=300)
     minimum_snapshot_coverage_ratio: float = Field(default=0.90, gt=0.0, le=1.0)
     history_bars: int = Field(default=40, ge=12, le=200)
     recent_efficiency_bars: int = Field(default=12, ge=5, le=60)
@@ -62,6 +69,13 @@ class StockRankConfig(BaseModel):
     range_penalty_weight: float = Field(default=0.50, ge=0.0, le=1.0)
     stall_penalty_weight: float = Field(default=0.25, ge=0.0, le=1.0)
 
+    # Attention tiers combine absolute score with cross-sectional rank. They
+    # remain diagnostic until StockAdvisor integration.
+    priority_rank_max: int = Field(default=25, ge=1, le=100)
+    secondary_rank_max: int = Field(default=50, ge=1, le=100)
+    priority_score_min: float = Field(default=35.0, ge=0.0, le=100.0)
+    secondary_score_min: float = Field(default=25.0, ge=0.0, le=100.0)
+
     # Classification only.  StockRank never enables/disables or blocks trades.
     moving_score_threshold: float = Field(default=35.0, ge=0.0, le=100.0)
     developing_score_threshold: float = Field(default=20.0, ge=0.0, le=100.0)
@@ -90,6 +104,12 @@ class StockRankConfig(BaseModel):
             raise ValueError("StockRank total movement/quality weights must sum to 1.0")
         if self.developing_score_threshold > self.moving_score_threshold:
             raise ValueError("developing_score_threshold cannot exceed moving_score_threshold")
+        if self.priority_rank_max >= self.secondary_rank_max:
+            raise ValueError("priority_rank_max must be below secondary_rank_max")
+        if self.secondary_score_min > self.priority_score_min:
+            raise ValueError("secondary_score_min cannot exceed priority_score_min")
+        if self.maximum_snapshot_age_minutes * 60 <= self.snapshot_completion_lag_seconds:
+            raise ValueError("maximum snapshot age must exceed completion lag")
         return self
 
 

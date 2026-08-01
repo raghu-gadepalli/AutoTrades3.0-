@@ -779,6 +779,57 @@ class SnapshotSchema(StrictBaseModel):
         return row.snapshot_time, int(row.coverage), len(clean_symbols)
 
     @staticmethod
+    def fetch_rankable_times(
+        *,
+        trading_day: date,
+        symbols: List[str],
+        minimum_coverage_ratio: float = 0.90,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Tuple[datetime, int, int]]:
+        """Return all exact same-time cadences satisfying coverage.
+
+        Historical replay uses this method to enumerate causal StockRank
+        cadences without substituting per-symbol snapshot times.
+        """
+        clean_symbols = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in symbols
+                if str(symbol or "").strip()
+            }
+        )
+        if not clean_symbols:
+            raise ValueError("StockRank cadence lookup requires symbols")
+        ratio = float(minimum_coverage_ratio)
+        if ratio <= 0.0 or ratio > 1.0:
+            raise ValueError("minimum_coverage_ratio must be in (0, 1]")
+
+        day_start = datetime.combine(trading_day, dtime.min)
+        day_end = day_start + timedelta(days=1)
+        lower = max(day_start, start_time or day_start)
+        upper = min(day_end, end_time or day_end)
+        required = max(1, math.ceil(len(clean_symbols) * ratio))
+        with get_trades_db() as db:
+            rows = (
+                db.query(
+                    SnapshotORM.snapshot_time.label("snapshot_time"),
+                    func.count(func.distinct(SnapshotORM.symbol)).label("coverage"),
+                )
+                .filter(SnapshotORM.snapshot_time >= lower)
+                .filter(SnapshotORM.snapshot_time < upper)
+                .filter(SnapshotORM.symbol.in_(clean_symbols))
+                .group_by(SnapshotORM.snapshot_time)
+                .having(func.count(func.distinct(SnapshotORM.symbol)) >= required)
+                .order_by(SnapshotORM.snapshot_time.asc())
+                .all()
+            )
+        return [
+            (row.snapshot_time, int(row.coverage), len(clean_symbols))
+            for row in rows
+        ]
+
+    @staticmethod
     def fetch_rank_snapshots_at_time(
         *,
         rank_time: datetime,

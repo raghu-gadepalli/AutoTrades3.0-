@@ -459,6 +459,7 @@ class StockRank(Base):
 
     direction = Column(String(8), nullable=False)
     classification = Column(String(32), nullable=False)
+    attention_tier = Column(String(16), nullable=False)
 
     total_score = Column(DECIMAL(10, 4), nullable=False)
     movement_score = Column(DECIMAL(10, 4), nullable=False)
@@ -520,6 +521,7 @@ class StockRank(Base):
         Index("idx_stock_rank_time_position", "rank_time", "rank_position"),
         Index("idx_stock_rank_day_symbol", "trading_day", "symbol"),
         Index("idx_stock_rank_day_class", "trading_day", "classification"),
+        Index("idx_stock_rank_day_tier", "trading_day", "attention_tier"),
         Index("idx_stock_rank_day_score", "trading_day", "total_score"),
     )
 

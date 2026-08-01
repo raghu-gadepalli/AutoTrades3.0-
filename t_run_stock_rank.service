@@ -1,5 +1,5 @@
 [Unit]
-Description=autotrades StockRank Service (enable after StockRank runner patch)
+Description=autotrades StockRank Service
 After=network.target
 
 [Service]
@@ -9,7 +9,8 @@ Group=www-data
 UMask=0002
 WorkingDirectory=/var/www/autotrades/scripts
 ExecStart=/var/www/autotrades/venv/bin/python /var/www/autotrades/scripts/run_stock_rank.py
-Restart=no
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target

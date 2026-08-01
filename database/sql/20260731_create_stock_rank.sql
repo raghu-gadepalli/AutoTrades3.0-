@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS `stock_rank` (
 
   `direction` varchar(8) NOT NULL,
   `classification` varchar(32) NOT NULL,
+  `attention_tier` varchar(16) NOT NULL,
 
   `total_score` decimal(10,4) NOT NULL,
   `movement_score` decimal(10,4) NOT NULL,
@@ -69,5 +70,6 @@ CREATE TABLE IF NOT EXISTS `stock_rank` (
   KEY `idx_stock_rank_time_position` (`rank_time`,`rank_position`),
   KEY `idx_stock_rank_day_symbol` (`trading_day`,`symbol`),
   KEY `idx_stock_rank_day_class` (`trading_day`,`classification`),
+  KEY `idx_stock_rank_day_tier` (`trading_day`,`attention_tier`),
   KEY `idx_stock_rank_day_score` (`trading_day`,`total_score`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

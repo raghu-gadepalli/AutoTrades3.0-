@@ -83,7 +83,7 @@ The primary service entry points are under `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `run_stock_rank.py` | Reserved entry point for the six-minute StockRank runner; keep its systemd unit disabled until the StockRank service patch is applied |
+| `run_stock_rank.py` | Six-minute StockRank service over a common completed active-universe snapshot cadence; persists ranks and logs summaries without CSV output |
 | `gen_derivatives.py` | Generate derivatives-chain context |
 | `gen_snapshots.py` | Generate completed-candle snapshots |
 | `gen_signals.py` | Process unprocessed snapshots through SignalGenerator |
@@ -106,9 +106,17 @@ Occasional/manual workflows are under `operations/`:
 | `filter_stock_universe.py` | Review/apply whitelist and blacklist policy; owns only `symbols.enabled` |
 | `generate_stock_universe.py` | Review/apply long-horizon 150-to-100 curation; owns only `symbols.active` |
 | `refresh_broker_instruments.py` | Refresh raw NSE/NFO broker instruments |
-| `refresh_derivative_symbols.py` | Refresh application FUT/OPT symbols from broker instruments |
+| `refresh_derivative_symbols.py` | Truncate and rebuild EQ plus configured current/near/far FUT/OPT symbols from broker instruments |
 
-Universe operations default to review mode and require `--apply` for membership writes. The retired first-candle StockScan selector and its separate service module have been removed. StockRank remains a separate diagnostic/persistence concern and its production runner is implemented in a later patch.
+Universe operations default to review mode and require `--apply` for membership writes. `refresh_derivative_symbols.py` applies by default: it builds and validates the complete plan first, truncates `symbols`, recreates EQ rows with generation flags enabled but `enabled=False` and `active=False`, and recreates current/near/far derivatives as enabled. Run `filter_stock_universe.py` and `generate_stock_universe.py` immediately afterwards to restore EQ policy and active membership. The retired first-candle StockScan selector and its separate service module have been removed. StockRank runs every six minutes over the active universe, owns only `stock_rank` rows, and remains diagnostic until StockAdvisor integration.
+
+## StockRank
+
+StockRank measures current cross-sectional attention-worthiness across the curated active universe. Snapshots remain on a three-minute cadence; StockRank persists a common-cadence ranking every six minutes after a configured completion lag. Each row records movement quality, range/stall penalties, movement classification, absolute score, cross-sectional rank and an attention tier (`PRIORITY`, `SECONDARY` or `SUPPRESSED`).
+
+StockRank does not alter `enabled`, `active`, signals, opportunities or trades. The production runner writes database rows and concise logs only. Detailed CSV diagnostics belong to `tests/functionality/test_stock_rank.py`; historical consolidated analysis belongs to `tests/replays/replay_stock_rank.py`.
+
+If `stock_rank` was created before the attention-tier field was added, run `database/sql/20260801_add_stock_rank_attention_tier.sql` once before starting the service.
 
 ## Service window and failure handling
 
@@ -201,13 +209,14 @@ python -m pytest -q
 
 ### Functionality programs
 
-`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockScan, TradeGenerator, TradeExecutor, or TradeMonitor.
+`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockRank, TradeGenerator, TradeExecutor, or TradeMonitor.
 
 Examples:
 
 ```powershell
 python tests/functionality/test_snapshot_generator.py
 python tests/functionality/test_derivatives.py
+python tests/functionality/test_stock_rank.py
 python tests/functionality/test_trade_generator.py
 ```
 
@@ -225,6 +234,7 @@ These are not intended to be collected and run together as unit tests. Some requ
 | `replay_pipeline.py` | Generate snapshots and run the complete end-to-end pipeline |
 | `replay_signal_generator.py` | Focused signal and opportunity lifecycle diagnostics from stored snapshots |
 | `replay_signal_trade_pipeline.py` | Strict downstream validation through trade creation, execution, monitoring, and exits |
+| `replay_stock_rank.py` | Causal multi-cadence StockRank replay with consolidated cadence, row and symbol reports |
 
 The sequential and multi-worker unprocessed replays are intentionally retained separately for now. They may be compared and merged later after equivalent behaviour is established.
 

@@ -101,6 +101,7 @@ def test_stock_rank_model_has_required_identity_and_indexes() -> None:
         "idx_stock_rank_time_position",
         "idx_stock_rank_day_symbol",
         "idx_stock_rank_day_class",
+        "idx_stock_rank_day_tier",
         "idx_stock_rank_day_score",
     }.issubset(index_names)
 
@@ -161,7 +162,9 @@ def test_clean_directional_mover_outranks_stalled_gap_range() -> None:
 
     assert [row.symbol for row in ranked] == ["MOVER", "GAPRANGE"]
     assert ranked[0].classification == "MOVING_UP"
+    assert ranked[0].attention_tier == "PRIORITY"
     assert ranked[1].classification in {"RANGE_BOUND", "STALLED_GAP_RANGE"}
+    assert ranked[1].attention_tier == "SUPPRESSED"
     assert ranked[1].range_penalty > ranked[0].range_penalty
     assert ranked[1].total_score < ranked[0].total_score
 
@@ -203,49 +206,31 @@ def test_gap_is_context_not_permanent_movement_score() -> None:
     assert result.total_score < result.movement_score
 
 
-def test_stock_rank_cli_uses_visible_source_defaults() -> None:
-    from services.selection.stock_rank import (
-        DEFAULT_ALL_ENABLED,
-        DEFAULT_AS_OF,
-        DEFAULT_LOG_FILE,
-        DEFAULT_REPORT_DIR,
-        DEFAULT_SYMBOLS,
-        DEFAULT_TRADING_DAY,
-        _build_parser,
+
+def test_attention_tier_requires_absolute_score_and_actionable_classification() -> None:
+    evaluator = StockRankEvaluator()
+    weak = _snapshot(
+        symbol="WEAK", ts=TS, close=100.0, previous_close=100.0, today_open=100.0,
+        move15_pct=0.01, move30_pct=0.02, move60_pct=0.03, sod_pct=0.05,
+        move15_atr=0.01, move30_atr=0.02, move60_atr=0.03, bar_rvol=0.2,
     )
-
-    args = _build_parser().parse_args([])
-
-    assert args.trading_day == DEFAULT_TRADING_DAY
-    assert args.as_of == DEFAULT_AS_OF
-    assert args.symbols == DEFAULT_SYMBOLS
-    assert args.all_enabled is DEFAULT_ALL_ENABLED
-    assert args.report_dir == DEFAULT_REPORT_DIR
-    assert args.log_file == DEFAULT_LOG_FILE
+    result = evaluator.rank([weak], {"WEAK": [weak]})[0]
+    assert result.rank_position == 1
+    assert result.attention_tier == "SUPPRESSED"
 
 
-def test_stock_rank_cli_overrides_source_defaults() -> None:
-    from services.selection.stock_rank import _build_parser
+def test_replay_cadence_selection_uses_six_minute_spacing() -> None:
+    from tests.replays.replay_stock_rank import select_cadences
 
-    args = _build_parser().parse_args(
-        [
-            "--trading-day",
-            "2026-07-29",
-            "--as-of",
-            "12:30:00",
-            "--symbols",
-            "SIEMENS,PAYTM",
-            "--no-all-enabled",
-            "--report-dir",
-            "tmp/reports",
-            "--log-file",
-            "tmp/stock_rank.log",
-        ]
-    )
+    times = [TS + timedelta(minutes=value) for value in (0, 3, 6, 9, 12)]
+    selected = select_cadences(times, 6)
+    assert selected == [times[0], times[2], times[4]]
 
-    assert args.trading_day == "2026-07-29"
-    assert args.as_of == "12:30:00"
-    assert args.symbols == "SIEMENS,PAYTM"
-    assert args.all_enabled is False
-    assert args.report_dir == "tmp/reports"
-    assert args.log_file == "tmp/stock_rank.log"
+
+def test_stock_rank_config_has_production_service_contract() -> None:
+    from configs.stock_rank_config import STOCK_RANK_CONFIG
+
+    assert STOCK_RANK_CONFIG.cadence_minutes == 6
+    assert STOCK_RANK_CONFIG.snapshot_completion_lag_seconds == 300
+    assert STOCK_RANK_CONFIG.priority_rank_max == 25
+    assert STOCK_RANK_CONFIG.secondary_rank_max == 50
