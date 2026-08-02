@@ -548,6 +548,73 @@ def _get_signal_last_snapshot(signal: SignalSchema) -> Dict[str, Any]:
     return {}
 
 
+def _option_chain_coverage_check(
+    snapshot_dict: Dict[str, Any],
+    *,
+    option_type: str,
+) -> Dict[str, Any]:
+    """Validate that derivative spot is inside the available option strikes.
+
+    Trade creation must not treat the nearest ladder boundary as ATM when the
+    option chain does not cover the underlying.  BUY signals validate the call
+    ladder and SELL signals validate the put ladder because those are the option
+    legs the current trade model creates.
+    """
+    inst = _inst_code(option_type)
+    if inst not in ("CE", "PE"):
+        raise ValueError(f"option_type must be CE or PE, got {option_type!r}")
+
+    deriv = snapshot_dict.get("derivatives") or {}
+    ladder = deriv.get("option_ladder") or {}
+    rows = ladder.get("calls") if inst == "CE" else ladder.get("puts")
+    rows = rows if isinstance(rows, list) else []
+
+    spot = _safe_num(deriv.get("spot_price"), None)
+    strikes = [
+        strike
+        for row in rows
+        if isinstance(row, dict)
+        for strike in [_safe_num(row.get("strike"), None)]
+        if strike is not None and strike > 0
+    ]
+
+    snapshot_time = snapshot_dict.get("snapshot_time")
+    details: Dict[str, Any] = {
+        "snapshot_time": snapshot_time,
+        "option_type": inst,
+        "spot": float(spot) if spot is not None else None,
+        "min_strike": float(min(strikes)) if strikes else None,
+        "max_strike": float(max(strikes)) if strikes else None,
+        "atm_strike": ladder.get("atm_strike"),
+        "strike_count": len(strikes),
+    }
+
+    if spot is None or spot <= 0:
+        return {
+            "ok": False,
+            "error": "OPTION_CHAIN_SPOT_UNAVAILABLE",
+            "details": details,
+        }
+
+    if not strikes:
+        return {
+            "ok": False,
+            "error": "OPTION_CHAIN_STRIKES_UNAVAILABLE",
+            "details": details,
+        }
+
+    min_strike = min(strikes)
+    max_strike = max(strikes)
+    if not (min_strike <= spot <= max_strike):
+        return {
+            "ok": False,
+            "error": "OPTION_CHAIN_SPOT_OUTSIDE_COVERAGE",
+            "details": details,
+        }
+
+    return {"ok": True, "details": details}
+
+
 def _resolve_future_symbol(signal: SignalSchema) -> Optional[str]:
     snap = _get_signal_last_snapshot(signal)
     deriv = snap.get("derivatives") or {}
@@ -2645,6 +2712,33 @@ class TradeGenHelper:
         signal_setup = str(getattr(signal, "setup", "") or "").strip().upper()
         if not signal_setup:
             return {"ok": False, "error": "MISSING_SIGNAL_SETUP", "details": {"signal_id": getattr(signal, "signal_id", None)}}
+
+        choice = _inst_code(instrument_choice)
+        option_type: Optional[str] = None
+        if choice in ("CE", "PE"):
+            option_type = choice
+        elif choice == "MULTI" and _user_instrument_enabled(user, "CE"):
+            option_type = "CE" if _side(getattr(signal, "side", "BUY")) == "BUY" else "PE"
+
+        if option_type is not None:
+            snapshot_dict = _get_signal_last_snapshot(signal) or _safe_snapshot_dict(snapshot)
+            coverage = _option_chain_coverage_check(
+                snapshot_dict,
+                option_type=option_type,
+            )
+            if not coverage.get("ok"):
+                details = dict(coverage.get("details") or {})
+                details.update({
+                    "userid": userid,
+                    "signal_id": str(signal_id),
+                    "symbol": getattr(signal, "symbol", None),
+                    "instrument_choice": choice,
+                })
+                return {
+                    "ok": False,
+                    "error": coverage.get("error") or "OPTION_CHAIN_COVERAGE_INVALID",
+                    "details": details,
+                }
 
         selection_result = TradeGenHelper._resolve_signal_form_selection(
             user=user,
