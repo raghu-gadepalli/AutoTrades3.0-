@@ -170,3 +170,24 @@ def test_manager_defers_opposite_authoritative_candidates() -> None:
         up_eval.candidate.candidate_id,
         down_eval.candidate.candidate_id,
     }
+
+
+def test_reversal_prefers_preserved_confirmation_boundary_for_geometry() -> None:
+    snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        SetupFamily.REVERSAL,
+        direction=DirectionalBias.DOWN,
+        close=98.0,
+        data={
+            "origin_price": 99.0,
+            "reversal_confirmation_level": 100.0,
+        },
+    )
+    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    evaluation = EventDrivenSetupEngine().evaluate(snapshot, routes)[0]
+
+    assert evaluation.approved is True
+    assert evaluation.candidate is not None
+    assert evaluation.candidate.stop_anchor_price == pytest.approx(100.0)
+    assert evaluation.candidate.stop_anchor_type == "REVERSAL_CONFIRMATION_LEVEL"
+    assert evaluation.candidate.reference_price == pytest.approx(100.0)

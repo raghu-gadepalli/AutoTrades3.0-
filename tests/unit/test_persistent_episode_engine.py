@@ -1324,3 +1324,198 @@ def test_recompression_expansion_emits_authoritative_reacceleration_event() -> N
         StructuralPermissionResult.PERMIT
     )
     assert SetupFamily.CONTINUATION not in _permission_results(expanded)
+
+
+def _established_down_reversal_from_up(engine: PersistentEpisodeEngine):
+    """Build one established DOWN reversal with preserved source geometry."""
+    engine.advance(_observation(0))
+    engine.advance(_observation(1))
+    engine.advance(_observation(2, current_leg_mature=True))
+    engine.advance(
+        _observation(
+            3,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            rejection=True,
+        )
+    )
+    engine.advance(
+        _observation(
+            4,
+            close=99.90,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            rejection=True,
+            structural_failure=True,
+        )
+    )
+    confirmed = engine.advance(
+        _observation(
+            5,
+            close=99.50,
+            observation_state=AuctionStateName.TREND_FAILURE,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            rejection=True,
+            structural_failure=True,
+        )
+    )
+    assert confirmed.directional.current_state is DirectionalEpisodeState.REVERSAL_LEG
+    assert confirmed.directional.reversal_confirmation_level == pytest.approx(99.80)
+    engine.advance(
+        _observation(
+            6,
+            close=98.90,
+            observation_state=AuctionStateName.REVERSAL,
+            trend_direction=DirectionalBias.DOWN,
+            directional_bias=DirectionalBias.DOWN,
+            structural_failure=True,
+        )
+    )
+    established = engine.advance(
+        _observation(
+            7,
+            close=98.80,
+            observation_state=AuctionStateName.REVERSAL,
+            trend_direction=DirectionalBias.DOWN,
+            directional_bias=DirectionalBias.DOWN,
+            structural_failure=True,
+        )
+    )
+    assert established.directional.current_state is DirectionalEpisodeState.DIRECTIONAL
+    assert established.directional.direction is DirectionalBias.DOWN
+    return established
+
+
+def test_established_reversal_loss_emits_parent_trend_restoration() -> None:
+    engine = PersistentEpisodeEngine()
+    established = _established_down_reversal_from_up(engine)
+    child_episode_id = established.directional.episode_id
+    parent_episode_id = established.directional.parent_episode_id
+
+    first_parent_control = engine.advance(
+        _observation(
+            8,
+            close=99.10,
+            observation_state=AuctionStateName.ORDERLY_UPTREND,
+            trend_direction=DirectionalBias.UP,
+            directional_bias=DirectionalBias.UP,
+            protection=98.20,
+        )
+    )
+    assert first_parent_control.directional.current_state is DirectionalEpisodeState.DIRECTIONAL
+
+    restored = engine.advance(
+        _observation(
+            9,
+            close=99.40,
+            observation_state=AuctionStateName.ORDERLY_UPTREND,
+            trend_direction=DirectionalBias.UP,
+            directional_bias=DirectionalBias.UP,
+            protection=98.40,
+        )
+    )
+    restoration_events = [
+        event
+        for event in restored.events
+        if event.event_type is AuctionEventType.DIRECTIONAL_TREND_RESTORED
+    ]
+    assert len(restoration_events) == 1
+    event = restoration_events[0]
+    assert event.direction is DirectionalBias.UP
+    assert event.episode_id == child_episode_id
+    assert event.data["origin_price"] == pytest.approx(99.40)
+    assert event.data["protection_level"] == pytest.approx(98.40)
+    assert event.data["restored_parent_episode_id"] == parent_episode_id
+    assert event.data["completed_reversal_episode_id"] == child_episode_id
+    assert restored.directional.current_state is DirectionalEpisodeState.COMPLETED
+
+
+def test_reversal_leg_uses_current_trend_support_and_retains_qualified_progress() -> None:
+    engine = PersistentEpisodeEngine()
+    engine.advance(_observation(0))
+    engine.advance(_observation(1))
+    engine.advance(_observation(2, current_leg_mature=True))
+    engine.advance(
+        _observation(
+            3,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            rejection=True,
+        )
+    )
+    engine.advance(
+        _observation(
+            4,
+            close=99.90,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            structural_failure=True,
+        )
+    )
+    confirmed = engine.advance(
+        _observation(
+            5,
+            close=99.50,
+            observation_state=AuctionStateName.TREND_FAILURE,
+            trend_direction=DirectionalBias.DOWN,
+            current_leg_mature=True,
+            exhaustion_active=True,
+            exhausted_side=DirectionalBias.UP,
+            structural_failure=True,
+        )
+    )
+    assert confirmed.directional.current_state is DirectionalEpisodeState.REVERSAL_LEG
+    source_confirmation = confirmed.directional.reversal_confirmation_level
+
+    # Price briefly reaccepts above the handoff origin, but current objective
+    # trend evidence remains DOWN.  The leg must not be failed by stale UP
+    # observation-state continuity alone.
+    for index, close in ((6, 99.70), (7, 99.80)):
+        held = engine.advance(
+            _observation(
+                index,
+                close=close,
+                observation_state=AuctionStateName.ORDERLY_UPTREND,
+                trend_direction=DirectionalBias.DOWN,
+                directional_bias=DirectionalBias.UP,
+            )
+        )
+        assert held.directional.current_state is DirectionalEpisodeState.REVERSAL_LEG
+        assert held.directional.reversal_leg_failure_closes == 0
+
+    reached = engine.advance(
+        _observation(
+            8,
+            close=98.80,
+            observation_state=AuctionStateName.ORDERLY_UPTREND,
+            trend_direction=DirectionalBias.DOWN,
+            directional_bias=DirectionalBias.UP,
+        )
+    )
+    assert reached.directional.reversal_leg_progress_bars == 1
+
+    established = engine.advance(
+        _observation(
+            9,
+            close=99.10,
+            observation_state=AuctionStateName.ORDERLY_UPTREND,
+            trend_direction=DirectionalBias.DOWN,
+            directional_bias=DirectionalBias.UP,
+        )
+    )
+    assert established.directional.current_state is DirectionalEpisodeState.DIRECTIONAL
+    leg_events = [
+        event
+        for event in established.events
+        if event.event_type is AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED
+    ]
+    assert len(leg_events) == 1
+    assert leg_events[0].data["reversal_confirmation_level"] == pytest.approx(
+        source_confirmation
+    )

@@ -282,13 +282,36 @@ class EventDrivenSetupEngine:
         if not valid_stops:
             blockers.append("AUTHORITATIVE_STOP_GEOMETRY_REQUIRED")
             return {"blockers": blockers}
-        if side is TradeSide.BUY:
-            stop, stop_type = max(valid_stops, key=lambda item: item[0])
+
+        # Reversal proof is anchored to the objective confirmation boundary
+        # that caused the handoff.  Prefer that boundary when it remains valid
+        # at establishment; using the later leg-origin close can create an
+        # artificially tight stop and erase the original high/low geometry.
+        reversal_reference = (
+            self._positive_number(data, "reversal_confirmation_level")
+            if family is SetupFamily.REVERSAL
+            else None
+        )
+        reversal_reference_valid = bool(
+            reversal_reference is not None
+            and (
+                (side is TradeSide.BUY and reversal_reference < entry)
+                or (side is TradeSide.SELL and reversal_reference > entry)
+            )
+        )
+        if reversal_reference_valid:
+            stop = float(reversal_reference)
+            stop_type = "REVERSAL_CONFIRMATION_LEVEL"
+            reference = float(reversal_reference)
         else:
-            stop, stop_type = min(valid_stops, key=lambda item: item[0])
+            if side is TradeSide.BUY:
+                stop, stop_type = max(valid_stops, key=lambda item: item[0])
+            else:
+                stop, stop_type = min(valid_stops, key=lambda item: item[0])
+            reference = self._positive_number(data, "origin_price") or stop
+
         risk = abs(entry - stop)
         target = entry + 1.5 * risk if side is TradeSide.BUY else entry - 1.5 * risk
-        reference = self._positive_number(data, "origin_price") or stop
         max_distance = (
             self.config.reversal.max_entry_distance_from_failure_level_atr
             if family is SetupFamily.REVERSAL

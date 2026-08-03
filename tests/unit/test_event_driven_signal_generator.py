@@ -752,3 +752,36 @@ def test_balance_completion_keeps_price_deferred_signal_open() -> None:
         AuctionEventType.BALANCE_COMPLETED
     ]
     assert persister.cutoff_closes == []
+
+
+def test_opposite_parent_trend_restoration_replaces_active_reversal_when_proved() -> None:
+    create_snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        SetupFamily.REVERSAL,
+        direction=DirectionalBias.UP,
+        close=102.0,
+        data={"origin_price": 100.0},
+        episode_id="EPISODE:REVERSAL:UP",
+    )
+    fetcher = _Fetcher()
+    persister = _Persister(fetcher)
+    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
+    created = assembler.assemble(create_snapshot)[0][1]
+
+    restored_snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+        SetupFamily.CONTINUATION,
+        direction=DirectionalBias.DOWN,
+        close=101.0,
+        data={"origin_price": 101.0, "protection_level": 103.0},
+        episode_id="EPISODE:REVERSAL:UP",
+    )
+    events = assembler.assemble(restored_snapshot)
+
+    assert [item[0] for item in events] == ["CLOSE", "CREATE"]
+    invalidated, replacement = events[0][1], events[1][1]
+    assert invalidated.signal_id == created.signal_id
+    assert invalidated.status is SignalStatus.INVALIDATED
+    assert replacement.setup == SetupFamily.CONTINUATION.value
+    assert replacement.side is SignalSide.SELL
+    assert replacement.status is SignalStatus.OPEN

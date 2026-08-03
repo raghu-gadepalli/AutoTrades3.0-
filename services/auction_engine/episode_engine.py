@@ -451,7 +451,23 @@ class PersistentEpisodeEngine:
                 is not DirectionalEpisodeOrigin.REVERSAL_EVENT_HANDOFF
                 or observed_side is memory.direction
             )
-            if self._maturity_observed(observation) and maturity_direction_aligned:
+            if self._parent_trend_restoration_required(memory, observation):
+                self._emit_parent_trend_restoration(
+                    memory,
+                    observation,
+                    events,
+                )
+                self._complete_directional(
+                    memory,
+                    observation,
+                    events,
+                    (
+                        "ESTABLISHED_REVERSAL_LOST_PARENT_SIDE_CONTROL",
+                        "PARENT_TREND_RESTORATION_COMPLETED_REVERSAL_EPISODE",
+                    ),
+                )
+                reasons.append("PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL")
+            elif self._maturity_observed(observation) and maturity_direction_aligned:
                 self._transition_directional(
                     memory,
                     observation,
@@ -473,7 +489,24 @@ class PersistentEpisodeEngine:
                 reasons.append("DIRECTIONAL_EPISODE_RETAINED")
 
         elif memory.state is DirectionalEpisodeState.MATURE:
-            if self._reversal_watch_trigger(observation, memory.direction):
+            if self._parent_trend_restoration_required(memory, observation):
+                self._emit_parent_trend_restoration(
+                    memory,
+                    observation,
+                    events,
+                )
+                self._complete_directional(
+                    memory,
+                    observation,
+                    events,
+                    (
+                        "MATURE_REVERSAL_LOST_PARENT_SIDE_CONTROL",
+                        "PARENT_TREND_RESTORATION_COMPLETED_REVERSAL_EPISODE",
+                    ),
+                )
+                reasons.append("PARENT_TREND_RESTORED_AFTER_MATURE_REVERSAL")
+            elif self._reversal_watch_trigger(observation, memory.direction):
+                self._clear_reversal_watch(memory)
                 self._transition_directional(
                     memory,
                     observation,
@@ -530,6 +563,9 @@ class PersistentEpisodeEngine:
                     raise ValueError(
                         "Fresh reversal confirmation must emit a transition event"
                     )
+                source_confirmation_level = memory.reversal_confirmation_level
+                source_confirmation_source = memory.reversal_confirmation_source
+                source_confirmation_time = memory.reversal_confirmation_level_time
                 self._complete_directional(
                     memory,
                     observation,
@@ -544,6 +580,9 @@ class PersistentEpisodeEngine:
                     events,
                     parent_episode_id=parent_episode_id,
                     origin_event_id=reversal_event.event_id,
+                    source_confirmation_level=source_confirmation_level,
+                    source_confirmation_source=source_confirmation_source,
+                    source_confirmation_time=source_confirmation_time,
                 )
                 reasons.extend(
                     (
@@ -1109,7 +1148,16 @@ class PersistentEpisodeEngine:
         *,
         parent_episode_id: str,
         origin_event_id: str,
+        source_confirmation_level: Optional[float],
+        source_confirmation_source: str,
+        source_confirmation_time: Optional[datetime],
     ) -> None:
+        # Preserve the source reversal boundary across the handoff.  The
+        # reversal setup is evaluated only when the new leg establishes, which
+        # can be several completed snapshots later.  Clearing this geometry at
+        # handoff leaves the setup evaluator with only the leg origin and can
+        # turn a valid high/low reversal into unusably tight stop geometry.
+
         memory.sequence += 1
         memory.episode_id = self._episode_id(
             observation.symbol,
@@ -1144,6 +1192,9 @@ class PersistentEpisodeEngine:
         memory.reversal_leg_progress_atr = 0.0
         memory.last_close = observation.close
         self._clear_reversal_watch(memory)
+        memory.reversal_confirmation_level = source_confirmation_level
+        memory.reversal_confirmation_source = source_confirmation_source
+        memory.reversal_confirmation_level_time = source_confirmation_time
         self._emit_directional_event(
             memory,
             observation,
@@ -1169,20 +1220,41 @@ class PersistentEpisodeEngine:
 
         if memory.direction is DirectionalBias.UP:
             progress_points = observation.close - memory.origin_price
-            failed_now = observation.close < memory.origin_price
+            price_reaccepted_parent_side = observation.close < memory.origin_price
         else:
             progress_points = memory.origin_price - observation.close
-            failed_now = observation.close > memory.origin_price
+            price_reaccepted_parent_side = observation.close > memory.origin_price
         memory.reversal_leg_progress_atr = max(0.0, progress_points / observation.atr)
 
-        if (
+        # Establishment requires the leg to reach the configured displacement
+        # once and then retain the reversal side of the handoff origin.  The
+        # old implementation required every confirming close to remain beyond
+        # the full displacement threshold, so a shallow pause after genuine
+        # progress reset proof to zero.
+        reached_minimum_progress = bool(
             memory.reversal_leg_progress_atr
             >= self.directional_cfg.reversal_leg_min_progress_atr
-        ):
+        )
+        retained_reversal_side = bool(
+            progress_points >= 0.0
+            and memory.reversal_leg_progress_bars > 0
+        )
+        if reached_minimum_progress or retained_reversal_side:
             memory.reversal_leg_progress_bars += 1
         else:
             memory.reversal_leg_progress_bars = 0
 
+        # A close through the handoff origin is not sufficient to declare the
+        # leg failed while the objective trend evidence still supports the new
+        # side.  This prevents stale observation-state continuity from
+        # cancelling a reversal that current trend evidence continues to prove.
+        trend_still_supports_reversal = bool(
+            observation.trend_direction is memory.direction
+        )
+        failed_now = bool(
+            price_reaccepted_parent_side
+            and not trend_still_supports_reversal
+        )
         if failed_now:
             memory.reversal_leg_failure_closes += 1
         else:
@@ -1720,6 +1792,78 @@ class PersistentEpisodeEngine:
         return (
             memory.trend_restore_bars
             >= self.directional_cfg.trend_restoration_confirmation_bars
+        )
+
+    def _parent_trend_restoration_required(
+        self,
+        memory: _DirectionalMemory,
+        observation: AuctionObservation,
+    ) -> bool:
+        """Return True when an established reversal loses control to its parent side.
+
+        This is intentionally narrower than a generic directional restart.  It
+        applies only to a reversal-event handoff that already established and
+        then accumulated the configured opposite-control closes.
+        """
+        if (
+            memory.origin_source
+            is not DirectionalEpisodeOrigin.REVERSAL_EVENT_HANDOFF
+            or memory.parent_episode_id is None
+            or memory.direction
+            not in (DirectionalBias.UP, DirectionalBias.DOWN)
+        ):
+            return False
+        if (
+            memory.opposite_control_bars
+            < self.directional_cfg.opposite_completion_bars
+        ):
+            return False
+        parent_side = _opposite_direction(memory.direction)
+        if self._observed_direction(observation) is not parent_side:
+            return False
+        protection = observation.trend_protection_level
+        if protection is None:
+            return False
+        if parent_side is DirectionalBias.UP:
+            return protection < observation.close
+        return protection > observation.close
+
+    def _emit_parent_trend_restoration(
+        self,
+        memory: _DirectionalMemory,
+        observation: AuctionObservation,
+        events: List[AuctionEvent],
+    ) -> None:
+        """Emit a creation-capable parent-trend restoration transition.
+
+        Setup geometry is sourced from the current objective parent-side
+        protection level.  No synthetic stop or compatibility fallback is
+        introduced; absent or invalid geometry is left for the setup evaluator
+        to reject explicitly.
+        """
+        if memory.parent_episode_id is None or memory.episode_id is None:
+            raise ValueError(
+                "Parent-trend restoration requires child and parent episode identity"
+            )
+        parent_side = _opposite_direction(memory.direction)
+        self._emit_directional_event(
+            memory,
+            observation,
+            AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+            events,
+            (
+                "ESTABLISHED_REVERSAL_LOST_OPPOSITE_CONTROL",
+                "PARENT_DIRECTION_REESTABLISHED_AFTER_REVERSAL_HANDOFF",
+            ),
+            event_direction=parent_side,
+            extra_data={
+                "origin_price": observation.close,
+                "protection_level": observation.trend_protection_level,
+                "protection_source": observation.trend_protection_source,
+                "restored_parent_episode_id": memory.parent_episode_id,
+                "completed_reversal_episode_id": memory.episode_id,
+                "completed_reversal_extreme_price": memory.extreme_price,
+            },
         )
 
     def _directional_completion_required(self, memory: _DirectionalMemory) -> bool:
