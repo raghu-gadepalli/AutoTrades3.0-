@@ -1431,6 +1431,11 @@ def test_established_reversal_loss_emits_parent_trend_restoration() -> None:
     assert event.data["protection_level"] == pytest.approx(98.40)
     assert event.data["restored_parent_episode_id"] == parent_episode_id
     assert event.data["completed_reversal_episode_id"] == child_episode_id
+    assert event.data["exhaustion_was_active"] is False
+    assert event.data["exhausted_side_before_restoration"] == "UNKNOWN"
+    assert event.data["exhaustion_resolution"] == (
+        "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
+    )
     assert restored.directional.current_state is DirectionalEpisodeState.COMPLETED
 
 

@@ -16,6 +16,7 @@ import json
 from typing import Any, Deque, Dict, Optional
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineConfig
+from enums.auction_engine import AuctionEventType, DirectionalBias
 from schemas.snapshot import SnapshotSchema
 from services.auction_engine.contracts import BarEvidence, EvidenceSnapshot
 from services.auction_engine.episode_contracts import (
@@ -23,6 +24,8 @@ from services.auction_engine.episode_contracts import (
     AuctionEpisodeMemory,
     AuctionEvidenceHistoryEntry,
     AuctionEvidenceHistoryTrend,
+    AuctionLifecycleProjection,
+    AuctionObservation,
     BalanceEpisodeMemory,
     DirectionalEpisodeMemory,
     DirectionalObservationMemory,
@@ -120,6 +123,11 @@ class AuctionEngine:
         )
         observation = self.observation_provider.build(snapshot, evidence)
         lifecycle = self.episode_engine.advance(observation)
+        observation, lifecycle = self._resolve_restoration_exhaustion(
+            symbol,
+            observation,
+            lifecycle,
+        )
         result = AuctionAuthorityResult(
             symbol=symbol,
             snapshot_time=snapshot_time,
@@ -132,6 +140,120 @@ class AuctionEngine:
         self._last_results[symbol] = result
         self._last_input_hashes[symbol] = input_hash
         return result
+
+    def _resolve_restoration_exhaustion(
+        self,
+        symbol: str,
+        observation: AuctionObservation,
+        lifecycle: AuctionLifecycleProjection,
+    ) -> tuple[AuctionObservation, AuctionLifecycleProjection]:
+        """Resolve stale parent-side exhaustion after proven trend restoration.
+
+        Ordinary continuation in an exhausted direction remains blocked.  This
+        resolution applies only when Persistent Episode Engine emits the
+        creation-capable parent-trend restoration event and the active
+        exhaustion side matches that restored direction.
+        """
+        restoration_events = tuple(
+            event
+            for event in lifecycle.events
+            if event.event_type is AuctionEventType.DIRECTIONAL_TREND_RESTORED
+        )
+        if not restoration_events:
+            return observation, lifecycle
+
+        resolved_event = next(
+            (
+                event
+                for event in restoration_events
+                if observation.exhaustion_active
+                and event.direction is observation.exhausted_side
+            ),
+            None,
+        )
+        if resolved_event is None:
+            diagnostics = dict(lifecycle.diagnostics)
+            diagnostics["exhaustion_resolution_applied"] = False
+            diagnostics["exhaustion_resolution_reason"] = (
+                "NO_MATCHING_ACTIVE_EXHAUSTION_FOR_TREND_RESTORATION"
+            )
+            return observation, AuctionLifecycleProjection.model_validate(
+                {
+                    **lifecycle.model_dump(mode="python"),
+                    "diagnostics": diagnostics,
+                }
+            )
+
+        resolved = self.observation_provider.resolve_exhaustion_after_trend_restoration(
+            symbol,
+            snapshot_time=observation.snapshot_time,
+            restored_side=resolved_event.direction,
+        )
+        if not resolved:
+            diagnostics = dict(lifecycle.diagnostics)
+            diagnostics["exhaustion_resolution_applied"] = False
+            diagnostics["exhaustion_resolution_reason"] = (
+                "OBSERVATION_MEMORY_DID_NOT_ACCEPT_RESTORATION_RESOLUTION"
+            )
+            return observation, AuctionLifecycleProjection.model_validate(
+                {
+                    **lifecycle.model_dump(mode="python"),
+                    "diagnostics": diagnostics,
+                }
+            )
+
+        observation_payload = observation.model_dump(mode="python")
+        observation_payload.update(
+            {
+                "exhaustion_active": False,
+                "exhausted_side": DirectionalBias.UNKNOWN,
+                "source_reason_codes": self._unique_reason_codes(
+                    (
+                        *observation.source_reason_codes,
+                        "EXHAUSTION_RESOLVED_BY_TREND_RESTORATION",
+                    )
+                ),
+            }
+        )
+        resolved_observation = AuctionObservation.model_validate(observation_payload)
+
+        diagnostics = dict(lifecycle.diagnostics)
+        diagnostics.update(
+            {
+                "observation_exhaustion_active": False,
+                "observation_exhausted_side": DirectionalBias.UNKNOWN.value,
+                "exhaustion_resolution_applied": True,
+                "exhaustion_resolution_event_id": resolved_event.event_id,
+                "exhaustion_resolution_reason": (
+                    "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
+                ),
+            }
+        )
+        resolved_lifecycle = AuctionLifecycleProjection.model_validate(
+            {
+                **lifecycle.model_dump(mode="python"),
+                "diagnostics": diagnostics,
+            }
+        )
+
+        # Keep incremental memory and duplicate-observation semantics aligned
+        # with the public post-restoration Auction result.
+        controller = self.episode_engine._memory.get(symbol)
+        if controller is not None:
+            controller.last_observation_hash = resolved_observation.stable_hash()
+            controller.last_evaluation = resolved_lifecycle
+        return resolved_observation, resolved_lifecycle
+
+    @staticmethod
+    def _unique_reason_codes(values: tuple[str, ...]) -> tuple[str, ...]:
+        seen = set()
+        result = []
+        for value in values:
+            text = str(value).strip().upper()
+            if text and text not in seen:
+                seen.add(text)
+                result.append(text)
+        return tuple(result)
 
     def export_incremental_state(self, symbol: str) -> AuctionEpisodeMemory:
         key = self._symbol_key(symbol)

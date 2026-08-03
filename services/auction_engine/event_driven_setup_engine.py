@@ -302,7 +302,14 @@ class EventDrivenSetupEngine:
         if reversal_reference_valid:
             stop = float(reversal_reference)
             stop_type = "REVERSAL_CONFIRMATION_LEVEL"
-            reference = float(reversal_reference)
+            # The confirmation boundary owns structural stop proof.  Entry
+            # timeliness remains measured from the event handoff/origin so a
+            # valid reversal is not rejected merely because its protective
+            # boundary is farther away than the configured freshness window.
+            reference = (
+                self._positive_number(data, "origin_price")
+                or float(reversal_reference)
+            )
         else:
             if side is TradeSide.BUY:
                 stop, stop_type = max(valid_stops, key=lambda item: item[0])

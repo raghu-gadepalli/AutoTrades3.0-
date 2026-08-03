@@ -1863,6 +1863,15 @@ class PersistentEpisodeEngine:
                 "restored_parent_episode_id": memory.parent_episode_id,
                 "completed_reversal_episode_id": memory.episode_id,
                 "completed_reversal_extreme_price": memory.extreme_price,
+                "exhaustion_was_active": observation.exhaustion_active,
+                "exhausted_side_before_restoration": (
+                    observation.exhausted_side.value
+                    if observation.exhaustion_active
+                    else DirectionalBias.UNKNOWN.value
+                ),
+                "exhaustion_resolution": (
+                    "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
+                ),
             },
         )
 

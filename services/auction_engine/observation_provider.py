@@ -126,6 +126,41 @@ class AuctionObservationProvider:
             raise ValueError(f"No objective observation memory exists for {key}")
         return DirectionalObservationMemory.model_validate(vars(self._memory[key]))
 
+    def resolve_exhaustion_after_trend_restoration(
+        self,
+        symbol: str,
+        *,
+        snapshot_time: datetime,
+        restored_side: DirectionalBias,
+    ) -> bool:
+        """Clear active exhaustion only when its side is explicitly restored.
+
+        Persistent Episode Engine owns the restoration event.  The observation
+        provider owns the active exhaustion context, so Auction orchestration
+        calls this method only after a creation-capable
+        ``DIRECTIONAL_TREND_RESTORED`` event has been emitted.  Historical
+        exhaustion remains preserved in that event; only the active blocker is
+        resolved for the restored parent trend.
+        """
+        key = self._symbol_key(symbol)
+        memory = self._memory.get(key)
+        if memory is None:
+            return False
+        if memory.last_snapshot_time != snapshot_time:
+            return False
+        if restored_side not in (DirectionalBias.UP, DirectionalBias.DOWN):
+            return False
+        if not memory.exhaustion_active:
+            return False
+        if memory.exhaustion_side is not restored_side:
+            return False
+
+        self._clear_exhaustion(memory)
+        memory.last_reason_codes = self._unique(
+            (*memory.last_reason_codes, "EXHAUSTION_RESOLVED_BY_TREND_RESTORATION")
+        )
+        return True
+
     @staticmethod
     def initial_memory() -> DirectionalObservationMemory:
         return DirectionalObservationMemory(

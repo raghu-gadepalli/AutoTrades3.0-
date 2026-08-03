@@ -190,4 +190,24 @@ def test_reversal_prefers_preserved_confirmation_boundary_for_geometry() -> None
     assert evaluation.candidate is not None
     assert evaluation.candidate.stop_anchor_price == pytest.approx(100.0)
     assert evaluation.candidate.stop_anchor_type == "REVERSAL_CONFIRMATION_LEVEL"
-    assert evaluation.candidate.reference_price == pytest.approx(100.0)
+    assert evaluation.candidate.reference_price == pytest.approx(99.0)
+
+
+def test_reversal_stop_boundary_does_not_replace_entry_freshness_origin() -> None:
+    snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        SetupFamily.REVERSAL,
+        direction=DirectionalBias.UP,
+        close=104.8,
+        data={
+            "origin_price": 103.0,
+            "reversal_confirmation_level": 100.0,
+        },
+    )
+    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    evaluation = EventDrivenSetupEngine().evaluate(snapshot, routes)[0]
+
+    assert evaluation.approved is True
+    assert evaluation.candidate is not None
+    assert evaluation.candidate.stop_anchor_price == pytest.approx(100.0)
+    assert evaluation.candidate.reference_price == pytest.approx(103.0)

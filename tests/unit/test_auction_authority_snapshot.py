@@ -7,8 +7,14 @@ import unittest
 from pydantic import ValidationError
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineConfig
+from enums.auction_engine import AuctionEventType, DirectionalBias
 from schemas.snapshot import SnapshotSchema
 from services.auction_engine.engine import AuctionEngine
+from services.auction_engine.episode_contracts import (
+    AuctionEvent,
+    AuctionLifecycleProjection,
+    AuctionObservation,
+)
 from services.auction_engine.snapshot_adapter import (
     empty_auction_block,
     enrich_snapshot_with_auction,
@@ -359,6 +365,115 @@ class AuctionAuthoritySnapshotTests(unittest.TestCase):
         fields = set(type(observation).model_fields)
         self.assertNotIn("established_trend_side", fields)
         self.assertNotIn("failure_watch_active", fields)
+
+    def test_trend_restoration_resolves_matching_active_exhaustion(self) -> None:
+        final = _finalize(self._rows()[0])
+        observation_payload = final.auction.observation.model_dump(mode="python")
+        observation_payload.update(
+            {
+                "exhaustion_active": True,
+                "exhausted_side": DirectionalBias.UP,
+            }
+        )
+        observation = AuctionObservation.model_validate(observation_payload)
+
+        lifecycle_payload = final.auction.lifecycle.model_dump(mode="python")
+        event = AuctionEvent(
+            event_id="DIR:TEST:RESTORED:UP",
+            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+            episode_id="DIR:TEST:REVERSAL",
+            symbol="TEST",
+            trading_day=final.snapshot_time.date(),
+            event_time=final.snapshot_time,
+            direction=DirectionalBias.UP,
+            reason_codes=("TEST_RESTORATION",),
+            data={
+                "exhaustion_was_active": True,
+                "exhausted_side_before_restoration": "UP",
+                "exhaustion_resolution": (
+                    "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
+                ),
+            },
+        )
+        lifecycle_payload["events"] = [event.model_dump(mode="python")]
+        lifecycle_payload["permissions"] = []
+        lifecycle = AuctionLifecycleProjection.model_validate(lifecycle_payload)
+
+        engine = AuctionEngine(_config())
+        memory = engine.observation_provider._new_memory()
+        memory.trading_day = final.snapshot_time.date()
+        memory.last_snapshot_time = final.snapshot_time
+        memory.exhaustion_active = True
+        memory.exhaustion_side = DirectionalBias.UP
+        engine.observation_provider._memory["TEST"] = memory
+
+        resolved_observation, resolved_lifecycle = (
+            engine._resolve_restoration_exhaustion(
+                "TEST",
+                observation,
+                lifecycle,
+            )
+        )
+
+        self.assertFalse(resolved_observation.exhaustion_active)
+        self.assertIs(resolved_observation.exhausted_side, DirectionalBias.UNKNOWN)
+        self.assertIn(
+            "EXHAUSTION_RESOLVED_BY_TREND_RESTORATION",
+            resolved_observation.source_reason_codes,
+        )
+        self.assertTrue(
+            resolved_lifecycle.diagnostics["exhaustion_resolution_applied"]
+        )
+        exported = engine.observation_provider.export_memory("TEST")
+        self.assertFalse(exported.exhaustion_active)
+
+    def test_trend_restoration_does_not_clear_opposite_exhaustion(self) -> None:
+        final = _finalize(self._rows()[0])
+        observation_payload = final.auction.observation.model_dump(mode="python")
+        observation_payload.update(
+            {
+                "exhaustion_active": True,
+                "exhausted_side": DirectionalBias.DOWN,
+            }
+        )
+        observation = AuctionObservation.model_validate(observation_payload)
+
+        lifecycle_payload = final.auction.lifecycle.model_dump(mode="python")
+        event = AuctionEvent(
+            event_id="DIR:TEST:RESTORED:UP",
+            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+            episode_id="DIR:TEST:REVERSAL",
+            symbol="TEST",
+            trading_day=final.snapshot_time.date(),
+            event_time=final.snapshot_time,
+            direction=DirectionalBias.UP,
+            reason_codes=("TEST_RESTORATION",),
+        )
+        lifecycle_payload["events"] = [event.model_dump(mode="python")]
+        lifecycle_payload["permissions"] = []
+        lifecycle = AuctionLifecycleProjection.model_validate(lifecycle_payload)
+
+        engine = AuctionEngine(_config())
+        memory = engine.observation_provider._new_memory()
+        memory.trading_day = final.snapshot_time.date()
+        memory.last_snapshot_time = final.snapshot_time
+        memory.exhaustion_active = True
+        memory.exhaustion_side = DirectionalBias.DOWN
+        engine.observation_provider._memory["TEST"] = memory
+
+        unresolved_observation, unresolved_lifecycle = (
+            engine._resolve_restoration_exhaustion(
+                "TEST",
+                observation,
+                lifecycle,
+            )
+        )
+
+        self.assertTrue(unresolved_observation.exhaustion_active)
+        self.assertIs(unresolved_observation.exhausted_side, DirectionalBias.DOWN)
+        self.assertFalse(
+            unresolved_lifecycle.diagnostics["exhaustion_resolution_applied"]
+        )
 
 
 if __name__ == "__main__":
