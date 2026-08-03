@@ -127,6 +127,7 @@ def test_non_balance_candidate_still_uses_current_observation_range() -> None:
 
     assert decision.action is AdvisorAction.WATCH
     assert decision.reason_codes == ("INSIDE_ACCEPTED_RANGE",)
+    assert decision.diagnostics["applied_exceptions"] == []
     context = decision.diagnostics["range_context"]
     assert context["authority"] == "CURRENT_AUCTION_OBSERVATION"
     assert context["outside_for_side"] is False
@@ -152,7 +153,13 @@ def test_trend_restoration_is_not_suppressed_only_for_being_inside_range() -> No
     decision = _advisor().evaluate_authoritative(snapshot, candidate)
 
     assert decision.action is AdvisorAction.ALLOW
-    assert decision.reason_codes == ("ADVISOR_ALLOW",)
+    assert decision.reason_codes == (
+        "ADVISOR_ALLOW",
+        "TREND_RESTORATION_FAILED_PULLBACK_RANGE_EXCEPTION",
+    )
+    assert decision.diagnostics["applied_exceptions"] == [
+        "TREND_RESTORATION_FAILED_PULLBACK_RANGE_EXCEPTION"
+    ]
     assert "INSIDE_ACCEPTED_RANGE" not in {
         match["reason"] for match in decision.diagnostics["matched_rules"]
     }

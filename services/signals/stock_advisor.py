@@ -37,6 +37,11 @@ from services.signals.stock_advisor_history import (
 )
 
 
+_TREND_RESTORATION_RANGE_EXCEPTION = (
+    "TREND_RESTORATION_FAILED_PULLBACK_RANGE_EXCEPTION"
+)
+
+
 _SOURCE_RANGE_EVENT_TYPES = {
     AuctionEventType.BALANCE_ESCAPE_STARTED,
     AuctionEventType.BALANCE_ESCAPE_ACCEPTED,
@@ -95,6 +100,7 @@ class StockAdvisor:
         subtype = candidate.setup_subtype.upper()
         side_direction = "UP" if candidate.side is TradeSide.BUY else "DOWN"
         matches: List[Tuple[str, str]] = []
+        applied_exceptions: List[str] = []
         range_context = self._resolve_range_context(snapshot, candidate)
 
         prior_opportunities = self.history_provider.fetch_prior_opportunities(
@@ -126,11 +132,14 @@ class StockAdvisor:
             family in self._normalised(self.policy.inside_range_exempt_families)
             or subtype in self._normalised(self.policy.inside_range_exempt_subtypes)
         )
-        if range_context.inside_for_rule and not inside_exempt:
-            matches.append((
-                self.policy.inside_accepted_range_action,
-                "INSIDE_ACCEPTED_RANGE",
-            ))
+        if range_context.inside_for_rule:
+            if not inside_exempt:
+                matches.append((
+                    self.policy.inside_accepted_range_action,
+                    "INSIDE_ACCEPTED_RANGE",
+                ))
+            elif subtype == "TREND_RESTORATION":
+                applied_exceptions.append(_TREND_RESTORATION_RANGE_EXCEPTION)
 
         if family in self._normalised(
             self.policy.accepted_breakout_current_context_families
@@ -204,6 +213,8 @@ class StockAdvisor:
         )
         if not reasons:
             reasons = ("ADVISOR_ALLOW",)
+        if action is AdvisorAction.ALLOW and applied_exceptions:
+            reasons = tuple(dict.fromkeys((*reasons, *applied_exceptions)))
         return self._decision(
             snapshot,
             candidate,
@@ -212,6 +223,7 @@ class StockAdvisor:
             tuple(matches),
             range_context=range_context,
             context_diagnostics={
+                "applied_exceptions": list(applied_exceptions),
                 "day_path": day_path.to_dict(),
                 "mature_range_churn": {
                     "matched": churn_matched,
