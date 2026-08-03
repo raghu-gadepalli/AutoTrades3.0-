@@ -131,7 +131,15 @@ class StockAdvisorPolicyConfig(BaseModel):
 
     inside_accepted_range_action: AdvisorRuleAction = "WATCH"
     inside_range_exempt_families: Tuple[str, ...] = ("FAILED_BREAKOUT",)
-    inside_range_exempt_subtypes: Tuple[str, ...] = ("EXHAUSTION_REVERSAL",)
+    # A proven trend restoration is an established opposite-side reversal/pullback
+    # that lost control back to its parent trend.  Like FAILED_BREAKOUT, the
+    # failure itself is fresh setup proof, so current-range containment must not
+    # categorically suppress it.  Ordinary continuation and reacceleration
+    # candidates remain subject to INSIDE_ACCEPTED_RANGE.
+    inside_range_exempt_subtypes: Tuple[str, ...] = (
+        "EXHAUSTION_REVERSAL",
+        "TREND_RESTORATION",
+    )
 
     accepted_breakout_current_context_action: AdvisorRuleAction = "BLOCK"
     accepted_breakout_current_context_families: Tuple[str, ...] = (

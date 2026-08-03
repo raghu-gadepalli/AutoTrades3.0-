@@ -132,6 +132,35 @@ def test_non_balance_candidate_still_uses_current_observation_range() -> None:
     assert context["outside_for_side"] is False
 
 
+def test_trend_restoration_is_not_suppressed_only_for_being_inside_range() -> None:
+    snapshot = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_TREND_RESTORED,
+        SetupFamily.CONTINUATION,
+        direction=DirectionalBias.DOWN,
+        close=100.5,
+        data={"origin_price": 101.0, "protection_level": 102.0},
+    )
+    snapshot = _snapshot_with_observation_range(
+        snapshot,
+        low=99.0,
+        high=102.0,
+        inside=True,
+    )
+    candidate = _candidate(snapshot)
+
+    assert candidate.setup_subtype == "TREND_RESTORATION"
+    decision = _advisor().evaluate_authoritative(snapshot, candidate)
+
+    assert decision.action is AdvisorAction.ALLOW
+    assert decision.reason_codes == ("ADVISOR_ALLOW",)
+    assert "INSIDE_ACCEPTED_RANGE" not in {
+        match["reason"] for match in decision.diagnostics["matched_rules"]
+    }
+    context = decision.diagnostics["range_context"]
+    assert context["authority"] == "CURRENT_AUCTION_OBSERVATION"
+    assert context["inside_for_rule"] is True
+
+
 def test_balance_candidate_rejects_reference_boundary_mismatch() -> None:
     snapshot = _event_snapshot(
         AuctionEventType.BALANCE_ESCAPE_STARTED,
