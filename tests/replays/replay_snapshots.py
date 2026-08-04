@@ -31,7 +31,7 @@ END = datetime(2026, 8, 3, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
 #   ["ALL"]                         -> all symbols allowed by ACTIVE_ONLY
 #   ["MARUTI", "INFY", "ASTRAL"]  -> only the named symbols allowed by ACTIVE_ONLY
 # SYMBOLS: List[str] = ['POLICYBZR', 'POWERINDIA', 'PREMIERENE', 'PRESTIGE', 'SBIN', 'SHREECEM', 'SHRIRAMFIN', 'TATAELXSI', 'TCS', 'TECHM', 'TRENT', 'TVSMOTOR', 'UNITDSPR', 'UPL', 'VEDL']
-SYMBOLS: List[str] = ['HYUNDAI', 'ICICIBANK', 'ICICIGI', 'ICICIPRULI', 'INDIGO', 'INDUSINDBK', 'INDUSTOWER', 'INFY', 'JINDALSTEL', 'JSWENERGY']
+SYMBOLS: List[str] = ['JUBLFOOD', 'KALYANKJIL', 'KOTAKBANK', 'KPITTECH', 'LAURUSLABS', 'LODHA', 'LTF', 'LTM', 'M&M', 'MANAPPURAM']
 SYMBOL_TYPE_FILTER = "EQ"
 
 # True  -> replay only enabled symbols whose intraday `active` flag is True.
