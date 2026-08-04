@@ -201,3 +201,80 @@ def test_missing_reversal_lineage_is_hard_contract_failure():
     assert row["lineage_complete"] is False
     assert row["consistency_class"] == "HARD_CONTRACT_FAILURE"
     assert "REVERSAL_LINEAGE_MISSING" in row["consistency_flags"]
+
+
+def test_symbol_summary_is_built_and_upserted(tmp_path):
+    import csv
+
+    from services.auction_engine.consistency_reporter import (
+        REPORT_FIELDS,
+        summarize_symbol_report,
+        upsert_symbol_summary,
+    )
+
+    detail_path = tmp_path / "ABB.csv"
+    rows = [
+        {
+            "record_status": "OK",
+            "episode_id": "EP-1",
+            "event_count": "1",
+            "opposite_evidence_streak": "0",
+            "consistency_flags": "",
+            "consistency_class": "COHERENT",
+        },
+        {
+            "record_status": "OK",
+            "episode_id": "EP-1",
+            "event_count": "2",
+            "opposite_evidence_streak": "3",
+            "consistency_flags": "FRESH_OPPOSITE_EVIDENCE|PERSISTENT_OPPOSITE_EVIDENCE",
+            "consistency_class": "PERSISTENT_CONFLICT",
+        },
+        {
+            "record_status": "ERROR",
+            "episode_id": "",
+            "event_count": "",
+            "opposite_evidence_streak": "",
+            "consistency_flags": "RECORD_ERROR",
+            "consistency_class": "UNASSESSABLE",
+        },
+    ]
+    with detail_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        for partial in rows:
+            writer.writerow({field: partial.get(field, "") for field in REPORT_FIELDS})
+
+    summary = summarize_symbol_report(
+        detail_path=detail_path,
+        trading_day=date(2026, 8, 3),
+        symbol="abb",
+    )
+
+    assert summary["symbol"] == "ABB"
+    assert summary["snapshot_count"] == 3
+    assert summary["ok_count"] == 2
+    assert summary["error_count"] == 1
+    assert summary["unassessable_count"] == 1
+    assert summary["coherent_count"] == 1
+    assert summary["persistent_conflict_count"] == 1
+    assert summary["episode_count"] == 1
+    assert summary["event_count"] == 3
+    assert summary["max_opposite_evidence_streak"] == 3
+    assert "PERSISTENT_OPPOSITE_EVIDENCE" in summary["finding_codes"]
+
+    summary_path = tmp_path / "summary.csv"
+    upsert_symbol_summary(summary_path=summary_path, summary_row=summary)
+    updated = dict(summary)
+    updated["event_count"] = 9
+    upsert_symbol_summary(summary_path=summary_path, summary_row=updated)
+    upsert_symbol_summary(
+        summary_path=summary_path,
+        summary_row={**summary, "symbol": "KPITTECH", "detail_file": "KPITTECH.csv"},
+    )
+
+    with summary_path.open("r", newline="", encoding="utf-8") as handle:
+        summary_rows = list(csv.DictReader(handle))
+
+    assert [row["symbol"] for row in summary_rows] == ["ABB", "KPITTECH"]
+    assert summary_rows[0]["event_count"] == "9"

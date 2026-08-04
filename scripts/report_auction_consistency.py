@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a read-only, one-row-per-snapshot Auction consistency CSV."""
+"""Generate a read-only Auction consistency report for one symbol."""
 
 from __future__ import annotations
 
@@ -9,24 +9,28 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from logconfig import setup_logging
-from services.auction_engine.consistency_reporter import generate_consistency_report
+from services.auction_engine.consistency_reporter import (
+    generate_consistency_report,
+    summarize_symbol_report,
+    upsert_symbol_summary,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Normal backtest defaults. Running the script with no arguments uses these.
-# CLI arguments below are only convenient overrides for date, symbols/output.
+# CLI arguments are only convenient overrides for the date and one symbol.
 # ---------------------------------------------------------------------------
 DEFAULT_TRADING_DATE = "2026-08-03"
-DEFAULT_SYMBOLS = ""  # Empty means every symbol present in snapshots.
-DEFAULT_OUTPUT = ""  # Empty derives reports/auction_consistency_<date>.csv.
+DEFAULT_SYMBOL = "ABB"
+DEFAULT_REPORT_ROOT = Path("reports")
 
 EXPERIMENT_ID = "restoration-v3-current-day"
 DATASET_SPLIT = "development"
@@ -40,32 +44,30 @@ LOG_FILE = None
 def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read persisted snapshots chronologically and write a neutral Auction "
-            "consistency input CSV. With no arguments, the hardcoded backtest "
-            "defaults at the top of this script are used."
+            "Read persisted snapshots chronologically and write one Auction "
+            "consistency CSV for one symbol, plus an accumulated summary.csv."
         )
+    )
+    parser.add_argument(
+        "--symbol",
+        default=DEFAULT_SYMBOL,
+        help=f"Single symbol to report (default: {DEFAULT_SYMBOL})",
     )
     parser.add_argument(
         "--date",
         default=DEFAULT_TRADING_DATE,
         help=f"Trading day YYYY-MM-DD (default: {DEFAULT_TRADING_DATE})",
     )
-    parser.add_argument(
-        "--symbols",
-        default=DEFAULT_SYMBOLS,
-        help="Optional comma-separated symbols; empty means all snapshot symbols",
-    )
-    parser.add_argument(
-        "--output",
-        default=DEFAULT_OUTPUT,
-        help="Optional output CSV path; otherwise derived from --date",
-    )
     return parser.parse_args(argv)
 
 
-def _symbols(raw: str) -> Optional[List[str]]:
-    values = sorted({item.strip().upper() for item in raw.split(",") if item.strip()})
-    return values or None
+def _clean_symbol(raw: str) -> str:
+    symbol = str(raw or "").strip().upper()
+    if not symbol:
+        raise ValueError("--symbol must contain one non-empty symbol")
+    if "," in symbol:
+        raise ValueError("Run one symbol at a time; comma-separated symbols are not supported")
+    return symbol
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -73,20 +75,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_logging(log_file=LOG_FILE)
 
     trading_day = date.fromisoformat(args.date)
-    output = Path(args.output) if args.output else Path(
-        "reports"
-    ) / f"auction_consistency_{trading_day:%Y%m%d}.csv"
+    symbol = _clean_symbol(args.symbol)
+    output_dir = DEFAULT_REPORT_ROOT / f"auction_consistency_{trading_day:%Y%m%d}"
+    detail_path = output_dir / f"{symbol}.csv"
+    summary_path = output_dir / "summary.csv"
 
     logger.info(
-        "Generating Auction consistency input | date=%s symbols=%s output=%s",
+        "Generating Auction consistency input | date=%s symbol=%s detail=%s",
         trading_day,
-        args.symbols or "ALL",
-        output,
+        symbol,
+        detail_path,
     )
-    summary = generate_consistency_report(
+    result = generate_consistency_report(
         trading_day=trading_day,
-        output_path=output,
-        symbols=_symbols(args.symbols),
+        output_path=detail_path,
+        symbols=[symbol],
         experiment_id=EXPERIMENT_ID,
         dataset_split=DATASET_SPLIT,
         code_commit=CODE_COMMIT,
@@ -94,14 +97,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         batch_size=BATCH_SIZE,
         overwrite=OVERWRITE,
     )
-    logger.info(
-        "Auction consistency input complete | rows=%d errors=%d symbols=%d output=%s",
-        summary.rows_written,
-        summary.error_rows,
-        len(summary.symbols_seen),
-        summary.output_path,
+
+    if result.rows_written == 0:
+        logger.error(
+            "No snapshots found | date=%s symbol=%s detail=%s",
+            trading_day,
+            symbol,
+            detail_path,
+        )
+        return 1
+
+    summary_row = summarize_symbol_report(
+        detail_path=detail_path,
+        trading_day=trading_day,
+        symbol=symbol,
     )
-    return 0 if summary.error_rows == 0 else 2
+    upsert_symbol_summary(summary_path=summary_path, summary_row=summary_row)
+
+    logger.info(
+        "Auction consistency input complete | symbol=%s rows=%d errors=%d "
+        "detail=%s summary=%s",
+        symbol,
+        result.rows_written,
+        result.error_rows,
+        result.output_path,
+        summary_path,
+    )
+    return 0 if result.error_rows == 0 else 2
 
 
 if __name__ == "__main__":

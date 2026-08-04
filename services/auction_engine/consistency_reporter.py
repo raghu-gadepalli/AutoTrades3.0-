@@ -8,6 +8,7 @@ state and adds neutral comparison fields that make corpus-wide review easier.
 
 from __future__ import annotations
 
+from collections import Counter
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
@@ -178,6 +179,26 @@ REPORT_FIELDS: Tuple[str, ...] = (
     "balance_json",
     "auction_diagnostics_json",
     "auction_memory_json",
+)
+
+
+
+SUMMARY_FIELDS: Tuple[str, ...] = (
+    "trading_date",
+    "symbol",
+    "snapshot_count",
+    "ok_count",
+    "error_count",
+    "unassessable_count",
+    "coherent_count",
+    "transitional_conflict_count",
+    "persistent_conflict_count",
+    "hard_contract_failure_count",
+    "episode_count",
+    "event_count",
+    "max_opposite_evidence_streak",
+    "finding_codes",
+    "detail_file",
 )
 
 _DIRECTION_UP = "UP"
@@ -711,9 +732,116 @@ def generate_consistency_report(
     )
 
 
+def summarize_symbol_report(
+    *,
+    detail_path: Path,
+    trading_day: date,
+    symbol: str,
+) -> Dict[str, Any]:
+    """Summarize one generated symbol report without re-querying the database."""
+
+    detail_path = Path(detail_path)
+    class_counts: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
+    episode_ids: set[str] = set()
+    finding_codes: set[str] = set()
+    snapshot_count = 0
+    event_count = 0
+    max_opposite_streak = 0
+
+    with detail_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            snapshot_count += 1
+            status = str(row.get("record_status") or "").strip().upper()
+            consistency_class = str(row.get("consistency_class") or "").strip().upper()
+            status_counts[status] += 1
+            class_counts[consistency_class] += 1
+
+            episode_id = str(row.get("episode_id") or "").strip()
+            if episode_id:
+                episode_ids.add(episode_id)
+
+            try:
+                event_count += int(row.get("event_count") or 0)
+            except (TypeError, ValueError):
+                finding_codes.add("INVALID_EVENT_COUNT")
+
+            try:
+                max_opposite_streak = max(
+                    max_opposite_streak,
+                    int(row.get("opposite_evidence_streak") or 0),
+                )
+            except (TypeError, ValueError):
+                finding_codes.add("INVALID_OPPOSITE_EVIDENCE_STREAK")
+
+            for code in str(row.get("consistency_flags") or "").split("|"):
+                clean = code.strip()
+                if clean:
+                    finding_codes.add(clean)
+
+    return {
+        "trading_date": trading_day.isoformat(),
+        "symbol": str(symbol).strip().upper(),
+        "snapshot_count": snapshot_count,
+        "ok_count": status_counts["OK"],
+        "error_count": status_counts["ERROR"],
+        "unassessable_count": class_counts["UNASSESSABLE"],
+        "coherent_count": class_counts["COHERENT"],
+        "transitional_conflict_count": class_counts["TRANSITIONAL_CONFLICT"],
+        "persistent_conflict_count": class_counts["PERSISTENT_CONFLICT"],
+        "hard_contract_failure_count": class_counts["HARD_CONTRACT_FAILURE"],
+        "episode_count": len(episode_ids),
+        "event_count": event_count,
+        "max_opposite_evidence_streak": max_opposite_streak,
+        "finding_codes": "|".join(sorted(finding_codes)),
+        "detail_file": detail_path.name,
+    }
+
+
+def upsert_symbol_summary(
+    *,
+    summary_path: Path,
+    summary_row: Mapping[str, Any],
+) -> None:
+    """Insert or replace one symbol/day row in the accumulated summary CSV."""
+
+    summary_path = Path(summary_path)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    key = (
+        str(summary_row.get("trading_date") or "").strip(),
+        str(summary_row.get("symbol") or "").strip().upper(),
+    )
+    if not all(key):
+        raise ValueError("Summary row requires trading_date and symbol")
+
+    rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if summary_path.exists():
+        with summary_path.open("r", newline="", encoding="utf-8") as handle:
+            for existing in csv.DictReader(handle):
+                existing_key = (
+                    str(existing.get("trading_date") or "").strip(),
+                    str(existing.get("symbol") or "").strip().upper(),
+                )
+                if all(existing_key):
+                    rows[existing_key] = {field: existing.get(field, "") for field in SUMMARY_FIELDS}
+
+    rows[key] = {field: _value(summary_row.get(field, "")) for field in SUMMARY_FIELDS}
+    temporary_path = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row_key in sorted(rows):
+            writer.writerow(rows[row_key])
+    temporary_path.replace(summary_path)
+
+
 __all__ = [
     "ConsistencyReportSummary",
+    "SUMMARY_FIELDS",
     "REPORT_FIELDS",
     "build_report_row",
     "generate_consistency_report",
+    "summarize_symbol_report",
+    "upsert_symbol_summary",
 ]
