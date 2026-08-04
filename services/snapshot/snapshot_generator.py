@@ -805,7 +805,7 @@ class SnapshotGenerator:
             symbol_cache_write_ms = (time.perf_counter() - cache_started) * 1000.0
 
         total_ms = (time.perf_counter() - total_started) * 1000.0
-        logger.info(
+        logger.debug(
             "snapshot_timing symbol=%s snapshot_time=%s total_ms=%.3f "
             "assemble_ms=%.3f validation_ms=%.3f snapshot_write_ms=%.3f "
             "symbol_cache_write_ms=%.3f",
