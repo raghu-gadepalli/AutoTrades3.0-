@@ -1461,12 +1461,12 @@ class SnapshotGenerator:
         generation_timings["assemble_total_ms"] = round(
             (time.perf_counter() - assemble_started) * 1000.0, 3
         )
-        logger.info(
-            "snapshot_component_timing symbol=%s snapshot_time=%s timings=%s",
-            self.symbol,
-            snap_time,
-            generation_timings,
-        )
+        # logger.info(
+        #     "snapshot_component_timing symbol=%s snapshot_time=%s timings=%s",
+        #     self.symbol,
+        #     snap_time,
+        #     generation_timings,
+        # )
 
         final_payload = pre_auction_snapshot.model_dump(mode="python", by_alias=True)
         final_payload["auction"] = auction_block.model_dump(mode="python", by_alias=True)
