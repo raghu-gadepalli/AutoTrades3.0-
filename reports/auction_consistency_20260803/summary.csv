@@ -1,0 +1,2 @@
+trading_date,symbol,snapshot_count,ok_count,error_count,unassessable_count,coherent_count,transitional_conflict_count,persistent_conflict_count,hard_contract_failure_count,episode_count,event_count,max_opposite_evidence_streak,finding_codes,detail_file
+2026-08-03,ABB,120,120,0,0,73,43,4,0,8,60,6,EPISODE_RAW_STRUCTURE_CONFLICT|EPISODE_SLOPE_CONFLICT|EPISODE_TREND_CONFLICT|FRESH_OPPOSITE_EVIDENCE|PERSISTENT_OPPOSITE_EVIDENCE,ABB.csv
