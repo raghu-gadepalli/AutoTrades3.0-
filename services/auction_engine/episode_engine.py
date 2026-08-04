@@ -431,7 +431,24 @@ class PersistentEpisodeEngine:
             memory.inactive_bars = 0
 
         if memory.state is not DirectionalEpisodeState.REVERSAL_LEG:
-            if observed_side is _opposite_direction(memory.direction):
+            opposite_side = _opposite_direction(memory.direction)
+            if (
+                memory.origin_source
+                is DirectionalEpisodeOrigin.REVERSAL_EVENT_HANDOFF
+            ):
+                # An established reversal may retain parent-side observation
+                # state or directional bias while current objective trend
+                # evidence still supports the reversal.  Parent restoration
+                # must therefore accumulate only from fresh trend direction,
+                # not from continuity fields used by generic direction
+                # observation precedence.
+                opposite_control_observed = (
+                    observation.trend_direction is opposite_side
+                )
+            else:
+                opposite_control_observed = observed_side is opposite_side
+
+            if opposite_control_observed:
                 memory.opposite_control_bars += 1
             else:
                 memory.opposite_control_bars = 0
@@ -1819,7 +1836,11 @@ class PersistentEpisodeEngine:
         ):
             return False
         parent_side = _opposite_direction(memory.direction)
-        if self._observed_direction(observation) is not parent_side:
+        # The configured generic precedence intentionally favours persistent
+        # observation state and directional bias.  Those fields are not fresh
+        # proof that an established reversal has lost control.  Require the
+        # current trend direction to confirm the restored parent side.
+        if observation.trend_direction is not parent_side:
             return False
         protection = observation.trend_protection_level
         if protection is None:
