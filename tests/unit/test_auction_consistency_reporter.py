@@ -219,14 +219,27 @@ def test_symbol_summary_is_built_and_upserted(tmp_path):
             "episode_id": "EP-1",
             "event_count": "1",
             "opposite_evidence_streak": "0",
+            "fresh_opposite_evidence": "False",
             "consistency_flags": "",
             "consistency_class": "COHERENT",
         },
         {
             "record_status": "OK",
             "episode_id": "EP-1",
+            "event_count": "0",
+            "opposite_evidence_streak": "1",
+            "fresh_opposite_evidence": "True",
+            "consistency_flags": "FRESH_OPPOSITE_EVIDENCE",
+            "consistency_class": "TRANSITIONAL_CONFLICT",
+        },
+        {
+            "record_status": "OK",
+            "episode_id": "EP-1",
+            "episode_current_state": "COMPLETED",
             "event_count": "2",
+            "event_types": "BALANCE_ESCAPE_ACCEPTED|DIRECTIONAL_COMPLETED",
             "opposite_evidence_streak": "3",
+            "fresh_opposite_evidence": "True",
             "consistency_flags": "FRESH_OPPOSITE_EVIDENCE|PERSISTENT_OPPOSITE_EVIDENCE",
             "consistency_class": "PERSISTENT_CONFLICT",
         },
@@ -235,6 +248,7 @@ def test_symbol_summary_is_built_and_upserted(tmp_path):
             "episode_id": "",
             "event_count": "",
             "opposite_evidence_streak": "",
+            "fresh_opposite_evidence": "False",
             "consistency_flags": "RECORD_ERROR",
             "consistency_class": "UNASSESSABLE",
         },
@@ -252,15 +266,21 @@ def test_symbol_summary_is_built_and_upserted(tmp_path):
     )
 
     assert summary["symbol"] == "ABB"
-    assert summary["snapshot_count"] == 3
-    assert summary["ok_count"] == 2
+    assert summary["snapshot_count"] == 4
+    assert summary["ok_count"] == 3
     assert summary["error_count"] == 1
     assert summary["unassessable_count"] == 1
     assert summary["coherent_count"] == 1
     assert summary["persistent_conflict_count"] == 1
+    assert summary["persistent_conflict_incidents"] == 1
+    assert summary["transition_explained_incidents"] == 1
+    assert summary["unresolved_conflict_incidents"] == 0
+    assert summary["unresolved_persistent_conflict_incidents"] == 0
     assert summary["episode_count"] == 1
     assert summary["event_count"] == 3
     assert summary["max_opposite_evidence_streak"] == 3
+    assert summary["review_priority"] == "P1"
+    assert summary["needs_review"] is True
     assert "PERSISTENT_OPPOSITE_EVIDENCE" in summary["finding_codes"]
 
     summary_path = tmp_path / "summary.csv"
@@ -278,3 +298,105 @@ def test_symbol_summary_is_built_and_upserted(tmp_path):
 
     assert [row["symbol"] for row in summary_rows] == ["ABB", "KPITTECH"]
     assert summary_rows[0]["event_count"] == "9"
+
+
+def test_unresolved_persistent_conflict_is_p2(tmp_path):
+    import csv
+
+    from services.auction_engine.consistency_reporter import (
+        REPORT_FIELDS,
+        summarize_symbol_report,
+    )
+
+    detail_path = tmp_path / "MCX.csv"
+    rows = [
+        {
+            "record_status": "OK",
+            "episode_id": "EP-DOWN",
+            "event_count": "0",
+            "opposite_evidence_streak": str(streak),
+            "fresh_opposite_evidence": "True",
+            "consistency_flags": (
+                "FRESH_OPPOSITE_EVIDENCE|PERSISTENT_OPPOSITE_EVIDENCE"
+                if streak >= 3
+                else "FRESH_OPPOSITE_EVIDENCE"
+            ),
+            "consistency_class": (
+                "PERSISTENT_CONFLICT" if streak >= 3 else "TRANSITIONAL_CONFLICT"
+            ),
+        }
+        for streak in (1, 2, 3, 4)
+    ]
+    with detail_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        for partial in rows:
+            writer.writerow({field: partial.get(field, "") for field in REPORT_FIELDS})
+
+    summary = summarize_symbol_report(
+        detail_path=detail_path,
+        trading_day=date(2026, 8, 3),
+        symbol="MCX",
+    )
+
+    assert summary["persistent_conflict_incidents"] == 1
+    assert summary["transition_explained_incidents"] == 0
+    assert summary["unresolved_conflict_incidents"] == 1
+    assert summary["unresolved_persistent_conflict_incidents"] == 1
+    assert summary["review_priority"] == "P2"
+    assert summary["needs_review"] is True
+
+
+def test_generate_summary_scans_all_symbols_without_detail_files(tmp_path, monkeypatch):
+    import csv
+
+    import services.auction_engine.consistency_reporter as reporter
+
+    rows = [
+        {
+            "symbol": "ABB",
+            "record_status": "OK",
+            "episode_id": "ABB-1",
+            "event_count": 0,
+            "opposite_evidence_streak": 0,
+            "fresh_opposite_evidence": False,
+            "consistency_flags": "",
+            "consistency_class": "COHERENT",
+        },
+        {
+            "symbol": "MCX",
+            "record_status": "OK",
+            "episode_id": "MCX-1",
+            "event_count": 0,
+            "opposite_evidence_streak": 3,
+            "fresh_opposite_evidence": True,
+            "consistency_flags": "FRESH_OPPOSITE_EVIDENCE|PERSISTENT_OPPOSITE_EVIDENCE",
+            "consistency_class": "PERSISTENT_CONFLICT",
+        },
+    ]
+    monkeypatch.setattr(
+        reporter,
+        "_iter_consistency_rows",
+        lambda **_kwargs: iter(rows),
+    )
+
+    summary_path = tmp_path / "summary.csv"
+    result = reporter.generate_consistency_summary(
+        trading_day=date(2026, 8, 3),
+        summary_path=summary_path,
+        overwrite=True,
+    )
+
+    assert result.rows_written == 2
+    assert result.symbols_seen == ("ABB", "MCX")
+    assert summary_path.exists()
+    assert not (tmp_path / "ABB.csv").exists()
+    assert not (tmp_path / "MCX.csv").exists()
+
+    with summary_path.open("r", newline="", encoding="utf-8") as handle:
+        summary_rows = list(csv.DictReader(handle))
+
+    assert [row["symbol"] for row in summary_rows] == ["ABB", "MCX"]
+    assert summary_rows[0]["review_priority"] == "NONE"
+    assert summary_rows[1]["review_priority"] == "P2"
+    assert summary_rows[1]["needs_review"] == "True"

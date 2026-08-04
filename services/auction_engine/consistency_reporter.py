@@ -16,7 +16,7 @@ from enum import Enum
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from schemas.snapshot import SnapshotSchema
@@ -194,10 +194,22 @@ SUMMARY_FIELDS: Tuple[str, ...] = (
     "transitional_conflict_count",
     "persistent_conflict_count",
     "hard_contract_failure_count",
+    "transitional_conflict_incidents",
+    "persistent_conflict_incidents",
+    "transition_explained_incidents",
+    "unresolved_conflict_incidents",
+    "unresolved_transitional_conflict_incidents",
+    "unresolved_persistent_conflict_incidents",
+    "hard_failure_incidents",
+    "directional_start_conflicts",
+    "directional_maturity_conflicts",
+    "lineage_anomalies",
     "episode_count",
     "event_count",
     "max_opposite_evidence_streak",
     "finding_codes",
+    "review_priority",
+    "needs_review",
     "detail_file",
 )
 
@@ -222,6 +234,224 @@ class _RawSnapshotRow:
     ltp_time: Optional[datetime]
     data: Any
     processed: bool
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().upper() in {"1", "TRUE", "YES", "Y"}
+
+
+def _event_type_set(row: Mapping[str, Any]) -> set[str]:
+    return {
+        token.strip().upper()
+        for token in str(row.get("event_types") or "").split("|")
+        if token.strip()
+    }
+
+
+def _transition_explains_conflict(row: Mapping[str, Any]) -> bool:
+    """Return True when the persisted row shows an explicit legal handoff path.
+
+    This is intentionally conservative and diagnostic. It does not assert that
+    the transition is correct; it only prevents a resolved handoff from being
+    counted as an unresolved conflict incident in the all-symbol summary.
+    """
+
+    state = str(row.get("episode_current_state") or "").strip().upper()
+    events = _event_type_set(row)
+    if state == "COMPLETED" and any(event.startswith("DIRECTIONAL_") for event in events):
+        return True
+
+    resolution_markers = (
+        "DIRECTIONAL_TREND_RESTORED",
+        "DIRECTIONAL_COMPLETED",
+        "DIRECTIONAL_REVERSAL_LEG_STARTED",
+        "DIRECTIONAL_REVERSAL_LEG_CONFIRMED",
+        "DIRECTIONAL_REVERSAL_LEG_ESTABLISHED",
+        "BALANCE_ESCAPE_ACCEPTED",
+        "BALANCE_ESCAPE_FAILED",
+    )
+    return any(
+        event == marker or event.endswith(marker)
+        for event in events
+        for marker in resolution_markers
+    )
+
+
+class _SymbolSummaryAccumulator:
+    """Incrementally aggregate one symbol without retaining wide snapshot rows."""
+
+    def __init__(
+        self,
+        *,
+        trading_day: date,
+        symbol: str,
+        detail_file: str = "",
+    ) -> None:
+        self.trading_day = trading_day
+        self.symbol = str(symbol).strip().upper()
+        self.detail_file = detail_file
+        self.class_counts: Counter[str] = Counter()
+        self.status_counts: Counter[str] = Counter()
+        self.episode_ids: set[str] = set()
+        self.finding_codes: set[str] = set()
+        self.snapshot_count = 0
+        self.event_count = 0
+        self.max_opposite_streak = 0
+        self.transitional_conflict_incidents = 0
+        self.persistent_conflict_incidents = 0
+        self.transition_explained_incidents = 0
+        self.unresolved_conflict_incidents = 0
+        self.unresolved_transitional_conflict_incidents = 0
+        self.unresolved_persistent_conflict_incidents = 0
+        self.hard_failure_incidents = 0
+        self.directional_start_conflicts = 0
+        self.directional_maturity_conflicts = 0
+        self.lineage_anomalies = 0
+        self._conflict_active = False
+        self._conflict_persistent = False
+        self._conflict_explained = False
+        self._hard_active = False
+
+    def _finish_conflict(self) -> None:
+        if not self._conflict_active:
+            return
+        if self._conflict_persistent:
+            self.persistent_conflict_incidents += 1
+        else:
+            self.transitional_conflict_incidents += 1
+        if self._conflict_explained:
+            self.transition_explained_incidents += 1
+        else:
+            self.unresolved_conflict_incidents += 1
+            if self._conflict_persistent:
+                self.unresolved_persistent_conflict_incidents += 1
+            else:
+                self.unresolved_transitional_conflict_incidents += 1
+        self._conflict_active = False
+        self._conflict_persistent = False
+        self._conflict_explained = False
+
+    def add(self, row: Mapping[str, Any]) -> None:
+        self.snapshot_count += 1
+        status = str(row.get("record_status") or "").strip().upper()
+        consistency_class = str(row.get("consistency_class") or "").strip().upper()
+        self.status_counts[status] += 1
+        self.class_counts[consistency_class] += 1
+
+        episode_id = str(row.get("episode_id") or "").strip()
+        if episode_id:
+            self.episode_ids.add(episode_id)
+
+        raw_event_count = row.get("event_count")
+        try:
+            self.event_count += int(raw_event_count or 0)
+        except (TypeError, ValueError):
+            self.finding_codes.add("INVALID_EVENT_COUNT")
+
+        raw_streak = row.get("opposite_evidence_streak")
+        try:
+            streak = int(raw_streak or 0)
+        except (TypeError, ValueError):
+            streak = 0
+            self.finding_codes.add("INVALID_OPPOSITE_EVIDENCE_STREAK")
+        self.max_opposite_streak = max(self.max_opposite_streak, streak)
+
+        flags = {
+            code.strip()
+            for code in str(row.get("consistency_flags") or "").split("|")
+            if code.strip()
+        }
+        self.finding_codes.update(flags)
+        events = _event_type_set(row)
+        fresh_opposite = _as_bool(row.get("fresh_opposite_evidence"))
+
+        if fresh_opposite:
+            if not self._conflict_active:
+                self._conflict_active = True
+            self._conflict_persistent = (
+                self._conflict_persistent
+                or consistency_class == "PERSISTENT_CONFLICT"
+                or streak >= 3
+            )
+            self._conflict_explained = (
+                self._conflict_explained or _transition_explains_conflict(row)
+            )
+        elif self._conflict_active:
+            self._conflict_explained = (
+                self._conflict_explained or _transition_explains_conflict(row)
+            )
+            self._finish_conflict()
+
+        hard_now = consistency_class == "HARD_CONTRACT_FAILURE"
+        if hard_now and not self._hard_active:
+            self.hard_failure_incidents += 1
+        self._hard_active = hard_now
+
+        if fresh_opposite and "DIRECTIONAL_STARTED" in events:
+            self.directional_start_conflicts += 1
+            self.finding_codes.add("DIRECTIONAL_START_CONFLICT")
+        if fresh_opposite and "DIRECTIONAL_MATURED" in events:
+            self.directional_maturity_conflicts += 1
+            self.finding_codes.add("DIRECTIONAL_MATURITY_CONFLICT")
+        if "REVERSAL_LINEAGE_MISSING" in flags:
+            self.lineage_anomalies += 1
+
+    def result(self) -> Dict[str, Any]:
+        self._finish_conflict()
+
+        if (
+            self.hard_failure_incidents > 0
+            or self.status_counts["ERROR"] > 0
+            or self.lineage_anomalies > 0
+        ):
+            review_priority = "P1"
+        elif (
+            self.unresolved_persistent_conflict_incidents > 0
+            or self.directional_start_conflicts > 0
+            or self.directional_maturity_conflicts > 0
+        ):
+            review_priority = "P2"
+        elif (
+            self.transition_explained_incidents > 0
+            or self.unresolved_transitional_conflict_incidents > 0
+            or self.class_counts["TRANSITIONAL_CONFLICT"] > 0
+            or self.class_counts["UNASSESSABLE"] > 0
+        ):
+            review_priority = "P3"
+        else:
+            review_priority = "NONE"
+
+        return {
+            "trading_date": self.trading_day.isoformat(),
+            "symbol": self.symbol,
+            "snapshot_count": self.snapshot_count,
+            "ok_count": self.status_counts["OK"],
+            "error_count": self.status_counts["ERROR"],
+            "unassessable_count": self.class_counts["UNASSESSABLE"],
+            "coherent_count": self.class_counts["COHERENT"],
+            "transitional_conflict_count": self.class_counts["TRANSITIONAL_CONFLICT"],
+            "persistent_conflict_count": self.class_counts["PERSISTENT_CONFLICT"],
+            "hard_contract_failure_count": self.class_counts["HARD_CONTRACT_FAILURE"],
+            "transitional_conflict_incidents": self.transitional_conflict_incidents,
+            "persistent_conflict_incidents": self.persistent_conflict_incidents,
+            "transition_explained_incidents": self.transition_explained_incidents,
+            "unresolved_conflict_incidents": self.unresolved_conflict_incidents,
+            "unresolved_transitional_conflict_incidents": self.unresolved_transitional_conflict_incidents,
+            "unresolved_persistent_conflict_incidents": self.unresolved_persistent_conflict_incidents,
+            "hard_failure_incidents": self.hard_failure_incidents,
+            "directional_start_conflicts": self.directional_start_conflicts,
+            "directional_maturity_conflicts": self.directional_maturity_conflicts,
+            "lineage_anomalies": self.lineage_anomalies,
+            "episode_count": len(self.episode_ids),
+            "event_count": self.event_count,
+            "max_opposite_evidence_streak": self.max_opposite_streak,
+            "finding_codes": "|".join(sorted(self.finding_codes)),
+            "review_priority": review_priority,
+            "needs_review": review_priority in {"P1", "P2"},
+            "detail_file": self.detail_file,
+        }
 
 
 def _value(value: Any) -> Any:
@@ -629,6 +859,82 @@ def _parse_snapshot(raw: _RawSnapshotRow) -> "SnapshotSchema":
     return SnapshotSchema.from_db_dict(payload)
 
 
+def _iter_consistency_rows(
+    *,
+    trading_day: date,
+    symbols: Optional[Sequence[str]],
+    experiment_id: str,
+    dataset_split: str,
+    code_commit: str,
+    config_hash: str,
+    batch_size: int,
+) -> Iterator[Dict[str, Any]]:
+    """Yield chronological report rows while isolating per-record failures."""
+
+    previous_state: Dict[str, Dict[str, str]] = {}
+    opposite_streak: Dict[str, int] = {}
+    after_time: Optional[datetime] = None
+    after_symbol = ""
+
+    while True:
+        batch = _fetch_batch(
+            trading_day=trading_day,
+            after_time=after_time,
+            after_symbol=after_symbol,
+            symbols=symbols,
+            limit=batch_size,
+        )
+        if not batch:
+            break
+
+        for raw in batch:
+            try:
+                snapshot = _parse_snapshot(raw)
+                row, next_state, next_streak = build_report_row(
+                    snapshot,
+                    db_processed=raw.processed,
+                    experiment_id=experiment_id,
+                    dataset_split=dataset_split,
+                    code_commit=code_commit,
+                    config_hash=config_hash,
+                    previous=previous_state.get(raw.symbol),
+                    previous_opposite_streak=opposite_streak.get(raw.symbol, 0),
+                )
+                previous_state[raw.symbol] = next_state
+                opposite_streak[raw.symbol] = next_streak
+            except Exception as exc:
+                logger.exception(
+                    "Auction consistency report failed for %s @ %s",
+                    raw.symbol,
+                    raw.snapshot_time,
+                )
+                row = _empty_row(
+                    experiment_id=experiment_id,
+                    dataset_split=dataset_split,
+                    code_commit=code_commit,
+                    config_hash=config_hash,
+                    record_status="ERROR",
+                    error_stage="PARSE_OR_FLATTEN",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    symbol=raw.symbol,
+                    trading_date=trading_day,
+                    snapshot_time=raw.snapshot_time,
+                    db_processed=raw.processed,
+                    ltp=raw.ltp,
+                    ltp_time=raw.ltp_time,
+                    consistency_class="UNASSESSABLE",
+                    consistency_flags="RECORD_ERROR",
+                )
+            yield row
+
+        last = batch[-1]
+        after_time = last.snapshot_time
+        after_symbol = last.symbol
+        if len(batch) < max(1, int(batch_size)):
+            break
+
+
 def generate_consistency_report(
     *,
     trading_day: date,
@@ -650,85 +956,101 @@ def generate_consistency_report(
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    previous_state: Dict[str, Dict[str, str]] = {}
-    opposite_streak: Dict[str, int] = {}
     symbols_seen: set[str] = set()
     rows_written = 0
     error_rows = 0
-    after_time: Optional[datetime] = None
-    after_symbol = ""
-
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS, extrasaction="ignore")
         writer.writeheader()
-
-        while True:
-            batch = _fetch_batch(
-                trading_day=trading_day,
-                after_time=after_time,
-                after_symbol=after_symbol,
-                symbols=symbols,
-                limit=batch_size,
-            )
-            if not batch:
-                break
-
-            for raw in batch:
-                symbols_seen.add(raw.symbol)
-                try:
-                    snapshot = _parse_snapshot(raw)
-                    row, next_state, next_streak = build_report_row(
-                        snapshot,
-                        db_processed=raw.processed,
-                        experiment_id=experiment_id,
-                        dataset_split=dataset_split,
-                        code_commit=code_commit,
-                        config_hash=config_hash,
-                        previous=previous_state.get(raw.symbol),
-                        previous_opposite_streak=opposite_streak.get(raw.symbol, 0),
-                    )
-                    previous_state[raw.symbol] = next_state
-                    opposite_streak[raw.symbol] = next_streak
-                except Exception as exc:
-                    error_rows += 1
-                    logger.exception(
-                        "Auction consistency report failed for %s @ %s",
-                        raw.symbol,
-                        raw.snapshot_time,
-                    )
-                    row = _empty_row(
-                        experiment_id=experiment_id,
-                        dataset_split=dataset_split,
-                        code_commit=code_commit,
-                        config_hash=config_hash,
-                        record_status="ERROR",
-                        error_stage="PARSE_OR_FLATTEN",
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                        symbol=raw.symbol,
-                        trading_date=trading_day,
-                        snapshot_time=raw.snapshot_time,
-                        db_processed=raw.processed,
-                        ltp=raw.ltp,
-                        ltp_time=raw.ltp_time,
-                        consistency_class="UNASSESSABLE",
-                        consistency_flags="RECORD_ERROR",
-                    )
-
-                writer.writerow(row)
-                rows_written += 1
-
-            last = batch[-1]
-            after_time = last.snapshot_time
-            after_symbol = last.symbol
-            if len(batch) < max(1, int(batch_size)):
-                break
+        for row in _iter_consistency_rows(
+            trading_day=trading_day,
+            symbols=symbols,
+            experiment_id=experiment_id,
+            dataset_split=dataset_split,
+            code_commit=code_commit,
+            config_hash=config_hash,
+            batch_size=batch_size,
+        ):
+            writer.writerow(row)
+            rows_written += 1
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if symbol:
+                symbols_seen.add(symbol)
+            if str(row.get("record_status") or "").strip().upper() == "ERROR":
+                error_rows += 1
 
     return ConsistencyReportSummary(
         output_path=output_path,
         rows_written=rows_written,
         error_rows=error_rows,
         symbols_seen=tuple(sorted(symbols_seen)),
+    )
+
+
+def generate_consistency_summary(
+    *,
+    trading_day: date,
+    summary_path: Path,
+    experiment_id: str = "auction-consistency-input",
+    dataset_split: str = "development",
+    code_commit: str = "UNSPECIFIED",
+    config_hash: str = "UNSPECIFIED",
+    batch_size: int = 500,
+    overwrite: bool = False,
+) -> ConsistencyReportSummary:
+    """Scan all symbols and write only a compact anomaly summary CSV."""
+
+    summary_path = Path(summary_path)
+    if summary_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Summary already exists: {summary_path}. Use overwrite explicitly."
+        )
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    accumulators: Dict[str, _SymbolSummaryAccumulator] = {}
+    rows_written = 0
+    error_rows = 0
+    for row in _iter_consistency_rows(
+        trading_day=trading_day,
+        symbols=None,
+        experiment_id=experiment_id,
+        dataset_split=dataset_split,
+        code_commit=code_commit,
+        config_hash=config_hash,
+        batch_size=batch_size,
+    ):
+        rows_written += 1
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            logger.error("Skipping summary row without symbol | row=%s", row)
+            error_rows += 1
+            continue
+        if str(row.get("record_status") or "").strip().upper() == "ERROR":
+            error_rows += 1
+        detail_path = summary_path.parent / f"{symbol}.csv"
+        accumulator = accumulators.setdefault(
+            symbol,
+            _SymbolSummaryAccumulator(
+                trading_day=trading_day,
+                symbol=symbol,
+                detail_file=detail_path.name if detail_path.exists() else "",
+            ),
+        )
+        accumulator.add(row)
+
+    temporary_path = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for symbol in sorted(accumulators):
+            writer.writerow(accumulators[symbol].result())
+    temporary_path.replace(summary_path)
+
+    return ConsistencyReportSummary(
+        output_path=summary_path,
+        rows_written=rows_written,
+        error_rows=error_rows,
+        symbols_seen=tuple(sorted(accumulators)),
     )
 
 
@@ -741,62 +1063,15 @@ def summarize_symbol_report(
     """Summarize one generated symbol report without re-querying the database."""
 
     detail_path = Path(detail_path)
-    class_counts: Counter[str] = Counter()
-    status_counts: Counter[str] = Counter()
-    episode_ids: set[str] = set()
-    finding_codes: set[str] = set()
-    snapshot_count = 0
-    event_count = 0
-    max_opposite_streak = 0
-
+    accumulator = _SymbolSummaryAccumulator(
+        trading_day=trading_day,
+        symbol=symbol,
+        detail_file=detail_path.name,
+    )
     with detail_path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            snapshot_count += 1
-            status = str(row.get("record_status") or "").strip().upper()
-            consistency_class = str(row.get("consistency_class") or "").strip().upper()
-            status_counts[status] += 1
-            class_counts[consistency_class] += 1
-
-            episode_id = str(row.get("episode_id") or "").strip()
-            if episode_id:
-                episode_ids.add(episode_id)
-
-            try:
-                event_count += int(row.get("event_count") or 0)
-            except (TypeError, ValueError):
-                finding_codes.add("INVALID_EVENT_COUNT")
-
-            try:
-                max_opposite_streak = max(
-                    max_opposite_streak,
-                    int(row.get("opposite_evidence_streak") or 0),
-                )
-            except (TypeError, ValueError):
-                finding_codes.add("INVALID_OPPOSITE_EVIDENCE_STREAK")
-
-            for code in str(row.get("consistency_flags") or "").split("|"):
-                clean = code.strip()
-                if clean:
-                    finding_codes.add(clean)
-
-    return {
-        "trading_date": trading_day.isoformat(),
-        "symbol": str(symbol).strip().upper(),
-        "snapshot_count": snapshot_count,
-        "ok_count": status_counts["OK"],
-        "error_count": status_counts["ERROR"],
-        "unassessable_count": class_counts["UNASSESSABLE"],
-        "coherent_count": class_counts["COHERENT"],
-        "transitional_conflict_count": class_counts["TRANSITIONAL_CONFLICT"],
-        "persistent_conflict_count": class_counts["PERSISTENT_CONFLICT"],
-        "hard_contract_failure_count": class_counts["HARD_CONTRACT_FAILURE"],
-        "episode_count": len(episode_ids),
-        "event_count": event_count,
-        "max_opposite_evidence_streak": max_opposite_streak,
-        "finding_codes": "|".join(sorted(finding_codes)),
-        "detail_file": detail_path.name,
-    }
+        for row in csv.DictReader(handle):
+            accumulator.add(row)
+    return accumulator.result()
 
 
 def upsert_symbol_summary(
@@ -842,6 +1117,7 @@ __all__ = [
     "REPORT_FIELDS",
     "build_report_row",
     "generate_consistency_report",
+    "generate_consistency_summary",
     "summarize_symbol_report",
     "upsert_symbol_summary",
 ]
