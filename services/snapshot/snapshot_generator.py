@@ -1123,7 +1123,7 @@ class SnapshotGenerator:
                 prev_state_memory=previous_state_memory,
             )
 
-            logger.info(
+            logger.debug(
                 "structure_update symbol=%s snapshot_time=%s mode=INCREMENTAL_PREVIOUS_SNAPSHOT previous=%s",
                 self.symbol,
                 snap_time,
@@ -1131,7 +1131,7 @@ class SnapshotGenerator:
             )
 
         else:
-            logger.info(
+            logger.debug(
                 "structure_update symbol=%s snapshot_time=%s mode=FULL_SESSION_REPLAY",
                 self.symbol,
                 snap_time,
@@ -1461,12 +1461,12 @@ class SnapshotGenerator:
         generation_timings["assemble_total_ms"] = round(
             (time.perf_counter() - assemble_started) * 1000.0, 3
         )
-        # logger.info(
-        #     "snapshot_component_timing symbol=%s snapshot_time=%s timings=%s",
-        #     self.symbol,
-        #     snap_time,
-        #     generation_timings,
-        # )
+        logger.debug(
+            "snapshot_component_timing symbol=%s snapshot_time=%s timings=%s",
+            self.symbol,
+            snap_time,
+            generation_timings,
+        )
 
         final_payload = pre_auction_snapshot.model_dump(mode="python", by_alias=True)
         final_payload["auction"] = auction_block.model_dump(mode="python", by_alias=True)
