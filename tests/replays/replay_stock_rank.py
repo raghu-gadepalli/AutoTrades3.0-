@@ -39,7 +39,7 @@ from schemas.snapshot import SnapshotSchema
 from services.selection.stock_rank import StockRankService
 
 # Normal workflow: change this one value and run the program without arguments.
-DEFAULT_REPLAY_DATE = date(2026, 8, 3)
+DEFAULT_REPLAY_DATE = date(2026, 8, 4)
 DEFAULT_SYMBOLS: Optional[str] = None
 DEFAULT_PERSIST = True
 DEFAULT_REPORT_DIR = "reports"
