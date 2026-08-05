@@ -24,13 +24,14 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 # ---------------------------------------------------------------------------
 # Hard-coded replay configuration
 # ---------------------------------------------------------------------------
-START = datetime(2026, 8, 5, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
-END = datetime(2026, 8, 5, 15, 15, tzinfo=ZoneInfo("Asia/Kolkata"))
+START = datetime(2026, 8, 3, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
+END = datetime(2026, 8, 3, 15, 15, tzinfo=ZoneInfo("Asia/Kolkata"))
 
 # Use exactly one of these forms:
 #   ["ALL"]                         -> all symbols allowed by ACTIVE_ONLY
 #   ["MARUTI", "INFY", "ASTRAL"]  -> only the named symbols allowed by ACTIVE_ONLY
-# SYMBOLS: List[str] = ['360ONE', 'ABB', 'ABCAPITAL', 'ADANIGREEN', 'ADANIPORTS', 'AMBER', 'ANGELONE', 'ASTRAL', 'AUBANK', 'AXISBANK']
+# SYMBOLS: List[str] = ['MARUTI', 'ABB', 'AUBANK', 'AXISBANK']
+SYMBOLS: List[str] = ['360ONE', 'ABB', 'ABCAPITAL', 'ADANIGREEN', 'ADANIPORTS', 'AMBER', 'ANGELONE', 'ASTRAL', 'AUBANK', 'AXISBANK']
 # SYMBOLS: List[str] = ['BAJAJ-AUTO', 'BAJFINANCE', 'BANKBARODA', 'BDL', 'BEL', 'BHARATFORG', 'BHEL', 'BIOCON', 'BLUESTARCO', 'BPCL']
 # SYMBOLS: List[str] = ['BSE', 'CGPOWER', 'CHOLAFIN', 'COFORGE', 'CROMPTON', 'DELHIVERY', 'DIVISLAB', 'DLF', 'DMART', 'DRREDDY']
 # SYMBOLS: List[str] = ['ETERNAL', 'FORCEMOT', 'GLENMARK', 'GODFRYPHLP', 'GVT&D', 'HCLTECH', 'HDFCAMC', 'HINDALCO', 'HINDPETRO', 'HINDZINC']
@@ -39,7 +40,7 @@ END = datetime(2026, 8, 5, 15, 15, tzinfo=ZoneInfo("Asia/Kolkata"))
 # SYMBOLS: List[str] = ['MANKIND', 'MARUTI', 'MAXHEALTH', 'MCX', 'MFSL', 'MOTILALOFS', 'MPHASIS', 'MUTHOOTFIN', 'NAM-INDIA', 'NATIONALUM']
 # SYMBOLS: List[str] = ['NIFTY 50', 'NIFTY BANK', 'OFSS', 'ONGC', 'PATANJALI', 'PAYTM', 'PERSISTENT', 'PNBHOUSING', 'POLICYBZR', 'POLYCAB']
 # SYMBOLS: List[str] = ['POWERINDIA', 'PREMIERENE', 'PRESTIGE', 'RADICO', 'SHRIRAMFIN', 'SIEMENS', 'SOLARINDS', 'SRF', 'TATAELXSI', 'TCS']
-SYMBOLS: List[str] = ['TECHM', 'TIINDIA', 'TITAN', 'TMPV', 'TORNTPHARM', 'TRENT', 'TVSMOTOR', 'UNOMINDA', 'VEDL', 'VOLTAS']
+# SYMBOLS: List[str] = ['TECHM', 'TIINDIA', 'TITAN', 'TMPV', 'TORNTPHARM', 'TRENT', 'TVSMOTOR', 'UNOMINDA', 'VEDL', 'VOLTAS']
 
 SYMBOL_TYPE_FILTER = "EQ"
 
