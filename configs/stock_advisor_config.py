@@ -88,8 +88,6 @@ class RepeatedEpisodePolicyConfig(BaseModel):
     require_same_side: bool = True
     balance_min_escape_attempts: int = Field(default=2, ge=1)
     balance_min_failed_escapes: int = Field(default=1, ge=1)
-    directional_maturity_counts_as_exhausted: bool = True
-    directional_exhaustion_counts_as_exhausted: bool = True
 
 
 class DeferredEntryFreshnessPolicyConfig(BaseModel):
@@ -117,14 +115,6 @@ class StockAdvisorPolicyConfig(BaseModel):
     model_config = STRICT_CONFIG
 
     enabled: bool = True
-
-    same_direction_exhaustion_action: AdvisorRuleAction = "BLOCK"
-    same_direction_exhaustion_families: Tuple[str, ...] = (
-        "BREAKOUT_INITIATION",
-        "ACCEPTED_BREAKOUT",
-        "CONTINUATION",
-        "REACCELERATION",
-    )
 
     inside_accepted_range_action: AdvisorRuleAction = "WATCH"
     inside_range_exempt_families: Tuple[str, ...] = ("FAILED_BREAKOUT",)

@@ -25,7 +25,7 @@ This is intentionally a simple clean-run utility:
 - optional CSV exports
 
 For large-universe work, use replay_snapshots.py followed by
-replay_unprocessed_multi.py instead.
+replay_unprocessed.py instead.
 """
 
 from __future__ import annotations

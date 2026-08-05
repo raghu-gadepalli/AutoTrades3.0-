@@ -86,7 +86,7 @@ SIGNAL_MAX_WORKERS: int = 3
 # Log individual signal evaluations above this duration as slow.
 SLOW_SIGNAL_SECONDS: float = 5.0
 
-LOG_FILE = "reports/replay_unprocessed_multi.log"
+LOG_FILE = "reports/replay_unprocessed.log"
 IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
@@ -592,7 +592,7 @@ def main() -> int:
     logger = logging.getLogger(__name__)
 
     logger.info(
-        "Starting replay_unprocessed_multi | generate_trades=%s userid=%s "
+        "Starting replay_unprocessed | generate_trades=%s userid=%s "
         "signal_workers=%d snapshot_generation=NEVER clearing=NEVER "
         "processing=LIVE_CADENCE_THREADED",
         GENERATE_TRADES,
@@ -609,7 +609,7 @@ def main() -> int:
         )
         return 130
     except Exception:
-        logger.exception("replay_unprocessed_multi failed during startup/preflight")
+        logger.exception("replay_unprocessed failed during startup/preflight")
         return 1
 
 
