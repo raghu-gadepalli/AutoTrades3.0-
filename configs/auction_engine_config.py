@@ -14,11 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from enums.auction_engine import (
     AuctionEventType,
-    AuctionStateName,
     BalanceEpisodeState,
-    DirectionObservationSource,
-    MaturityObservationSource,
-    ReversalWatchSource,
     SetupFamily,
     StructuralPermissionResult,
 )
@@ -197,95 +193,25 @@ class ReversalPolicyConfig(BaseModel):
 
 
 class DirectionalEpisodePolicyConfig(BaseModel):
-    """Authoritative directional-episode thresholds and observation policy."""
+    """Thresholds consumed by the minimal directional episode tracker."""
 
     model_config = STRICT_CONFIG
 
     start_confirmation_bars: int = Field(default=2, ge=1)
     opposite_completion_bars: int = Field(default=2, ge=1)
     inactive_completion_bars: int = Field(default=6, ge=2)
-
-    reversal_watch_max_bars: int = Field(default=20, ge=2)
-    reversal_confirmation_closes: int = Field(default=1, ge=1)
-    reversal_require_rejection: bool = True
-    reversal_require_continuation_failure: bool = True
-    reversal_confirmation_level_tolerance_atr: float = Field(default=0.0, ge=0.0)
-    reversal_first_adverse_min_close_atr: float = Field(default=0.0, ge=0.0)
-    reversal_continuation_failure_bars: int = Field(default=1, ge=1)
-    trend_restoration_confirmation_bars: int = Field(default=2, ge=1)
-
-    reversal_leg_establishment_closes: int = Field(default=2, ge=1)
-    reversal_leg_min_progress_atr: float = Field(default=0.50, ge=0.0)
-    reversal_leg_failure_closes: int = Field(default=2, ge=1)
-
-    start_observation_states: Tuple[AuctionStateName, ...] = (
-        AuctionStateName.FRESH_EXPANSION,
-        AuctionStateName.ORDERLY_UPTREND,
-        AuctionStateName.ORDERLY_DOWNTREND,
-        AuctionStateName.CONTROLLED_PULLBACK,
-        AuctionStateName.RECOMPRESSION,
-        AuctionStateName.REACCELERATION,
-        AuctionStateName.MATURE_EXTENSION,
-    )
-    up_observation_states: Tuple[AuctionStateName, ...] = (
-        AuctionStateName.ORDERLY_UPTREND,
-    )
-    down_observation_states: Tuple[AuctionStateName, ...] = (
-        AuctionStateName.ORDERLY_DOWNTREND,
-    )
-    maturity_observation_states: Tuple[AuctionStateName, ...] = (
-        AuctionStateName.MATURE_EXTENSION,
-    )
-    reversal_watch_observation_states: Tuple[AuctionStateName, ...] = (
-        AuctionStateName.TREND_FAILURE,
-    )
     start_blocking_balance_states: Tuple[BalanceEpisodeState, ...] = (
         BalanceEpisodeState.LOCKED,
         BalanceEpisodeState.ESCAPE_WATCH,
         BalanceEpisodeState.FAILED_BACK_INSIDE,
     )
 
-    direction_source_precedence: Tuple[DirectionObservationSource, ...] = (
-        DirectionObservationSource.OBSERVATION_STATE,
-        DirectionObservationSource.DIRECTIONAL_BIAS,
-        DirectionObservationSource.TREND_DIRECTION,
-    )
-    maturity_sources: Tuple[MaturityObservationSource, ...] = (
-        MaturityObservationSource.CURRENT_LEG,
-        MaturityObservationSource.EXTENSION,
-        MaturityObservationSource.OBSERVATION_STATE,
-    )
-    reversal_watch_sources: Tuple[ReversalWatchSource, ...] = (
-        ReversalWatchSource.EXHAUSTION,
-        ReversalWatchSource.REJECTION,
-        ReversalWatchSource.FAILED_EXTREME,
-        ReversalWatchSource.STRUCTURAL_FAILURE,
-        ReversalWatchSource.OBSERVATION_STATE,
-    )
-
     @model_validator(mode="after")
     def _validate_directional_policy(self) -> "DirectionalEpisodePolicyConfig":
-        _require_unique_nonempty("start_observation_states", self.start_observation_states)
-        _require_unique_nonempty("up_observation_states", self.up_observation_states)
-        _require_unique_nonempty("down_observation_states", self.down_observation_states)
-        _require_unique_nonempty(
-            "maturity_observation_states",
-            self.maturity_observation_states,
-        )
-        _require_unique_nonempty(
-            "reversal_watch_observation_states",
-            self.reversal_watch_observation_states,
-        )
-        _require_unique_nonempty("direction_source_precedence", self.direction_source_precedence)
-        _require_unique_nonempty("maturity_sources", self.maturity_sources)
-        _require_unique_nonempty("reversal_watch_sources", self.reversal_watch_sources)
         _require_unique_nonempty(
             "start_blocking_balance_states",
             self.start_blocking_balance_states,
         )
-        overlap = set(self.up_observation_states).intersection(self.down_observation_states)
-        if overlap:
-            raise ValueError("UP and DOWN observation-state mappings cannot overlap")
         return self
 
 
@@ -365,7 +291,7 @@ class BalanceEpisodePolicyConfig(BaseModel):
 
 
 class StructuralEventRuleConfig(BaseModel):
-    """Default setup permission created by one authoritative lifecycle event."""
+    """Default setup permission created by one authoritative Auction event."""
 
     model_config = STRICT_CONFIG
 
@@ -411,28 +337,8 @@ class StructuralPermissionPolicyConfig(BaseModel):
     )
     event_rules: Tuple[StructuralEventRuleConfig, ...] = (
         StructuralEventRuleConfig(
-            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_CONFIRMED,
+            event_type=AuctionEventType.DIRECTIONAL_REVERSED,
             setup_families=(SetupFamily.REVERSAL,),
-            result=StructuralPermissionResult.WAIT,
-        ),
-        StructuralEventRuleConfig(
-            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-            setup_families=(SetupFamily.REVERSAL,),
-            result=StructuralPermissionResult.PERMIT,
-        ),
-        StructuralEventRuleConfig(
-            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-            setup_families=(SetupFamily.CONTINUATION,),
-            result=StructuralPermissionResult.PERMIT,
-        ),
-        StructuralEventRuleConfig(
-            event_type=AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED,
-            setup_families=(SetupFamily.CONTINUATION,),
-            result=StructuralPermissionResult.PERMIT,
-        ),
-        StructuralEventRuleConfig(
-            event_type=AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED,
-            setup_families=(SetupFamily.REACCELERATION,),
             result=StructuralPermissionResult.PERMIT,
         ),
         StructuralEventRuleConfig(
@@ -506,13 +412,24 @@ class StructuralPermissionPolicyConfig(BaseModel):
             if rule.result is StructuralPermissionResult.PERMIT
             for family in rule.setup_families
         }
-        if creation_families != set(SetupFamily):
+        required_event_backed_families = {
+            SetupFamily.REVERSAL,
+            SetupFamily.BREAKOUT_INITIATION,
+            SetupFamily.ACCEPTED_BREAKOUT,
+            SetupFamily.FAILED_BREAKOUT,
+        }
+        if creation_families != required_event_backed_families:
             missing = sorted(
-                family.value for family in set(SetupFamily) - creation_families
+                family.value
+                for family in required_event_backed_families - creation_families
+            )
+            unexpected = sorted(
+                family.value
+                for family in creation_families - required_event_backed_families
             )
             raise ValueError(
-                "Every setup family requires at least one authoritative PERMIT event; "
-                f"missing={missing}"
+                "Structural PERMIT events must match the current Auction event-backed "
+                f"families exactly; missing={missing} unexpected={unexpected}"
             )
         state_family_keys = []
         for rule in self.state_rules:
@@ -527,7 +444,7 @@ class StructuralPermissionPolicyConfig(BaseModel):
 
 
 class AuctionEpisodePolicyConfig(BaseModel):
-    """Authoritative persistent directional/balance lifecycle policy."""
+    """Authoritative directional and balance episode policy."""
 
     model_config = STRICT_CONFIG
 

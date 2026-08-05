@@ -1,4 +1,4 @@
-"""Central structural setup-permission matrix for Auction lifecycle events."""
+"""Central structural setup-permission matrix for authoritative Auction events."""
 
 from __future__ import annotations
 
@@ -85,6 +85,43 @@ class StructuralPermissionMatrix:
                 )
             )
         return tuple(permissions)
+
+    @staticmethod
+    def permission_signature(
+        permissions: Tuple[StructuralSetupPermission, ...],
+    ) -> Tuple[tuple, ...]:
+        """Return the complete deterministic permission projection signature."""
+        return tuple(
+            sorted(
+                (
+                    item.setup_family.value,
+                    item.result.value,
+                    tuple(item.source_event_ids),
+                    tuple(event.value for event in item.source_event_types),
+                    item.balance_state.value,
+                    tuple(item.reason_codes),
+                )
+                for item in permissions
+            )
+        )
+
+    def validate_persisted(
+        self,
+        *,
+        balance_state: BalanceEpisodeState,
+        events: Tuple[AuctionEvent, ...],
+        permissions: Tuple[StructuralSetupPermission, ...],
+    ) -> None:
+        """Fail when stored permissions do not match authoritative snapshot facts."""
+        expected = self.evaluate(balance_state=balance_state, events=events)
+        expected_signature = self.permission_signature(expected)
+        stored_signature = self.permission_signature(permissions)
+        if stored_signature != expected_signature:
+            raise ValueError(
+                "Persisted Auction permissions do not match authoritative events "
+                f"and balance state: stored={stored_signature!r} "
+                f"expected={expected_signature!r}"
+            )
 
     def _apply(
         self,

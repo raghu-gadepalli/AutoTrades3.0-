@@ -87,10 +87,6 @@ def _candidate_interpretation(
         "target_reference_source": candidate.target_basis,
         "reference_price": candidate.reference_price,
         "reference_source": candidate.reference_source,
-        "risk_points": candidate.risk_points,
-        "expected_move_points": candidate.expected_move_points,
-        "expected_move_pct": candidate.expected_move_pct,
-        "reward_risk": candidate.reward_risk,
         "valid_until": candidate.valid_until,
         "reason_codes": candidate.reason_codes,
         "evaluation": diagnostic,
@@ -108,6 +104,29 @@ def _lineage_record(candidate: AuthoritativeSetupCandidate) -> Dict[str, Any]:
         "candidate_id": candidate.candidate_id,
         "candidate_opportunity_key": candidate.opportunity_key,
         "snapshot_time": candidate.snapshot_time,
+    })
+
+
+def _route_lineage_record(
+    *,
+    snapshot: SnapshotSchema,
+    signal: SignalSchema,
+    route: AuthoritativeSetupEventRoute,
+    opportunity_key: str,
+) -> Dict[str, Any]:
+    """Record an authoritative non-candidate lifecycle event in opportunity lineage."""
+
+    return sanitize_json({
+        "source_event_id": route.source_event_id,
+        "source_event_type": route.source_event_type.value,
+        "source_episode_id": route.source_episode_id,
+        "setup_family": route.setup_family.value,
+        "setup_subtype": None,
+        "side": signal.side.value,
+        "candidate_id": None,
+        "candidate_opportunity_key": opportunity_key,
+        "snapshot_time": snapshot.snapshot_time,
+        "route_action": route.action.value,
     })
 
 
@@ -453,6 +472,12 @@ class StockOpportunitySchema(BaseModel):
                 raise RuntimeError(
                     f"Missing deployed opportunity for signal {signal.signal_id}"
                 )
+            state = str(existing.lifecycle_state or "").strip().upper()
+            if state not in {"DEPLOYED", "PROGRESSED"}:
+                raise RuntimeError(
+                    "Authoritative progression requires an active opportunity; "
+                    f"state={state} signal_id={signal.signal_id}"
+                )
             update_data: Dict[str, Any] = {
                 "latest_candidate_id": candidate.candidate_id,
                 "current_setup_family": candidate.setup_family.value,
@@ -502,26 +527,23 @@ class StockOpportunitySchema(BaseModel):
             raise
 
     @staticmethod
-    def complete_opportunity(
+    def record_opportunity_window_close(
         *,
         snapshot: SnapshotSchema,
         signal: SignalSchema,
         route: AuthoritativeSetupEventRoute,
     ) -> StockOpportunitySchema:
+        """Record closure of a setup-creation window without ending deployment.
+
+        A router ``CLOSE`` action closes only the setup family's creation/update
+        window.  Once a signal has been deployed, the opportunity remains active
+        until replacement, invalidation, or the intraday cutoff.  Persist the
+        authoritative event and transition for audit, but never convert an open
+        deployed opportunity to ``COMPLETED`` here.
+        """
+
         ts = _to_ist_naive(snapshot.snapshot_time)
-        reason = f"{route.source_event_type.value}_OPPORTUNITY_WINDOW_COMPLETED"
-        transition = _transition(
-            transition_key=f"COMPLETED:{route.source_event_id}:{signal.signal_id}",
-            transition_time=ts,
-            state="COMPLETED",
-            reason=reason,
-            signal_id=signal.signal_id,
-            event_id=route.source_event_id,
-            event_type=route.source_event_type.value,
-            episode_id=route.source_episode_id,
-            setup_family=route.setup_family.value,
-            side=signal.side.value,
-        )
+        reason = f"{route.source_event_type.value}_OPPORTUNITY_WINDOW_CLOSED"
 
         try:
             existing = StockOpportunitySchema.fetch_by_signal_id(signal.signal_id)
@@ -529,20 +551,53 @@ class StockOpportunitySchema(BaseModel):
                 raise RuntimeError(
                     f"Missing deployed opportunity for signal {signal.signal_id}"
                 )
+
+            state = str(existing.lifecycle_state or "").strip().upper()
+            if state not in {"DEPLOYED", "PROGRESSED"}:
+                raise RuntimeError(
+                    "Open signal cannot record an opportunity-window close with "
+                    f"terminal opportunity state={state} signal_id={signal.signal_id}"
+                )
+
+            transition = _transition(
+                transition_key=(
+                    f"WINDOW_CLOSED:{route.source_event_id}:{signal.signal_id}"
+                ),
+                transition_time=ts,
+                state=state,
+                reason=reason,
+                signal_id=signal.signal_id,
+                event_id=route.source_event_id,
+                event_type=route.source_event_type.value,
+                episode_id=route.source_episode_id,
+                setup_family=route.setup_family.value,
+                side=signal.side.value,
+            )
+            lineage = _route_lineage_record(
+                snapshot=snapshot,
+                signal=signal,
+                route=route,
+                opportunity_key=existing.opportunity_key,
+            )
+
             updated = StockOpportunitySchema.update_opportunity(
                 signal_id=signal.signal_id,
                 update_data={
                     "latest_event_id": route.source_event_id,
                     "latest_event_type": route.source_event_type.value,
                     "latest_episode_id": route.source_episode_id,
-                    "lifecycle_state": "COMPLETED",
+                    "lifecycle_state": state,
                     "lifecycle_reason": reason,
                     "last_eval_time": ts,
-                    "completed_at": existing.completed_at or ts,
                     "transition_history": _append_unique(
                         existing.transition_history,
                         transition,
                         identity_key="transition_key",
+                    ),
+                    "authoritative_event_lineage": _append_unique(
+                        existing.authoritative_event_lineage,
+                        lineage,
+                        identity_key="source_event_id",
                     ),
                 },
             )
@@ -553,7 +608,8 @@ class StockOpportunitySchema(BaseModel):
             return updated
         except Exception:
             logger.exception(
-                "stock opportunity completion failed | signal_id=%s event_id=%s",
+                "stock opportunity window-close recording failed | "
+                "signal_id=%s event_id=%s",
                 signal.signal_id,
                 route.source_event_id,
             )

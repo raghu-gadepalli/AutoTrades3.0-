@@ -1,7 +1,7 @@
 """Strict event-driven setup quality evaluation for all Auction setup families.
 
 The engine consumes only routes produced by :mod:`setup_event_router`.  It may
-assess price/risk/room quality, but it never rediscovers lifecycle transitions.
+assess price and room quality, but it never rediscovers structural events.
 """
 from __future__ import annotations
 
@@ -53,10 +53,9 @@ class EventDrivenSetupEngine:
     ) -> Tuple[SetupEvaluationResult, ...]:
         if not isinstance(snapshot, SnapshotSchema):
             raise TypeError("EventDrivenSetupEngine requires SnapshotSchema")
-        lifecycle = snapshot.auction.lifecycle
-        if snapshot.auction.status != "OK" or lifecycle is None:
-            raise ValueError("Authoritative Auction lifecycle is required")
-        event_by_id = {event.event_id: event for event in lifecycle.events}
+        if snapshot.auction.status != "OK":
+            raise ValueError("Authoritative Auction projection is required")
+        event_by_id = {event.event_id: event for event in snapshot.auction.events}
         results: List[SetupEvaluationResult] = []
         for route in routes:
             if route.action is not SetupEventAction.EVALUATE:
@@ -114,17 +113,6 @@ class EventDrivenSetupEngine:
         stop = float(geometry["stop"])
         target = float(geometry["target"])
         reference = float(geometry["reference"])
-        risk = abs(entry - stop)
-        expected = abs(target - entry)
-        expected_pct = expected / entry
-        reward_risk = expected / risk
-        if expected_pct < 0.005:
-            blockers.append("EXPECTED_FIRST_MOVE_BELOW_0_5_PERCENT")
-        if reward_risk < 1.0:
-            blockers.append("REWARD_RISK_BELOW_1")
-        if blockers:
-            return self._rejected(route, side, structural, tuple(blockers))
-
         candidate_id = self._stable_id(
             "CAND",
             snapshot.symbol,
@@ -143,12 +131,9 @@ class EventDrivenSetupEngine:
             route.source_episode_id,
             route.source_event_id,
         )
-        engine = snapshot.auction.engine
-        if engine is None:
-            raise ValueError("Authoritative setup candidate requires Auction engine identity")
         candidate = AuthoritativeSetupCandidate(
-            auction_engine_name=engine.name,
-            auction_engine_version=engine.version,
+            auction_engine_name=self.config.engine.engine_name,
+            auction_engine_version=self.config.engine.engine_version,
             candidate_id=candidate_id,
             opportunity_key=opportunity_key,
             symbol=snapshot.symbol.strip().upper(),
@@ -168,10 +153,6 @@ class EventDrivenSetupEngine:
             target_basis=str(geometry["target_basis"]),
             reference_price=reference,
             reference_source=str(geometry["reference_source"]),
-            risk_points=risk,
-            expected_move_points=expected,
-            expected_move_pct=expected_pct,
-            reward_risk=reward_risk,
             valid_until=snapshot.snapshot_time + timedelta(minutes=6),
             reason_codes=tuple(dict.fromkeys((
                 "AUTHORITATIVE_EVENT_ROUTE",
@@ -264,6 +245,42 @@ class EventDrivenSetupEngine:
                 "reference_source": "FROZEN_BALANCE_BOUNDARY",
                 "blockers": blockers,
                 "reasons": reasons,
+            }
+
+        if (
+            family is SetupFamily.REVERSAL
+            and event.event_type is AuctionEventType.DIRECTIONAL_REVERSED
+        ):
+            bars = tuple(snapshot.memory.structure.bars_3m[-2:])
+            if len(bars) < 2:
+                return {"blockers": ["REVERSAL_CONFIRMATION_BARS_REQUIRED"]}
+            reference = self._positive_number(data, "start_price")
+            if reference is None:
+                return {"blockers": ["REVERSAL_START_PRICE_REQUIRED"]}
+            if side is TradeSide.BUY:
+                stop = min(float(bar.low) for bar in bars)
+                if stop >= entry:
+                    return {"blockers": ["BUY_REVERSAL_STOP_BELOW_ENTRY_REQUIRED"]}
+                target = entry + 1.5 * (entry - stop)
+            else:
+                stop = max(float(bar.high) for bar in bars)
+                if stop <= entry:
+                    return {"blockers": ["SELL_REVERSAL_STOP_ABOVE_ENTRY_REQUIRED"]}
+                target = entry - 1.5 * (stop - entry)
+            if (
+                abs(entry - reference) / atr
+                > self.config.reversal.max_entry_distance_from_failure_level_atr
+            ):
+                blockers.append("ENTRY_TOO_FAR_FROM_REVERSAL_START")
+            return {
+                "stop": stop,
+                "target": target,
+                "reference": reference,
+                "stop_type": "TWO_BAR_CONFIRMATION_EXTREME",
+                "target_basis": "ONE_POINT_FIVE_R",
+                "reference_source": "DIRECTIONAL_REVERSAL_START",
+                "blockers": blockers,
+                "reasons": ["TWO_BAR_DIRECTIONAL_REVERSAL_CONFIRMATION_GEOMETRY"],
             }
 
         valid_stops: List[Tuple[float, str]] = []
@@ -371,13 +388,10 @@ class EventDrivenSetupEngine:
     @staticmethod
     def _subtype(event_type: AuctionEventType) -> str:
         mapping = {
+            AuctionEventType.DIRECTIONAL_REVERSED: "STRUCTURAL_REVERSAL",
             AuctionEventType.BALANCE_ESCAPE_STARTED: "BALANCE_ESCAPE_INITIATION",
             AuctionEventType.BALANCE_ESCAPE_ACCEPTED: "ACCEPTED_BALANCE_ESCAPE",
             AuctionEventType.BALANCE_ESCAPE_FAILED: "FAILED_BALANCE_ESCAPE",
-            AuctionEventType.DIRECTIONAL_TREND_RESTORED: "TREND_RESTORATION",
-            AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED: "CONTROLLED_PULLBACK_CONTINUATION",
-            AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED: "RECOMPRESSION_REACCELERATION",
-            AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED: "STRUCTURAL_REVERSAL",
         }
         if event_type not in mapping:
             raise ValueError(f"No setup subtype for event {event_type.value}")
@@ -440,7 +454,6 @@ class EventDrivenSetupManager:
             candidates,
             key=lambda item: (
                 -_FAMILY_PRIORITY[item.setup_family],
-                -item.reward_risk,
                 item.candidate_id,
             ),
         )

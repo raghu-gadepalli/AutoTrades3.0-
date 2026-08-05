@@ -1,73 +1,74 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from enums.auction_engine import (
     AuctionEventType,
-    AuctionStateName,
+    BalanceEpisodeState,
     DirectionalBias,
     SetupEventAction,
     SetupFamily,
     StructuralPermissionResult,
 )
-from services.auction_engine.episode_engine import PersistentEpisodeEngine
+from services.auction_engine.episode_contracts import AuctionEvent
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
-from tests.unit.test_persistent_episode_engine import _observation
+from services.auction_engine.structural_permissions import StructuralPermissionMatrix
 
 
-def test_every_setup_family_has_creation_capable_authoritative_event() -> None:
+TS = datetime(2026, 8, 3, 10, 12)
+
+
+def _event(event_type: AuctionEventType, direction: DirectionalBias) -> AuctionEvent:
+    episode_id = f"DIR-TEST-20260803-0002-{direction.value}"
+    return AuctionEvent(
+        event_id=f"EVT-TEST-{TS:%Y%m%d%H%M%S}-{event_type.value}-{episode_id}",
+        event_type=event_type,
+        episode_id=episode_id,
+        symbol="TEST",
+        trading_day=TS.date(),
+        event_time=TS,
+        direction=direction,
+        reason_codes=("TEST_EVENT",),
+        data={},
+    )
+
+
+def test_current_creation_events_include_balance_escape_and_directional_reversal() -> None:
     creation = AuthoritativeSetupEventRouter.creation_event_types()
 
-    assert set(creation) == set(SetupFamily)
-    assert all(creation[family] for family in SetupFamily)
     assert AuctionEventType.BALANCE_ESCAPE_STARTED in creation[
         SetupFamily.BREAKOUT_INITIATION
     ]
-    assert AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED in creation[
-        SetupFamily.CONTINUATION
+    assert AuctionEventType.BALANCE_ESCAPE_ACCEPTED in creation[
+        SetupFamily.ACCEPTED_BREAKOUT
     ]
-    assert AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED in creation[
-        SetupFamily.REACCELERATION
+    assert AuctionEventType.BALANCE_ESCAPE_FAILED in creation[
+        SetupFamily.FAILED_BREAKOUT
     ]
+    assert AuctionEventType.DIRECTIONAL_REVERSED in creation[SetupFamily.REVERSAL]
 
 
-def test_router_preserves_event_identity_and_structural_permission() -> None:
-    engine = PersistentEpisodeEngine()
-    engine.advance(_observation(0))
-    engine.advance(_observation(1))
-    engine.advance(
-        _observation(
-            2,
-            observation_state=AuctionStateName.CONTROLLED_PULLBACK,
-            trend_direction=DirectionalBias.UP,
-            directional_bias=DirectionalBias.UP,
-        )
-    )
-    lifecycle = engine.advance(
-        _observation(
-            3,
-            close=100.8,
-            observation_state=AuctionStateName.REACCELERATION,
-            trend_direction=DirectionalBias.UP,
-            directional_bias=DirectionalBias.UP,
-        )
+def test_router_preserves_current_reversal_event_identity_and_permission() -> None:
+    event = _event(AuctionEventType.DIRECTIONAL_REVERSED, DirectionalBias.DOWN)
+    permissions = StructuralPermissionMatrix().evaluate(
+        balance_state=BalanceEpisodeState.NONE,
+        events=(event,),
     )
 
-    routes = AuthoritativeSetupEventRouter().route(lifecycle)
-    continuation_routes = [
+    routes = AuthoritativeSetupEventRouter().route_authority(
+        events=(event,),
+        permissions=permissions,
+    )
+    evaluate = [
         route
         for route in routes
-        if route.setup_family is SetupFamily.CONTINUATION
+        if route.setup_family is SetupFamily.REVERSAL
         and route.action is SetupEventAction.EVALUATE
     ]
 
-    assert len(continuation_routes) == 1
-    route = continuation_routes[0]
-    event = next(
-        event
-        for event in lifecycle.events
-        if event.event_type
-        is AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED
-    )
+    assert len(evaluate) == 1
+    route = evaluate[0]
     assert route.source_event_id == event.event_id
     assert route.source_episode_id == event.episode_id
-    assert route.direction is event.direction
+    assert route.direction is DirectionalBias.DOWN
     assert route.structural_result is StructuralPermissionResult.PERMIT

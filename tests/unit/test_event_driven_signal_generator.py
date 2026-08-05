@@ -141,7 +141,7 @@ class _Persister:
         self.fetcher.active = None
         return closed
 
-    def complete_opportunity(self, *, signal, snapshot, route):
+    def record_opportunity_window_close(self, *, signal, snapshot, route):
         self.completed_routes.append(route)
 
     def close_at_intraday_cutoff(
@@ -183,11 +183,11 @@ class _Advisor:
 
 def test_symbol_generate_signals_gate_uses_schema_field() -> None:
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.UP,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
     fetcher = _Fetcher()
     fetcher.symbol.generate_signals = False
@@ -200,11 +200,11 @@ def test_symbol_generate_signals_gate_uses_schema_field() -> None:
 
 def test_signal_creation_uses_only_authoritative_event_identity() -> None:
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.UP,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
     fetcher = _Fetcher()
     persister = _Persister(fetcher)
@@ -228,11 +228,11 @@ def test_signal_creation_uses_only_authoritative_event_identity() -> None:
 
 def test_structural_block_cannot_create_signal() -> None:
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         result=StructuralPermissionResult.BLOCK,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
     fetcher = _Fetcher()
     persister = _Persister(fetcher)
@@ -327,11 +327,11 @@ def test_advisor_block_suppresses_only_new_creation() -> None:
 
 def test_advisor_is_not_reapplied_to_same_active_opportunity() -> None:
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
+        AuctionEventType.BALANCE_ESCAPE_STARTED,
+        SetupFamily.BREAKOUT_INITIATION,
         direction=DirectionalBias.UP,
-        close=102.0,
-        data={"origin_price": 100.0},
+        close=101.2,
+        data={"frozen_low": 99.0, "frozen_high": 101.0},
     )
     fetcher = _Fetcher()
     persister = _Persister(fetcher)
@@ -372,12 +372,10 @@ def test_consumed_event_identity_cannot_create_duplicate_signal() -> None:
         (AuctionEventType.BALANCE_ESCAPE_STARTED, SetupFamily.BREAKOUT_INITIATION, DirectionalBias.UP, 101.2, {"frozen_low": 99.0, "frozen_high": 101.0}),
         (AuctionEventType.BALANCE_ESCAPE_ACCEPTED, SetupFamily.ACCEPTED_BREAKOUT, DirectionalBias.UP, 101.2, {"frozen_low": 99.0, "frozen_high": 101.0}),
         (AuctionEventType.BALANCE_ESCAPE_FAILED, SetupFamily.FAILED_BREAKOUT, DirectionalBias.DOWN, 100.5, {"frozen_low": 99.0, "frozen_high": 101.0}),
-        (AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED, SetupFamily.CONTINUATION, DirectionalBias.UP, 102.0, {"origin_price": 101.4, "protection_level": 100.8}),
-        (AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED, SetupFamily.REACCELERATION, DirectionalBias.UP, 102.0, {"origin_price": 101.4, "protection_level": 100.8}),
-        (AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED, SetupFamily.REVERSAL, DirectionalBias.UP, 102.0, {"origin_price": 100.0}),
+        (AuctionEventType.DIRECTIONAL_REVERSED, SetupFamily.REVERSAL, DirectionalBias.UP, 102.0, {"start_price": 100.0}),
     ),
 )
-def test_all_six_families_reach_signal_persistence_only_from_events(
+def test_current_event_backed_families_reach_signal_persistence(
     event_type, family, direction, close, data
 ) -> None:
     snapshot = _event_snapshot(
@@ -403,13 +401,13 @@ def test_all_six_families_reach_signal_persistence_only_from_events(
     assert signal.meta_json["setup_levels"]["setup_contract_version"] == "AUTHORITATIVE_SETUP_V1"
 
 
-def test_directional_completion_keeps_signal_open_and_completes_opportunity() -> None:
+def test_directional_end_keeps_signal_open_and_closes_opportunity_window() -> None:
     create_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.UP,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
     fetcher = _Fetcher()
     persister = _Persister(fetcher)
@@ -417,7 +415,7 @@ def test_directional_completion_keeps_signal_open_and_completes_opportunity() ->
     created = assembler.assemble(create_snapshot)[0][1]
 
     completed_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_COMPLETED,
+        AuctionEventType.DIRECTIONAL_ENDED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.UP,
         close=102.1,
@@ -432,7 +430,7 @@ def test_directional_completion_keeps_signal_open_and_completes_opportunity() ->
     assert held.meta_json["management"]["should_exit_signal"] is False
     assert held.meta_json["lifecycle"]["trade_action"] == "HOLD_POSITION"
     assert [route.source_event_type for route in persister.completed_routes] == [
-        AuctionEventType.DIRECTIONAL_COMPLETED
+        AuctionEventType.DIRECTIONAL_ENDED
     ]
     assert persister.cutoff_closes == []
 
@@ -564,7 +562,7 @@ def test_same_episode_breakout_acceptance_progresses_signal_without_replacement(
     assert len(replayed[0][1].meta_json["authoritative_event_lineage"]) == 2
 
 
-def test_structural_invalidation_still_force_exits_before_opposite_setup() -> None:
+def test_approved_opposite_setup_replaces_active_signal() -> None:
     initiation_snapshot = _event_snapshot(
         AuctionEventType.BALANCE_ESCAPE_STARTED,
         SetupFamily.BREAKOUT_INITIATION,
@@ -586,95 +584,32 @@ def test_structural_invalidation_still_force_exits_before_opposite_setup() -> No
     )
     events = assembler.assemble(failed_snapshot)
 
-    assert [item[0] for item in events] == ["CLOSE", "CREATE"]
-    invalidated, replacement = events[0][1], events[1][1]
-    assert invalidated.signal_id == created.signal_id
-    assert invalidated.status is SignalStatus.INVALIDATED
-    assert invalidated.stage is LifecycleStage.FORCE_EXIT
+    assert [item[0] for item in events] == ["REPLACE", "CREATE"]
+    replaced, replacement = events[0][1], events[1][1]
+    assert replaced.signal_id == created.signal_id
+    assert replaced.status is SignalStatus.REPLACED
+    assert replaced.stage is LifecycleStage.FORCE_EXIT
     assert replacement.setup == SetupFamily.FAILED_BREAKOUT.value
     assert replacement.side is SignalSide.SELL
     assert replacement.status is SignalStatus.OPEN
     terminal_status, terminal_route, replacement_candidate = persister.terminal_records[0]
-    assert terminal_status is SignalStatus.INVALIDATED
-    assert terminal_route.source_event_type is AuctionEventType.BALANCE_ESCAPE_FAILED
-    assert replacement_candidate is None
-
-
-def test_opposite_trend_restoration_invalidates_reversal_without_replacement() -> None:
-    create_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
-        direction=DirectionalBias.DOWN,
-        close=98.0,
-        data={"origin_price": 100.0},
-        episode_id="EPISODE:DOWN:1",
+    assert terminal_status is SignalStatus.REPLACED
+    assert terminal_route is None
+    assert replacement_candidate.source_event_type is AuctionEventType.BALANCE_ESCAPE_FAILED
+    assert assembler.last_evaluation_diagnostics[0]["outcome"] == (
+        "CREATED_AFTER_REPLACEMENT"
     )
-    fetcher = _Fetcher()
-    persister = _Persister(fetcher)
-    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
-    created = assembler.assemble(create_snapshot)[0][1]
-
-    restored_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-        SetupFamily.CONTINUATION,
-        direction=DirectionalBias.UP,
-        close=101.0,
-        data={},
-        episode_id="EPISODE:UP:2",
-    )
-    events = assembler.assemble(restored_snapshot)
-
-    assert [item[0] for item in events] == ["CLOSE"]
-    invalidated = events[0][1]
-    assert invalidated.signal_id == created.signal_id
-    assert invalidated.status is SignalStatus.INVALIDATED
-    assert invalidated.stage is LifecycleStage.FORCE_EXIT
-    assert invalidated.status_reason == (
-        "DIRECTIONAL_TREND_RESTORED_INVALIDATED_OPPOSITE_ACTIVE_SIGNAL"
-    )
-    diagnostic = assembler.last_evaluation_diagnostics[0]
-    assert diagnostic["outcome"] == "SETUP_QUALITY_REJECTED"
-    assert diagnostic["blockers"] == ("AUTHORITATIVE_STOP_GEOMETRY_REQUIRED",)
 
 
-def test_same_direction_cross_episode_restoration_does_not_invalidate_reversal() -> None:
-    create_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
-        direction=DirectionalBias.UP,
-        close=102.0,
-        data={"origin_price": 100.0},
-        episode_id="EPISODE:UP:1",
-    )
-    fetcher = _Fetcher()
-    persister = _Persister(fetcher)
-    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
-    created = assembler.assemble(create_snapshot)[0][1]
-
-    restored_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-        SetupFamily.CONTINUATION,
-        direction=DirectionalBias.UP,
-        close=102.1,
-        data={},
-        episode_id="EPISODE:UP:2",
-    )
-    events = assembler.assemble(restored_snapshot)
-
-    assert [item[0] for item in events] == ["HOLD"]
-    held = events[0][1]
-    assert held.signal_id == created.signal_id
-    assert held.status is SignalStatus.OPEN
-    assert held.stage is not LifecycleStage.FORCE_EXIT
 
 
 def test_generate_events_preserves_replacement_and_creation_transitions() -> None:
     first_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.UP,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
         episode_id="EPISODE:UP:1",
     )
     fetcher = _Fetcher()
@@ -683,11 +618,11 @@ def test_generate_events_preserves_replacement_and_creation_transitions() -> Non
     generator.assemble(first_snapshot)
 
     replacement_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.DOWN,
         close=98.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
         episode_id="EPISODE:DOWN:2",
     )
     events = generator.assemble(replacement_snapshot)
@@ -700,7 +635,7 @@ def test_generate_events_preserves_replacement_and_creation_transitions() -> Non
     assert terminal_status is SignalStatus.REPLACED
     assert terminal_route is None
     assert replacement_candidate.source_event_type is (
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED
+        AuctionEventType.DIRECTIONAL_REVERSED
     )
 
 
@@ -752,36 +687,3 @@ def test_balance_completion_keeps_price_deferred_signal_open() -> None:
         AuctionEventType.BALANCE_COMPLETED
     ]
     assert persister.cutoff_closes == []
-
-
-def test_opposite_parent_trend_restoration_replaces_active_reversal_when_proved() -> None:
-    create_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
-        direction=DirectionalBias.UP,
-        close=102.0,
-        data={"origin_price": 100.0},
-        episode_id="EPISODE:REVERSAL:UP",
-    )
-    fetcher = _Fetcher()
-    persister = _Persister(fetcher)
-    assembler = SignalAssembler(fetcher=fetcher, persister=persister, advisor=_Advisor())
-    created = assembler.assemble(create_snapshot)[0][1]
-
-    restored_snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-        SetupFamily.CONTINUATION,
-        direction=DirectionalBias.DOWN,
-        close=101.0,
-        data={"origin_price": 101.0, "protection_level": 103.0},
-        episode_id="EPISODE:REVERSAL:UP",
-    )
-    events = assembler.assemble(restored_snapshot)
-
-    assert [item[0] for item in events] == ["CLOSE", "CREATE"]
-    invalidated, replacement = events[0][1], events[1][1]
-    assert invalidated.signal_id == created.signal_id
-    assert invalidated.status is SignalStatus.INVALIDATED
-    assert replacement.setup == SetupFamily.CONTINUATION.value
-    assert replacement.side is SignalSide.SELL
-    assert replacement.status is SignalStatus.OPEN

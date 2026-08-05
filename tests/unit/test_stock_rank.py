@@ -50,7 +50,7 @@ def _snapshot(
     )
     auction = _ns(
         status="OK" if range_active else "NOT_RUN",
-        lifecycle=_ns(balance=balance) if range_active else None,
+        balance=balance if range_active else None,
     )
     accepted_range = _ns(
         provisional=not range_active,

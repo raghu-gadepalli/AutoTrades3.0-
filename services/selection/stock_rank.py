@@ -281,8 +281,8 @@ def _range_context(
     rearm_required = False
     attempt_limit_reached = False
 
-    if snapshot.auction.status == "OK" and snapshot.auction.lifecycle is not None:
-        balance = snapshot.auction.lifecycle.balance
+    if snapshot.auction.status == "OK" and snapshot.auction.balance is not None:
+        balance = snapshot.auction.balance
         if balance.frozen_low is not None and balance.frozen_high is not None:
             low = float(balance.frozen_low)
             high = float(balance.frozen_high)

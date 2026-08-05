@@ -77,7 +77,7 @@ def test_intraday_cutoff_completes_only_active_opportunity(monkeypatch) -> None:
     assert len(updates) == 1
 
 
-def test_intraday_cutoff_preserves_prior_opportunity_completion_reason(monkeypatch) -> None:
+def test_intraday_cutoff_is_idempotent_for_already_completed_opportunity(monkeypatch) -> None:
     from datetime import date, datetime
     from types import SimpleNamespace
 
@@ -86,7 +86,7 @@ def test_intraday_cutoff_preserves_prior_opportunity_completion_reason(monkeypat
 
     existing = SimpleNamespace(
         lifecycle_state="COMPLETED",
-        lifecycle_reason="BALANCE_COMPLETED_OPPORTUNITY_WINDOW_COMPLETED",
+        lifecycle_reason="INTRADAY_SIGNAL_CUTOFF",
         trading_day=date(2026, 7, 29),
         latest_episode_id="EPISODE:1",
         current_setup_family="ACCEPTED_BREAKOUT",
@@ -109,4 +109,54 @@ def test_intraday_cutoff_preserves_prior_opportunity_completion_reason(monkeypat
         signal=SimpleNamespace(signal_id="SIG1", side=SignalSide.BUY),
     )
 
-    assert result.lifecycle_reason == "BALANCE_COMPLETED_OPPORTUNITY_WINDOW_COMPLETED"
+    assert result.lifecycle_reason == "INTRADAY_SIGNAL_CUTOFF"
+
+
+def test_window_close_keeps_progressed_opportunity_active_and_records_lineage(
+    monkeypatch,
+) -> None:
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from enums.auction_engine import AuctionEventType, SetupEventAction, SetupFamily
+    from enums.enums import SignalSide
+    from schemas.stock_opportunity import StockOpportunitySchema
+
+    existing = SimpleNamespace(
+        opportunity_key="OPP:ABB:SELL",
+        lifecycle_state="PROGRESSED",
+        transition_history=[],
+        authoritative_event_lineage=[],
+    )
+    monkeypatch.setattr(
+        StockOpportunitySchema,
+        "fetch_by_signal_id",
+        staticmethod(lambda signal_id: existing),
+    )
+    monkeypatch.setattr(
+        StockOpportunitySchema,
+        "update_opportunity",
+        staticmethod(lambda *, signal_id, update_data: update_data),
+    )
+
+    result = StockOpportunitySchema.record_opportunity_window_close(
+        snapshot=SimpleNamespace(snapshot_time=datetime(2026, 8, 3, 12, 54)),
+        signal=SimpleNamespace(signal_id="SIG:ABB:SELL", side=SignalSide.SELL),
+        route=SimpleNamespace(
+            source_event_id="EVT:ABB:BALANCE_COMPLETED",
+            source_event_type=AuctionEventType.BALANCE_COMPLETED,
+            source_episode_id="BAL:ABB:1",
+            setup_family=SetupFamily.ACCEPTED_BREAKOUT,
+            action=SetupEventAction.CLOSE,
+        ),
+    )
+
+    assert result["lifecycle_state"] == "PROGRESSED"
+    assert result["lifecycle_reason"] == (
+        "BALANCE_COMPLETED_OPPORTUNITY_WINDOW_CLOSED"
+    )
+    assert "completed_at" not in result
+    assert result["transition_history"][0]["state"] == "PROGRESSED"
+    assert result["authoritative_event_lineage"][0]["source_event_id"] == (
+        "EVT:ABB:BALANCE_COMPLETED"
+    )

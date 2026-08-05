@@ -33,7 +33,7 @@ class _StaticHistoryProvider:
 
 
 def _candidate(snapshot):
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    routes = AuthoritativeSetupEventRouter().route_authority(events=snapshot.auction.events, permissions=snapshot.auction.permissions)
     evaluations = EventDrivenSetupEngine().evaluate(snapshot, routes)
     approved = [item for item in evaluations if item.approved]
     assert len(approved) == 1
@@ -70,7 +70,7 @@ def _market_copy(snapshot, close: float, *, red: bool | None = None, vwap: float
 
 
 def _locked_balance_snapshot(snapshot, *, attempts: int = 1, failures: int = 0):
-    balance = snapshot.auction.lifecycle.balance.model_copy(
+    balance = snapshot.auction.balance.model_copy(
         update={
             "episode_id": "EPISODE:1",
             "previous_state": BalanceEpisodeState.LOCKED,
@@ -93,8 +93,7 @@ def _locked_balance_snapshot(snapshot, *, attempts: int = 1, failures: int = 0):
             "escape_direction": DirectionalBias.UP,
         }
     )
-    lifecycle = snapshot.auction.lifecycle.model_copy(update={"balance": balance})
-    auction = snapshot.auction.model_copy(update={"lifecycle": lifecycle})
+    auction = snapshot.auction.model_copy(update={"balance": balance})
     return snapshot.model_copy(update={"auction": auction})
 
 
@@ -181,15 +180,14 @@ def test_repeated_exhausted_same_episode_deployment_blocks() -> None:
 
 def test_delayed_entry_without_reset_is_watch() -> None:
     base = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.DOWN,
         close=100.0,
-        data={"origin_price": 102.0},
+        data={"start_price": 102.0},
     )
-    lifecycle = base.auction.lifecycle.model_copy(update={"events": ()})
     base = base.model_copy(
-        update={"auction": base.auction.model_copy(update={"lifecycle": lifecycle})}
+        update={"auction": base.auction.model_copy(update={"events": ()})}
     )
     rows = [
         _market_copy(base, 102.0, red=True),
@@ -212,15 +210,14 @@ def test_delayed_entry_without_reset_is_watch() -> None:
 
 def test_delayed_entry_pullback_resumption_is_fresh() -> None:
     base = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.DOWN,
         close=99.2,
-        data={"origin_price": 102.0},
+        data={"start_price": 102.0},
     )
-    lifecycle = base.auction.lifecycle.model_copy(update={"events": ()})
     base = base.model_copy(
-        update={"auction": base.auction.model_copy(update={"lifecycle": lifecycle})}
+        update={"auction": base.auction.model_copy(update={"events": ()})}
     )
     rows = [
         _market_copy(base, 101.0, red=True),

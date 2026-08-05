@@ -1,43 +1,32 @@
-"""Authoritative Auction orchestration.
-
-The active engine owns only objective evidence construction, objective
-observation classification, Persistent Episode lifecycle and structural
-permissions.  Legacy Auction state, boundary lifecycle, setup discovery,
-opportunity arbitration and local decision engines are not instantiated or
-consulted by this path.
-"""
+"""Auction orchestration used by snapshot generation."""
 from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
-import hashlib
-import json
-from typing import Any, Deque, Dict, Optional
+from typing import Deque, Dict, Optional, Sequence
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineConfig
-from enums.auction_engine import AuctionEventType, DirectionalBias
+from enums.auction_engine import DirectionalBias
 from schemas.snapshot import SnapshotSchema
-from services.auction_engine.contracts import BarEvidence, EvidenceSnapshot
-from services.auction_engine.episode_contracts import (
-    AuctionAuthorityResult,
-    AuctionEpisodeMemory,
-    AuctionEvidenceHistoryEntry,
-    AuctionEvidenceHistoryTrend,
-    AuctionLifecycleProjection,
-    AuctionObservation,
-    BalanceEpisodeMemory,
-    DirectionalEpisodeMemory,
-    DirectionalObservationMemory,
+from services.auction_engine.balance_state_machine import (
+    BalanceObservationBuilder,
+    BalanceStateMachine,
 )
-from services.auction_engine.episode_engine import (
-    PersistentEpisodeEngine,
-    _BalanceMemory,
-    _DirectionalMemory,
-    _SymbolMemory,
+from services.auction_engine.contracts import BarEvidence, EvidenceSnapshot
+from services.auction_engine.directional_evidence import DirectionalEvidenceBuilder
+from services.auction_engine.directional_state_machine import DirectionalStateMachine
+from services.auction_engine.episode_contracts import (
+    AuctionEvidenceHistoryTrend,
+    BalanceEpisodeMemory,
 )
 from services.auction_engine.evidence import EvidenceBuilder
-from services.auction_engine.observation_provider import AuctionObservationProvider
+from services.auction_engine.directional_contracts import (
+    AuctionAuthorityResult,
+    AuctionMemory,
+    DirectionalMemory,
+)
+from services.auction_engine.structural_permissions import StructuralPermissionMatrix
 
 
 @dataclass(frozen=True)
@@ -49,33 +38,32 @@ class _HistoryEvidence:
 
 
 class AuctionEngine:
-    """Advance one strict authoritative Auction snapshot at a time."""
+    """One current-evidence builder, one directional tracker and existing balance."""
 
     def __init__(self, config: AuctionEngineConfig = AUCTION_ENGINE_CONFIG) -> None:
         self.config = config
         self.evidence_builder = EvidenceBuilder(config)
-        self.observation_provider = AuctionObservationProvider(config)
-        self.episode_engine = PersistentEpisodeEngine(config)
+        self.directional_evidence_builder = DirectionalEvidenceBuilder(config)
+        self.directional_state_machine = DirectionalStateMachine(config)
+        self.balance_observation_builder = BalanceObservationBuilder(config)
+        self.balance_state_machine = BalanceStateMachine(config)
+        self.permission_matrix = StructuralPermissionMatrix(config)
         self._history: Dict[str, Deque[_HistoryEvidence]] = defaultdict(
             lambda: deque(maxlen=self.config.state.history_bars)
         )
+        self._memory: Dict[str, AuctionMemory] = {}
         self._last_results: Dict[str, AuctionAuthorityResult] = {}
-        self._last_input_hashes: Dict[str, str] = {}
 
     def reset(self, symbol: Optional[str] = None) -> None:
         if symbol is None:
             self._history.clear()
+            self._memory.clear()
             self._last_results.clear()
-            self._last_input_hashes.clear()
-            self.episode_engine.reset()
-            self.observation_provider.reset()
             return
         key = self._symbol_key(symbol)
         self._history.pop(key, None)
+        self._memory.pop(key, None)
         self._last_results.pop(key, None)
-        self._last_input_hashes.pop(key, None)
-        self.episode_engine.reset(key)
-        self.observation_provider.reset(key)
 
     def evaluate_snapshot(
         self,
@@ -84,307 +72,148 @@ class AuctionEngine:
         equity_ref: Optional[str] = None,
     ) -> AuctionAuthorityResult:
         if not isinstance(snapshot, SnapshotSchema):
-            raise TypeError("AuctionEngine.evaluate_snapshot requires SnapshotSchema")
+            raise TypeError("AuctionEngine requires SnapshotSchema")
         symbol = self._symbol_key(snapshot.symbol)
         snapshot_time = snapshot.snapshot_time
-        input_hash = self._snapshot_content_hash(snapshot)
-
-        prior = self._last_results[symbol] if symbol in self._last_results else None
-        if prior is not None and prior.snapshot_time == snapshot_time:
-            prior_hash = self._last_input_hashes[symbol]
-            if prior_hash == input_hash:
-                return prior
-            raise ValueError(
-                f"Conflicting duplicate authoritative snapshot for {symbol} @ {snapshot_time}"
-            )
-
-        controller_memory = (
-            self.episode_engine._memory[symbol]
-            if symbol in self.episode_engine._memory
-            else None
-        )
-        if controller_memory is not None:
-            if controller_memory.trading_day != snapshot_time.date():
-                self.reset(symbol)
-            elif (
-                controller_memory.last_snapshot_time is not None
-                and snapshot_time <= controller_memory.last_snapshot_time
-            ):
+        memory = self._memory.get(symbol)
+        if memory is None or memory.trading_day != snapshot_time.date():
+            memory = self.initial_memory(symbol, snapshot_time)
+        if memory.last_snapshot_time is not None:
+            if snapshot_time <= memory.last_snapshot_time:
                 raise ValueError(
-                    f"Authoritative snapshot time must advance for {symbol}: "
-                    f"{snapshot_time} <= {controller_memory.last_snapshot_time}"
+                    f"Auction snapshot time must advance for {symbol}: "
+                    f"{snapshot_time} <= {memory.last_snapshot_time}"
                 )
 
-        history = tuple(self._history[symbol])
-        evidence = self.evidence_builder.build(
+        objective = self.evidence_builder.build(
             snapshot,
-            history=history,
+            history=tuple(self._history[symbol]),
             equity_ref=equity_ref,
         )
-        observation = self.observation_provider.build(snapshot, evidence)
-        lifecycle = self.episode_engine.advance(observation)
-        observation, lifecycle = self._resolve_restoration_exhaustion(
-            symbol,
-            observation,
-            lifecycle,
+        fresh = self.directional_evidence_builder.build(snapshot, objective)
+        balance_observation = self.balance_observation_builder.build(snapshot, objective)
+        balance_memory, balance_projection, balance_events = self.balance_state_machine.advance(
+            previous_memory=memory.balance,
+            observation=balance_observation,
+        )
+        directional_memory, directional_projection, directional_events = (
+            self.directional_state_machine.advance(
+                symbol=symbol,
+                trading_day=snapshot_time.date(),
+                snapshot_time=snapshot_time,
+                close=float(objective.close),
+                high=float(objective.bar.high),
+                low=float(objective.bar.low),
+                evidence=fresh,
+                previous_memory=memory.directional,
+                balance_state=balance_projection.current_state,
+            )
+        )
+        events = tuple((*balance_events, *directional_events))
+        permissions = self.permission_matrix.evaluate(
+            balance_state=balance_projection.current_state,
+            events=events,
         )
         result = AuctionAuthorityResult(
             symbol=symbol,
             snapshot_time=snapshot_time,
-            evidence=evidence,
-            observation=observation,
-            lifecycle=lifecycle,
+            objective_evidence=objective,
+            fresh_direction=fresh,
+            directional=directional_projection,
+            balance=balance_projection,
+            events=events,
+            permissions=permissions,
+            diagnostics={
+                "fresh_direction": fresh.side.value,
+                "active_episode_id": directional_projection.active_episode_id,
+                "directional_transition": directional_projection.transition.value,
+                "balance_state": balance_projection.current_state.value,
+            },
         )
 
-        self._history[symbol].append(self._compact_history(evidence))
+        self._history[symbol].append(self._compact_history(objective))
+        self._memory[symbol] = AuctionMemory(
+            symbol=symbol,
+            trading_day=snapshot_time.date(),
+            last_snapshot_time=snapshot_time,
+            directional=directional_memory,
+            balance=balance_memory,
+        )
         self._last_results[symbol] = result
-        self._last_input_hashes[symbol] = input_hash
         return result
 
-    def _resolve_restoration_exhaustion(
-        self,
-        symbol: str,
-        observation: AuctionObservation,
-        lifecycle: AuctionLifecycleProjection,
-    ) -> tuple[AuctionObservation, AuctionLifecycleProjection]:
-        """Resolve stale parent-side exhaustion after proven trend restoration.
-
-        Ordinary continuation in an exhausted direction remains blocked.  This
-        resolution applies only when Persistent Episode Engine emits the
-        creation-capable parent-trend restoration event and the active
-        exhaustion side matches that restored direction.
-        """
-        restoration_events = tuple(
-            event
-            for event in lifecycle.events
-            if event.event_type is AuctionEventType.DIRECTIONAL_TREND_RESTORED
-        )
-        if not restoration_events:
-            return observation, lifecycle
-
-        resolved_event = next(
-            (
-                event
-                for event in restoration_events
-                if observation.exhaustion_active
-                and event.direction is observation.exhausted_side
-            ),
-            None,
-        )
-        if resolved_event is None:
-            diagnostics = dict(lifecycle.diagnostics)
-            diagnostics["exhaustion_resolution_applied"] = False
-            diagnostics["exhaustion_resolution_reason"] = (
-                "NO_MATCHING_ACTIVE_EXHAUSTION_FOR_TREND_RESTORATION"
-            )
-            return observation, AuctionLifecycleProjection.model_validate(
-                {
-                    **lifecycle.model_dump(mode="python"),
-                    "diagnostics": diagnostics,
-                }
-            )
-
-        resolved = self.observation_provider.resolve_exhaustion_after_trend_restoration(
-            symbol,
-            snapshot_time=observation.snapshot_time,
-            restored_side=resolved_event.direction,
-        )
-        if not resolved:
-            diagnostics = dict(lifecycle.diagnostics)
-            diagnostics["exhaustion_resolution_applied"] = False
-            diagnostics["exhaustion_resolution_reason"] = (
-                "OBSERVATION_MEMORY_DID_NOT_ACCEPT_RESTORATION_RESOLUTION"
-            )
-            return observation, AuctionLifecycleProjection.model_validate(
-                {
-                    **lifecycle.model_dump(mode="python"),
-                    "diagnostics": diagnostics,
-                }
-            )
-
-        observation_payload = observation.model_dump(mode="python")
-        observation_payload.update(
-            {
-                "exhaustion_active": False,
-                "exhausted_side": DirectionalBias.UNKNOWN,
-                "source_reason_codes": self._unique_reason_codes(
-                    (
-                        *observation.source_reason_codes,
-                        "EXHAUSTION_RESOLVED_BY_TREND_RESTORATION",
-                    )
-                ),
-            }
-        )
-        resolved_observation = AuctionObservation.model_validate(observation_payload)
-
-        diagnostics = dict(lifecycle.diagnostics)
-        diagnostics.update(
-            {
-                "observation_exhaustion_active": False,
-                "observation_exhausted_side": DirectionalBias.UNKNOWN.value,
-                "exhaustion_resolution_applied": True,
-                "exhaustion_resolution_event_id": resolved_event.event_id,
-                "exhaustion_resolution_reason": (
-                    "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
-                ),
-            }
-        )
-        resolved_lifecycle = AuctionLifecycleProjection.model_validate(
-            {
-                **lifecycle.model_dump(mode="python"),
-                "diagnostics": diagnostics,
-            }
-        )
-
-        # Keep incremental memory and duplicate-observation semantics aligned
-        # with the public post-restoration Auction result.
-        controller = self.episode_engine._memory.get(symbol)
-        if controller is not None:
-            controller.last_observation_hash = resolved_observation.stable_hash()
-            controller.last_evaluation = resolved_lifecycle
-        return resolved_observation, resolved_lifecycle
-
-    @staticmethod
-    def _unique_reason_codes(values: tuple[str, ...]) -> tuple[str, ...]:
-        seen = set()
-        result = []
-        for value in values:
-            text = str(value).strip().upper()
-            if text and text not in seen:
-                seen.add(text)
-                result.append(text)
-        return tuple(result)
-
-    def export_incremental_state(self, symbol: str) -> AuctionEpisodeMemory:
+    def export_incremental_state(self, symbol: str) -> AuctionMemory:
         key = self._symbol_key(symbol)
-        if key not in self.episode_engine._memory:
-            raise ValueError(f"No authoritative Auction memory exists for {key}")
-        controller = self.episode_engine._memory[key]
-        if controller.last_snapshot_time is None:
-            raise ValueError("Cannot export unevaluated authoritative Auction memory")
-        return AuctionEpisodeMemory(
-            symbol=key,
-            trading_day=controller.trading_day,
-            last_snapshot_time=controller.last_snapshot_time,
-            last_observation_hash=controller.last_observation_hash,
-            evidence_history=tuple(
-                AuctionEvidenceHistoryEntry(
-                    close=item.close,
-                    bar=item.bar,
-                    trend=item.trend,
-                    atr=item.atr,
-                )
-                for item in self._history[key]
-            ),
-            observation=self.observation_provider.export_memory(key),
-            directional=self._directional_memory_contract(controller.directional),
-            balance=self._balance_memory_contract(controller.balance),
-        )
+        memory = self._memory.get(key)
+        if memory is None or memory.last_snapshot_time is None:
+            raise ValueError(f"No evaluated Auction memory for {key}")
+        return memory
 
     def restore_incremental_state(
         self,
         symbol: str,
-        payload: AuctionEpisodeMemory | Dict[str, Any],
+        payload: AuctionMemory | dict,
+        *,
+        history_snapshots: Sequence[SnapshotSchema] = (),
     ) -> None:
         key = self._symbol_key(symbol)
         memory = (
             payload
-            if isinstance(payload, AuctionEpisodeMemory)
-            else AuctionEpisodeMemory.model_validate(payload)
+            if isinstance(payload, AuctionMemory)
+            else AuctionMemory.model_validate(payload)
         )
         if memory.symbol != key:
-            raise ValueError(
-                f"Authoritative Auction memory symbol mismatch: {memory.symbol} != {key}"
-            )
+            raise ValueError(f"Auction memory symbol mismatch: {memory.symbol} != {key}")
         if memory.last_snapshot_time is None:
             raise ValueError("Only evaluated Auction memory may be restored")
-
         self.reset(key)
-        self.observation_provider.restore_memory(key, memory.observation)
-        restored_history: Deque[_HistoryEvidence] = deque(
-            (
-                _HistoryEvidence(
-                    close=item.close,
-                    bar=item.bar,
-                    trend=item.trend,
-                    atr=item.atr,
-                )
-                for item in memory.evidence_history
-            ),
-            maxlen=self.config.state.history_bars,
-        )
-        self._history[key] = restored_history
-
-        directional_data = memory.directional.model_dump(mode="python")
-        directional_data["emitted_event_ids"] = set(
-            directional_data["emitted_event_ids"]
-        )
-        balance_data = memory.balance.model_dump(mode="python")
-        balance_data["source_range_ids"] = list(balance_data["source_range_ids"])
-        balance_data["emitted_event_ids"] = set(balance_data["emitted_event_ids"])
-        self.episode_engine._memory[key] = _SymbolMemory(
+        self._memory[key] = memory
+        self._history[key] = self._rebuild_history(
+            symbol=key,
             trading_day=memory.trading_day,
-            last_snapshot_time=memory.last_snapshot_time,
-            last_observation_hash=memory.last_observation_hash,
-            last_evaluation=None,
-            directional=_DirectionalMemory(**directional_data),
-            balance=_BalanceMemory(**balance_data),
+            through_time=memory.last_snapshot_time,
+            snapshots=history_snapshots,
         )
+
+    def _rebuild_history(
+        self,
+        *,
+        symbol: str,
+        trading_day: object,
+        through_time: datetime,
+        snapshots: Sequence[SnapshotSchema],
+    ) -> Deque[_HistoryEvidence]:
+        history: Deque[_HistoryEvidence] = deque(
+            maxlen=self.config.state.history_bars
+        )
+        ordered = sorted(snapshots, key=lambda item: item.snapshot_time)
+        seen = set()
+        for snapshot in ordered:
+            if snapshot.symbol.strip().upper() != symbol:
+                raise ValueError("Auction history snapshot symbol mismatch")
+            if snapshot.snapshot_time.date() != trading_day:
+                raise ValueError("Auction history snapshot trading day mismatch")
+            if snapshot.snapshot_time > through_time:
+                raise ValueError("Auction history cannot extend beyond restored memory")
+            if snapshot.snapshot_time in seen:
+                raise ValueError("Auction history snapshots must be unique")
+            seen.add(snapshot.snapshot_time)
+            objective = self.evidence_builder.build(
+                snapshot,
+                history=tuple(history),
+                equity_ref=symbol,
+            )
+            history.append(self._compact_history(objective))
+        return history
 
     @staticmethod
-    def initial_memory(symbol: str, snapshot_time: datetime) -> AuctionEpisodeMemory:
+    def initial_memory(symbol: str, snapshot_time: datetime) -> AuctionMemory:
         key = AuctionEngine._symbol_key(symbol)
-        return AuctionEpisodeMemory(
+        return AuctionMemory(
             symbol=key,
             trading_day=snapshot_time.date(),
             last_snapshot_time=None,
-            last_observation_hash="",
-            evidence_history=(),
-            observation=AuctionObservationProvider.initial_memory(),
-            directional=DirectionalEpisodeMemory(
-                sequence=0,
-                episode_id=None,
-                state="NONE",
-                direction="UNKNOWN",
-                origin_source="NONE",
-                parent_episode_id=None,
-                origin_event_id=None,
-                started_at=None,
-                state_started_at=None,
-                state_age_bars=0,
-                origin_price=None,
-                extreme_price=None,
-                extreme_time=None,
-                protection_level=None,
-                protection_source="",
-                protection_time=None,
-                start_candidate_side="UNKNOWN",
-                start_candidate_bars=0,
-                rejection_seen=False,
-                rejection_seen_at=None,
-                continuation_failure_seen=False,
-                continuation_failure_seen_at=None,
-                continuation_failure_progress_bars=0,
-                first_adverse_bar_time=None,
-                first_adverse_bar_level=None,
-                first_adverse_bar_close=None,
-                reversal_confirmation_level=None,
-                reversal_confirmation_source="",
-                reversal_confirmation_level_time=None,
-                reversal_confirmation_breach_closes=0,
-                reversal_watch_age_bars=0,
-                reversal_leg_progress_bars=0,
-                reversal_leg_failure_closes=0,
-                reversal_leg_progress_atr=0.0,
-                trend_restore_bars=0,
-                opposite_control_bars=0,
-                inactive_bars=0,
-                emitted_event_ids=(),
-                last_close=None,
-                last_observation_state="UNKNOWN",
-                last_observation_state_time=None,
-                last_reason_codes=(),
-            ),
+            directional=DirectionalMemory(),
             balance=BalanceEpisodeMemory(
                 sequence=0,
                 episode_id=None,
@@ -406,14 +235,14 @@ class AuctionEngine:
                 marginal_excursion_bars=0,
                 meaningful_escape_bars=0,
                 forming_invalid_bars=0,
-                escape_direction="UNKNOWN",
+                escape_direction=DirectionalBias.UNKNOWN,
                 outside_close_count=0,
                 reentry_close_count=0,
                 escape_attempt_count=0,
                 failed_escape_count=0,
                 up_escape_attempt_count=0,
                 down_escape_attempt_count=0,
-                last_escape_direction="UNKNOWN",
+                last_escape_direction=DirectionalBias.UNKNOWN,
                 last_escape_started_at=None,
                 last_escape_failed_at=None,
                 rearm_required=False,
@@ -440,41 +269,11 @@ class AuctionEngine:
         )
 
     @staticmethod
-    def _directional_memory_contract(
-        memory: _DirectionalMemory,
-    ) -> DirectionalEpisodeMemory:
-        payload = dict(memory.__dict__)
-        payload["emitted_event_ids"] = tuple(sorted(memory.emitted_event_ids))
-        return DirectionalEpisodeMemory.model_validate(payload)
-
-    @staticmethod
-    def _balance_memory_contract(memory: _BalanceMemory) -> BalanceEpisodeMemory:
-        payload = dict(memory.__dict__)
-        payload["source_range_ids"] = tuple(memory.source_range_ids)
-        payload["emitted_event_ids"] = tuple(sorted(memory.emitted_event_ids))
-        return BalanceEpisodeMemory.model_validate(payload)
-
-    @staticmethod
     def _symbol_key(symbol: str) -> str:
-        key = str(symbol).strip().upper()
+        key = str(symbol or "").strip().upper()
         if not key:
             raise ValueError("Auction symbol is required")
         return key
-
-    @staticmethod
-    def _snapshot_content_hash(snapshot: SnapshotSchema) -> str:
-        payload = snapshot.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude={"auction": True, "memory": {"auction": True}},
-        )
-        raw = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
 
 
 __all__ = ["AuctionEngine"]

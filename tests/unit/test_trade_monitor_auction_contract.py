@@ -28,13 +28,13 @@ TS = datetime(2026, 7, 20, 11, 48, tzinfo=timezone.utc)
 
 
 def _signal(*, state: str = "ORDERLY_DOWNTREND"):
-    del state  # posture comes from the authoritative directional lifecycle
+    del state  # posture comes from the authoritative directional projection
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         direction=DirectionalBias.DOWN,
         close=100.0,
-        data={"origin_price": 102.0},
+        data={"start_price": 102.0},
     )
     fetcher = _Fetcher()
     events = SignalAssembler(

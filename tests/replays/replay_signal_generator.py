@@ -7,9 +7,11 @@ SignalGenerator used by scripts/gen_signals.py, and writes compact reports.
 
 It writes signal and stock-opportunity rows to the database selected by the
 application configuration. Source defaults are visible below and may be
-overridden from the command line. CLEAR_DATA defaults to False; when enabled,
-it clears the complete signals and stock_opportunities output tables before the
-replay starts.
+overridden from the command line. Use --reset-symbol-day for a bounded replay;
+it deletes only the requested symbol/day signal and opportunity outputs. The
+runner consumes structural permissions persisted in each snapshot. It verifies
+those permissions against the authoritative events and balance state but never
+replaces or repairs the stored projection.
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ from schemas.signal import SignalSchema
 from schemas.stock_opportunity import StockOpportunitySchema
 from schemas.snapshot import SnapshotSchema
 from services.advisor_context.reporting import flatten_advisor_context_for_csv
+from services.auction_engine.structural_permissions import StructuralPermissionMatrix
 from services.signals.signal_generator import SignalGenerator
 from utils.json_utils import sanitize_json
 
@@ -51,6 +54,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRADING_DAY = "2026-07-27"
 DEFAULT_SYMBOLS = "LT,BHEL,INDIGO,MAXHEALTH,PERSISTENT,PNBHOUSING,TCS"
 DEFAULT_CLEAR_DATA = False
+DEFAULT_RESET_SYMBOL_DAY = False
 DEFAULT_REPORT_DIR = "reports"
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_LOG_FILE: Optional[str] = None
@@ -80,6 +84,15 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Clear complete signals and stock_opportunities tables before replay "
             f"(default: {DEFAULT_CLEAR_DATA})"
+        ),
+    )
+    parser.add_argument(
+        "--reset-symbol-day",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RESET_SYMBOL_DAY,
+        help=(
+            "Delete only matching symbol/day signals and stock opportunities before "
+            f"replay (default: {DEFAULT_RESET_SYMBOL_DAY})"
         ),
     )
     parser.add_argument(
@@ -130,6 +143,38 @@ def _clear_data() -> Dict[str, int]:
         )
         signals_deleted = int(
             db.query(SignalORM).delete(synchronize_session=False)
+        )
+        db.commit()
+    return {
+        "signals": signals_deleted,
+        "opportunities": opportunities_deleted,
+    }
+
+
+def _reset_symbol_day(
+    *,
+    trading_day: date,
+    symbols: List[str],
+    lifecycle: str,
+) -> Dict[str, int]:
+    """Delete only replay outputs for the requested symbol/day scope."""
+
+    day_start = datetime.combine(trading_day, time.min)
+    day_end = day_start + timedelta(days=1)
+    with get_trades_db() as db:
+        opportunities_deleted = int(
+            db.query(StockOpportunityORM)
+            .filter(StockOpportunityORM.symbol.in_(symbols))
+            .filter(StockOpportunityORM.trading_day == trading_day)
+            .delete(synchronize_session=False)
+        )
+        signals_deleted = int(
+            db.query(SignalORM)
+            .filter(SignalORM.symbol.in_(symbols))
+            .filter(SignalORM.lifecycle == lifecycle)
+            .filter(SignalORM.first_seen_time >= day_start)
+            .filter(SignalORM.first_seen_time < day_end)
+            .delete(synchronize_session=False)
         )
         db.commit()
     return {
@@ -451,6 +496,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     trading_day = date.fromisoformat(args.date)
     symbols = _symbols(args.symbols)
     lifecycle = SIGNAL_CONFIG.default_lifecycle.strip().upper()
+    if args.clear_data and args.reset_symbol_day:
+        raise ValueError("Choose either --clear-data or --reset-symbol-day, not both")
     report_dir = Path(args.report_dir)
     log_file = args.log_file or str(report_dir / "replay_signal_generator.log")
     setup_logging(log_file=log_file)
@@ -461,13 +508,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cleared = {"signals": 0, "opportunities": 0}
     if args.clear_data:
         cleared = _clear_data()
+    elif args.reset_symbol_day:
+        cleared = _reset_symbol_day(
+            trading_day=trading_day,
+            symbols=symbols,
+            lifecycle=lifecycle,
+        )
     logger.info(
         "Resolved replay configuration | database=%s date=%s symbols=%s "
-        "clear_data=%s batch_size=%s report_dir=%s",
+        "clear_data=%s reset_symbol_day=%s batch_size=%s report_dir=%s",
         database_name,
         trading_day,
         symbols,
         bool(args.clear_data),
+        bool(args.reset_symbol_day),
         max(1, int(args.batch_size)),
         report_dir,
     )
@@ -483,6 +537,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     event_rows: List[Dict[str, Any]] = []
     evaluation_rows: List[Dict[str, Any]] = []
+    failure_rows: List[Dict[str, Any]] = []
     action_counts: Counter[str] = Counter()
     evaluation_outcome_counts: Counter[str] = Counter()
     advisor_action_counts: Counter[str] = Counter()
@@ -502,6 +557,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     total_snapshots = len(snapshots)
     symbol_totals = Counter(snapshot.symbol for snapshot in snapshots)
     symbol_progress: Counter[str] = Counter()
+    permission_matrix = StructuralPermissionMatrix()
     for index, snapshot in enumerate(snapshots, start=1):
         symbol_progress[snapshot.symbol] += 1
         progress = (
@@ -512,8 +568,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(progress, flush=True)
         logger.info("signal_replay_progress %s", progress)
-        generator = SignalGenerator(snapshot)
-        generated_events = generator.generate_events()
+        signal_snapshot = snapshot
+        failure_stage = "SNAPSHOT_PERMISSION_VALIDATION"
+        try:
+            if snapshot.auction.balance is None:
+                raise ValueError(
+                    "Snapshot Auction balance projection missing"
+                )
+            permission_matrix.validate_persisted(
+                balance_state=snapshot.auction.balance.current_state,
+                events=snapshot.auction.events,
+                permissions=tuple(snapshot.auction.permissions),
+            )
+            failure_stage = "SIGNAL_GENERATOR"
+            generator = SignalGenerator(signal_snapshot)
+            generated_events = generator.generate_events()
+        except Exception as exc:
+            logger.exception(
+                "signal_replay_record_failed | symbol=%s snapshot_time=%s stage=%s",
+                signal_snapshot.symbol,
+                signal_snapshot.snapshot_time,
+                failure_stage,
+            )
+            action_counts["FAILED"] += 1
+            failure_rows.append(sanitize_json({
+                "index": index,
+                "symbol": signal_snapshot.symbol,
+                "snapshot_time": signal_snapshot.snapshot_time,
+                "stage": failure_stage,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }))
+            event_rows.append(sanitize_json({
+                "index": index,
+                "symbol": signal_snapshot.symbol,
+                "snapshot_time": signal_snapshot.snapshot_time,
+                "auction_action": ",".join(
+                    event.event_type.value for event in signal_snapshot.auction.events
+                ) or "NO_EVENT",
+                "signal_action": "FAILED",
+                "record_failure": True,
+                "failure_type": type(exc).__name__,
+                "failure_message": str(exc),
+            }))
+            continue
         generated_actions = [action for action, _signal in generated_events]
         if generated_actions:
             action_counts.update(generated_actions)
@@ -556,8 +654,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ] += 1
             evaluation_rows.append(sanitize_json({
                 "index": index,
-                "symbol": snapshot.symbol,
-                "snapshot_time": snapshot.snapshot_time,
+                "symbol": signal_snapshot.symbol,
+                "snapshot_time": signal_snapshot.snapshot_time,
                 "source_event_id": diagnostic["source_event_id"],
                 "source_event_type": diagnostic["source_event_type"],
                 "source_episode_id": diagnostic["source_episode_id"],
@@ -574,25 +672,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "outcome": diagnostic["outcome"],
                 **context_fields,
             }))
-        lifecycle_projection = snapshot.auction.lifecycle
-        if lifecycle_projection is None:
-            raise ValueError("Snapshot authoritative Auction lifecycle missing")
-        authoritative_event_ids = [event.event_id for event in lifecycle_projection.events]
+        directional_projection = signal_snapshot.auction.directional
+        balance_projection = signal_snapshot.auction.balance
+        if directional_projection is None or balance_projection is None:
+            raise ValueError("Snapshot Auction projection missing")
+        authoritative_event_ids = [event.event_id for event in signal_snapshot.auction.events]
         authoritative_event_types = [
-            event.event_type.value for event in lifecycle_projection.events
+            event.event_type.value for event in signal_snapshot.auction.events
         ]
         permission_results = [
             f"{permission.setup_family.value}:{permission.result.value}"
-            for permission in lifecycle_projection.permissions
+            for permission in signal_snapshot.auction.permissions
         ]
         latest_signal = _latest_signal_for_symbol(
             trading_day=trading_day,
-            symbol=snapshot.symbol,
+            symbol=signal_snapshot.symbol,
             lifecycle=lifecycle,
         )
         if latest_signal is not None and not _same_replay_snapshot_time(
             latest_signal.last_snapshot_time,
-            snapshot.snapshot_time,
+            signal_snapshot.snapshot_time,
         ):
             latest_signal = None
         signal_stage = latest_signal.stage.value if latest_signal is not None else None
@@ -658,14 +757,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ]
         event_rows.append(sanitize_json({
             "index": index,
-            "symbol": snapshot.symbol,
-            "snapshot_time": snapshot.snapshot_time,
+            "symbol": signal_snapshot.symbol,
+            "snapshot_time": signal_snapshot.snapshot_time,
             "auction_action": ",".join(authoritative_event_types) if authoritative_event_types else "NO_EVENT",
-            "auction_state": lifecycle_projection.directional.current_state.value,
-            "balance_state": lifecycle_projection.balance.current_state.value,
+            "auction_state": (
+                directional_projection.direction.value
+                if directional_projection.active_episode_id is not None
+                else "NONE"
+            ),
+            "balance_state": balance_projection.current_state.value,
             "authoritative_event_ids": json.dumps(authoritative_event_ids),
             "authoritative_event_types": json.dumps(authoritative_event_types),
             "permission_results": json.dumps(permission_results),
+            "permission_source": "SNAPSHOT_PERSISTED",
             "selected_opportunity_key": (
                 latest_signal.meta_json["auction_signal"]["opportunity_key"]
                 if latest_signal is not None else None
@@ -714,6 +818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_csv(prefix.with_name(prefix.name + "_evaluations.csv"), evaluation_rows)
     _write_csv(prefix.with_name(prefix.name + "_signals.csv"), signals)
     _write_csv(prefix.with_name(prefix.name + "_opportunities.csv"), opportunities)
+    _write_csv(prefix.with_name(prefix.name + "_failures.csv"), failure_rows)
 
     summary = sanitize_json({
         "trading_day": trading_day,
@@ -725,6 +830,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "first_snapshot_time": snapshots[0].snapshot_time,
         "last_snapshot_time": snapshots[-1].snapshot_time,
         "clear_data": bool(args.clear_data),
+        "reset_symbol_day": bool(args.reset_symbol_day),
         "cleared": cleared,
         "signal_action_counts": dict(sorted(action_counts.items())),
         "setup_evaluation_outcome_counts": dict(sorted(evaluation_outcome_counts.items())),
@@ -761,6 +867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "should_exit_signal_observations": should_exit_signal_count,
         "signals_persisted": len(signals),
         "opportunities_persisted": len(opportunities),
+        "record_failures": len(failure_rows),
         "opportunity_state_counts": dict(sorted(opportunity_state_counts.items())),
         "snapshots_marked_processed": 0,
     })

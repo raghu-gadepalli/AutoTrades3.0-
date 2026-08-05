@@ -196,14 +196,14 @@ class SignalPersister:
         )
         return persisted
 
-    def complete_opportunity(
+    def record_opportunity_window_close(
         self,
         *,
         signal: SignalSchema,
         snapshot: SnapshotSchema,
         route: Any,
     ) -> None:
-        StockOpportunitySchema.complete_opportunity(
+        StockOpportunitySchema.record_opportunity_window_close(
             snapshot=snapshot,
             signal=signal,
             route=route,
@@ -274,8 +274,14 @@ class SignalAssembler:
         self.last_evaluation_diagnostics = []
         if not isinstance(snapshot, SnapshotSchema):
             raise TypeError("SignalAssembler requires SnapshotSchema")
-        if snapshot.auction.status != "OK" or snapshot.auction.lifecycle is None:
-            raise ValueError("Signal generation requires authoritative Auction lifecycle")
+        if (
+            snapshot.auction.status != "OK"
+            or snapshot.auction.directional is None
+            or snapshot.auction.balance is None
+        ):
+            raise ValueError(
+                "Signal generation requires authoritative Auction projection"
+            )
 
         symbol = snapshot.symbol.strip().upper()
         symbol_row = self.fetcher.fetch_symbol(symbol)
@@ -327,47 +333,24 @@ class SignalAssembler:
             logger.info("SIG_SKIP | %s | SNAPSHOT_SIGNAL_GENERATION_DISABLED", symbol)
             return []
 
-        routes = self.router.route(snapshot.auction.lifecycle)
+        routes = self.router.route_authority(
+            events=snapshot.auction.events,
+            permissions=snapshot.auction.permissions,
+        )
         evaluations = self.setup_engine.evaluate(snapshot, routes)
         manager = self.setup_manager.select(snapshot, evaluations)
         self.last_evaluation_diagnostics = _evaluation_diagnostics(evaluations, manager)
         selected = manager.selected_candidate
         events: List[Tuple[str, SignalSchema]] = []
-
+        replaces_active = False
+        replaced_opportunity_key: Optional[str] = None
         terminal = self._terminal_action(active, routes)
-        if active is not None and terminal is not None:
-            status, reason, terminal_route = terminal
-            identity = _signal_identity(active)
-            stage = LifecycleStage.FORCE_EXIT
-            meta = _updated_meta(
-                signal=active,
-                snapshot=snapshot,
-                identity=identity,
-                stage=stage,
-                status=status,
-                signal_action="CLOSE",
-                reason=reason,
-                auction_action="EVENT_INVALIDATE" if status is SignalStatus.INVALIDATED else "EVENT_CLOSE",
-            )
-            analytics = _analytics(active, snapshot)
-            persisted = self.persister.close(
-                signal=active,
-                snapshot=snapshot,
-                status=status,
-                reason=reason,
-                meta_json=meta,
-                criteria_json=_criteria_json(snapshot, evaluations, manager),
-                analytics=analytics,
-                terminal_route=terminal_route,
-            )
-            events.append(("CLOSE", persisted))
-            active = None
 
-        if active is not None:
+        if active is not None and terminal is None:
             active_identity = _signal_identity(active)
             progression_pending = (
                 selected is not None
-                and _same_authoritative_lineage(active_identity, selected)
+                and _candidate_progresses_active_signal(active_identity, selected)
             )
             for route in routes:
                 if route.action is not SetupEventAction.CLOSE:
@@ -382,15 +365,14 @@ class SignalAssembler:
                 # A CLOSE route ends only the setup/opportunity creation window.
                 # The signal thesis remains independent and stays OPEN until an
                 # explicit INVALIDATE/REPLACE event or the intraday signal cutoff.
-                self.persister.complete_opportunity(
+                self.persister.record_opportunity_window_close(
                     signal=active,
                     snapshot=snapshot,
                     route=route,
                 )
 
         if selected is not None:
-            replaces_active = active is not None
-            if active is not None:
+            if active is not None and terminal is None:
                 active_identity = _signal_identity(active)
                 if active_identity.opportunity_key == selected.opportunity_key:
                     _mark_evaluation_outcome(
@@ -420,7 +402,7 @@ class SignalAssembler:
                     events.append(("UPDATE", persisted))
                     return events
 
-                if _same_authoritative_lineage(active_identity, selected):
+                if _candidate_progresses_active_signal(active_identity, selected):
                     if _candidate_event_consumed(active, selected):
                         _mark_evaluation_outcome(
                             self.last_evaluation_diagnostics,
@@ -429,10 +411,18 @@ class SignalAssembler:
                         )
                         selected = None
                     else:
+                        same_episode = _same_authoritative_lineage(
+                            active_identity,
+                            selected,
+                        )
                         _mark_evaluation_outcome(
                             self.last_evaluation_diagnostics,
                             selected.candidate_id,
-                            outcome="AUTHORITATIVE_PROGRESSION_UPDATE",
+                            outcome=(
+                                "AUTHORITATIVE_PROGRESSION_UPDATE"
+                                if same_episode
+                                else "SAME_SIDE_AUTHORITATIVE_PROGRESSION_UPDATE"
+                            ),
                         )
                         meta = _updated_meta(
                             signal=active,
@@ -536,8 +526,68 @@ class SignalAssembler:
                 )
                 selected = None
 
+        # Resolve explicit invalidation only after setup proof, Advisor deployment
+        # quality, and duplicate-event checks.  When the same snapshot contains
+        # an approved opposite-side candidate, the active opportunity is being
+        # superseded rather than merely invalidated.  Persist paired
+        # REPLACE -> CREATE lineage.  A blocked, deferred, rejected, or already
+        # consumed candidate still leaves the explicit invalidation in force.
+        if active is not None and terminal is not None:
+            terminal_status, terminal_reason, terminal_route = terminal
+            active_identity = _signal_identity(active)
+            approved_opposite_replacement = bool(
+                selected is not None
+                and _candidate_direction_opposes_signal(selected, active_identity)
+            )
+
+            if approved_opposite_replacement:
+                status = SignalStatus.REPLACED
+                reason = "REPLACED_BY_NEW_AUTHORITATIVE_OPPORTUNITY"
+                signal_action = "REPLACE"
+                auction_action = "EVENT_REPLACE"
+                replacement_candidate = selected
+                persisted_terminal_route = None
+                event_action = "REPLACE"
+                replaces_active = True
+                replaced_opportunity_key = active_identity.opportunity_key
+            else:
+                status = terminal_status
+                reason = terminal_reason
+                signal_action = "CLOSE"
+                auction_action = (
+                    "EVENT_INVALIDATE"
+                    if status is SignalStatus.INVALIDATED
+                    else "EVENT_CLOSE"
+                )
+                replacement_candidate = None
+                persisted_terminal_route = terminal_route
+                event_action = "CLOSE"
+
+            meta = _updated_meta(
+                signal=active,
+                snapshot=snapshot,
+                identity=active_identity,
+                stage=LifecycleStage.FORCE_EXIT,
+                status=status,
+                signal_action=signal_action,
+                reason=reason,
+                auction_action=auction_action,
+            )
+            persisted = self.persister.close(
+                signal=active,
+                snapshot=snapshot,
+                status=status,
+                reason=reason,
+                meta_json=meta,
+                criteria_json=_criteria_json(snapshot, evaluations, manager),
+                analytics=_analytics(active, snapshot),
+                terminal_route=persisted_terminal_route,
+                replacement_candidate=replacement_candidate,
+            )
+            events.append((event_action, persisted))
+            active = None
+
         if selected is not None:
-            replaced_opportunity_key: Optional[str] = None
             if active is not None:
                 active_identity = _signal_identity(active)
                 close_meta = _updated_meta(
@@ -562,6 +612,7 @@ class SignalAssembler:
                 )
                 events.append(("REPLACE", replaced))
                 replaced_opportunity_key = active_identity.opportunity_key
+                replaces_active = True
                 active = None
 
             _mark_evaluation_outcome(
@@ -672,6 +723,17 @@ class SignalGenerator:
 
     def generate(self) -> Optional[str]:
         return self.generate_signal()
+
+
+def _candidate_direction_opposes_signal(
+    candidate: AuthoritativeSetupCandidate,
+    identity: AuctionSignalIdentity,
+) -> bool:
+    if candidate.side is TradeSide.BUY:
+        return identity.side == SignalSide.SELL.value
+    if candidate.side is TradeSide.SELL:
+        return identity.side == SignalSide.BUY.value
+    return False
 
 
 def _route_direction_opposes_signal(
@@ -951,11 +1013,7 @@ def _downstream_meta(
     management_action = "EXIT" if terminal else ("STRENGTHEN" if stage in {LifecycleStage.ACTIVE, LifecycleStage.EXPAND} else "CAUTION")
     trade_action = "FORCE_EXIT" if terminal else ("CREATE_TRADE" if signal_action == "CREATE" else "HOLD_POSITION")
     signal_state = "TERMINAL" if terminal else "OPEN"
-    auction_state = (
-        snapshot.auction.lifecycle.directional.current_state.value
-        if snapshot.auction.lifecycle is not None
-        else "UNKNOWN"
-    )
+    auction_state = _auction_direction_state(snapshot)
     directional_alignment = _directional_alignment(snapshot, side)
     signal_block = {
         "contract_version": _DOWNSTREAM_CONTRACT_VERSION,
@@ -1043,6 +1101,20 @@ def _downstream_meta(
     })
 
 
+def _candidate_progresses_active_signal(
+    identity: AuctionSignalIdentity,
+    candidate: AuthoritativeSetupCandidate,
+) -> bool:
+    """Keep one active signal for consecutive authoritative events on one side.
+
+    Opposite-side events still invalidate or replace through the normal lifecycle.
+    A same-side event is additional structural interpretation of the active thesis,
+    even when the event comes from a different Auction episode owner (for example,
+    a balance escape followed by a directional reversal confirmation).
+    """
+    return identity.side == candidate.side.value
+
+
 def _same_authoritative_lineage(
     identity: AuctionSignalIdentity,
     candidate: AuthoritativeSetupCandidate,
@@ -1104,29 +1176,28 @@ def _operational_posture(
     snapshot: SnapshotSchema,
     identity: AuctionSignalIdentity,
 ) -> Tuple[LifecycleStage, str]:
-    lifecycle = snapshot.auction.lifecycle
-    if lifecycle is None:
-        raise ValueError("Operational posture requires Auction lifecycle")
+    directional = snapshot.auction.directional
+    evidence = snapshot.auction.evidence
+    if directional is None or evidence is None:
+        raise ValueError("Operational posture requires Auction direction")
     side_direction = "UP" if identity.side == "BUY" else "DOWN"
-    current_direction = lifecycle.directional.direction.value
-    state = lifecycle.directional.current_state.value
-    if current_direction == side_direction and state == "MATURE":
-        return LifecycleStage.EXPAND, "AUTHORITATIVE_DIRECTIONAL_MATURE"
-    if current_direction == side_direction and state in {"DIRECTIONAL", "REVERSAL_LEG"}:
+    current_direction = directional.direction.value
+    fresh_direction = evidence.side.value
+    if current_direction == side_direction and fresh_direction == side_direction:
         return LifecycleStage.ACTIVE, "AUTHORITATIVE_DIRECTIONAL_ALIGNED"
-    if state == "REVERSAL_WATCH":
-        return LifecycleStage.PROTECT, "AUTHORITATIVE_REVERSAL_WATCH"
     if current_direction not in {"UNKNOWN", side_direction}:
         return LifecycleStage.WEAKENING, "AUTHORITATIVE_DIRECTION_OPPOSED"
+    if fresh_direction in {"UP", "DOWN"} and fresh_direction != side_direction:
+        return LifecycleStage.WEAKENING, "FRESH_DIRECTION_OPPOSED"
     return LifecycleStage.TRANSITION, "NO_CURRENT_CREATION_EVENT"
 
 
 def _directional_alignment(snapshot: SnapshotSchema, side: str) -> str:
-    lifecycle = snapshot.auction.lifecycle
-    if lifecycle is None:
+    directional = snapshot.auction.directional
+    if directional is None:
         return "UNKNOWN"
     expected = "UP" if side == "BUY" else "DOWN"
-    actual = lifecycle.directional.direction.value
+    actual = directional.direction.value
     if actual == expected:
         return "ALIGNED"
     if actual in {"UP", "DOWN"}:
@@ -1137,10 +1208,17 @@ def _directional_alignment(snapshot: SnapshotSchema, side: str) -> str:
 def _criteria_json(snapshot: SnapshotSchema, evaluations: Sequence[Any], manager: Any) -> Dict[str, Any]:
     return sanitize_json({
         "snapshot_time": snapshot.snapshot_time,
-        "authoritative_event_ids": [event.event_id for event in snapshot.auction.lifecycle.events],
+        "authoritative_event_ids": [event.event_id for event in snapshot.auction.events],
         "setup_evaluations": [item.model_dump(mode="python") for item in evaluations],
         "setup_manager": manager.model_dump(mode="python"),
     })
+
+
+def _auction_direction_state(snapshot: SnapshotSchema) -> str:
+    directional = snapshot.auction.directional
+    if directional is None or directional.active_episode_id is None:
+        return "NONE"
+    return directional.direction.value
 
 
 def _snapshot_json(snapshot: SnapshotSchema) -> Dict[str, Any]:

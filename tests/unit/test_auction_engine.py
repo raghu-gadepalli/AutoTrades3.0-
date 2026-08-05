@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta
 import unittest
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -10,11 +11,6 @@ from configs.auction_engine_config import AUCTION_ENGINE_CONFIG, AuctionEngineCo
 from enums.auction_engine import AuctionEventType, DirectionalBias
 from schemas.snapshot import SnapshotSchema
 from services.auction_engine.engine import AuctionEngine
-from services.auction_engine.episode_contracts import (
-    AuctionEvent,
-    AuctionLifecycleProjection,
-    AuctionObservation,
-)
 from services.auction_engine.snapshot_adapter import (
     empty_auction_block,
     enrich_snapshot_with_auction,
@@ -67,7 +63,6 @@ def _snapshot(ts: datetime, *, close: float, direction: str = "UP") -> SnapshotS
         )
     }
     payload = {
-        "version": "SNAPSHOT_AUCTION_AUTHORITY_V3A",
         "symbol": "TEST",
         "snapshot_time": ts,
         "tf": "3m",
@@ -248,64 +243,88 @@ class AuctionAuthoritySnapshotTests(unittest.TestCase):
             for index, close in enumerate(closes)
         ]
 
+class AuctionEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ts = datetime(2026, 7, 27, 9, 15)
+
+    def _rows(self) -> list[SnapshotSchema]:
+        closes = (100.0, 100.2, 100.4, 100.1, 99.8, 99.6, 99.4, 99.7)
+        return [
+            _snapshot(
+                self.ts + timedelta(minutes=index * 3),
+                close=close,
+                direction="UP" if index < 4 else "DOWN",
+            )
+            for index, close in enumerate(closes)
+        ]
+
     @staticmethod
     def _signature(result) -> tuple:
         return (
-            result.lifecycle.directional.model_dump(mode="json"),
-            result.lifecycle.balance.model_dump(mode="json"),
-            tuple(item.model_dump(mode="json") for item in result.lifecycle.events),
-            tuple(item.model_dump(mode="json") for item in result.lifecycle.permissions),
+            result.fresh_direction.model_dump(mode="json"),
+            result.directional.model_dump(mode="json"),
+            result.balance.model_dump(mode="json"),
+            tuple(item.model_dump(mode="json") for item in result.events),
+            tuple(item.model_dump(mode="json") for item in result.permissions),
         )
 
     def test_incremental_memory_matches_continuous_engine(self) -> None:
         config = _config()
+        rows = self._rows()
         continuous = AuctionEngine(config)
         carried = None
-        for row in self._rows():
+        history: list[SnapshotSchema] = []
+        for row in rows:
             expected = continuous.evaluate_snapshot(row)
             incremental = AuctionEngine(config)
             if carried is not None:
-                incremental.restore_incremental_state("TEST", carried)
+                incremental.restore_incremental_state(
+                    "TEST",
+                    carried,
+                    history_snapshots=history,
+                )
             actual = incremental.evaluate_snapshot(row)
             self.assertEqual(self._signature(expected), self._signature(actual))
             carried = incremental.export_incremental_state("TEST")
+            history.append(row)
 
-    def test_snapshot_adapter_continuity_and_no_legacy_projection(self) -> None:
+    def test_snapshot_adapter_persists_only_current_projection(self) -> None:
         previous = None
-        for row in self._rows():
-            current = _finalize(row, previous)
-            public = current.auction.model_dump(mode="python")
-            self.assertEqual(
-                set(public),
-                {
-                    "status",
-                    "continuity_mode",
-                    "previous_snapshot_time",
-                    "engine",
-                    "observation",
-                    "lifecycle",
-                },
-            )
-            if previous is None:
-                self.assertEqual(current.auction.continuity_mode, "COLD_START")
-                self.assertIsNone(current.auction.previous_snapshot_time)
-            else:
-                self.assertEqual(
-                    current.auction.previous_snapshot_time,
-                    previous.snapshot_time,
-                )
-            legacy_keys = {
-                "state",
-                "stock_context",
-                "boundary",
-                "candidates",
-                "opportunities",
-                "decision",
-                "changes",
-                "error",
-            }
-            self.assertFalse(legacy_keys.intersection(public))
-            previous = current
+        expected_fields = {
+            "status",
+            "continuity_mode",
+            "previous_snapshot_time",
+            "evidence",
+            "directional",
+            "balance",
+            "events",
+            "permissions",
+            "diagnostics",
+        }
+        with patch.object(
+            SnapshotSchema,
+            "fetch_recent_today_for_symbol_before_time",
+            return_value=[],
+        ):
+            for row in self._rows():
+                current = _finalize(row, previous)
+                public = current.auction.model_dump(mode="python")
+                self.assertEqual(set(public), expected_fields)
+                if previous is None:
+                    self.assertEqual(current.auction.continuity_mode, "COLD_START")
+                    self.assertIsNone(current.auction.previous_snapshot_time)
+                else:
+                    self.assertEqual(
+                        current.auction.continuity_mode,
+                        "INCREMENTAL_PREVIOUS_SNAPSHOT",
+                    )
+                    self.assertEqual(
+                        current.auction.previous_snapshot_time,
+                        previous.snapshot_time,
+                    )
+                for removed in ("engine", "observation", "lifecycle", "state", "decision"):
+                    self.assertNotIn(removed, public)
+                previous = current
 
     def test_restore_rejects_wrong_symbol(self) -> None:
         engine = AuctionEngine(_config())
@@ -316,28 +335,7 @@ class AuctionAuthoritySnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symbol mismatch"):
             AuctionEngine(_config()).restore_incremental_state("TEST", corrupt)
 
-    def test_removed_memory_hash_fields_are_rejected(self) -> None:
-        final = _finalize(self._rows()[0])
-        payload = final.model_dump(mode="python")
-        payload["auction"]["memory_hash"] = "0" * 64
-        payload["auction"]["previous_memory_hash"] = "1" * 64
-        with self.assertRaisesRegex(ValidationError, "extra_forbidden"):
-            SnapshotSchema.model_validate(payload)
-
-    def test_legacy_config_metadata_never_gates_snapshot_validation(self) -> None:
-        final = _finalize(self._rows()[0])
-        payload = final.model_dump(mode="python")
-        payload["auction"]["engine"]["config_version"] = "OLD_VERSION"
-        payload["auction"]["engine"]["config_hash"] = "old-hash"
-        payload["auction"]["lifecycle"]["config_version"] = "NEW_VERSION"
-        payload["auction"]["lifecycle"]["config_hash"] = "different-hash"
-
-        restored = SnapshotSchema.model_validate(payload)
-
-        self.assertEqual(restored.auction.engine.config_version, "OLD_VERSION")
-        self.assertEqual(restored.auction.lifecycle.config_version, "NEW_VERSION")
-
-    def test_persisted_json_roundtrip_preserves_episode_memory(self) -> None:
+    def test_persisted_json_roundtrip_preserves_auction_memory_and_projection(self) -> None:
         import json
 
         final = _finalize(self._rows()[0])
@@ -345,136 +343,14 @@ class AuctionAuthoritySnapshotTests(unittest.TestCase):
         restored = SnapshotSchema.from_db_dict(persisted)
         self.assertEqual(restored.memory.auction, final.memory.auction)
         self.assertEqual(
-            restored.auction.lifecycle.model_dump(mode="json"),
-            final.auction.lifecycle.model_dump(mode="json"),
+            restored.auction.model_dump(mode="json"),
+            final.auction.model_dump(mode="json"),
         )
 
-    def test_non_finite_auction_memory_is_rejected_before_persistence(self) -> None:
+    def test_removed_legacy_projection_fields_are_rejected(self) -> None:
         final = _finalize(self._rows()[0])
         payload = final.model_dump(mode="python")
-        payload["memory"]["auction"]["evidence_history"][0]["trend"][
-            "hma_spread_atr"
-        ] = float("nan")
-        with self.assertRaisesRegex(ValidationError, "finite_number"):
+        payload["auction"]["lifecycle"] = {}
+        with self.assertRaisesRegex(ValidationError, "extra_forbidden"):
             SnapshotSchema.model_validate(payload)
 
-    def test_observation_contract_has_no_legacy_authority_fields(self) -> None:
-        final = _finalize(self._rows()[0])
-        observation = final.auction.observation
-        self.assertIsNotNone(observation)
-        fields = set(type(observation).model_fields)
-        self.assertNotIn("established_trend_side", fields)
-        self.assertNotIn("failure_watch_active", fields)
-
-    def test_trend_restoration_resolves_matching_active_exhaustion(self) -> None:
-        final = _finalize(self._rows()[0])
-        observation_payload = final.auction.observation.model_dump(mode="python")
-        observation_payload.update(
-            {
-                "exhaustion_active": True,
-                "exhausted_side": DirectionalBias.UP,
-            }
-        )
-        observation = AuctionObservation.model_validate(observation_payload)
-
-        lifecycle_payload = final.auction.lifecycle.model_dump(mode="python")
-        event = AuctionEvent(
-            event_id="DIR:TEST:RESTORED:UP",
-            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-            episode_id="DIR:TEST:REVERSAL",
-            symbol="TEST",
-            trading_day=final.snapshot_time.date(),
-            event_time=final.snapshot_time,
-            direction=DirectionalBias.UP,
-            reason_codes=("TEST_RESTORATION",),
-            data={
-                "exhaustion_was_active": True,
-                "exhausted_side_before_restoration": "UP",
-                "exhaustion_resolution": (
-                    "PARENT_TREND_RESTORED_AFTER_ESTABLISHED_REVERSAL"
-                ),
-            },
-        )
-        lifecycle_payload["events"] = [event.model_dump(mode="python")]
-        lifecycle_payload["permissions"] = []
-        lifecycle = AuctionLifecycleProjection.model_validate(lifecycle_payload)
-
-        engine = AuctionEngine(_config())
-        memory = engine.observation_provider._new_memory()
-        memory.trading_day = final.snapshot_time.date()
-        memory.last_snapshot_time = final.snapshot_time
-        memory.exhaustion_active = True
-        memory.exhaustion_side = DirectionalBias.UP
-        engine.observation_provider._memory["TEST"] = memory
-
-        resolved_observation, resolved_lifecycle = (
-            engine._resolve_restoration_exhaustion(
-                "TEST",
-                observation,
-                lifecycle,
-            )
-        )
-
-        self.assertFalse(resolved_observation.exhaustion_active)
-        self.assertIs(resolved_observation.exhausted_side, DirectionalBias.UNKNOWN)
-        self.assertIn(
-            "EXHAUSTION_RESOLVED_BY_TREND_RESTORATION",
-            resolved_observation.source_reason_codes,
-        )
-        self.assertTrue(
-            resolved_lifecycle.diagnostics["exhaustion_resolution_applied"]
-        )
-        exported = engine.observation_provider.export_memory("TEST")
-        self.assertFalse(exported.exhaustion_active)
-
-    def test_trend_restoration_does_not_clear_opposite_exhaustion(self) -> None:
-        final = _finalize(self._rows()[0])
-        observation_payload = final.auction.observation.model_dump(mode="python")
-        observation_payload.update(
-            {
-                "exhaustion_active": True,
-                "exhausted_side": DirectionalBias.DOWN,
-            }
-        )
-        observation = AuctionObservation.model_validate(observation_payload)
-
-        lifecycle_payload = final.auction.lifecycle.model_dump(mode="python")
-        event = AuctionEvent(
-            event_id="DIR:TEST:RESTORED:UP",
-            event_type=AuctionEventType.DIRECTIONAL_TREND_RESTORED,
-            episode_id="DIR:TEST:REVERSAL",
-            symbol="TEST",
-            trading_day=final.snapshot_time.date(),
-            event_time=final.snapshot_time,
-            direction=DirectionalBias.UP,
-            reason_codes=("TEST_RESTORATION",),
-        )
-        lifecycle_payload["events"] = [event.model_dump(mode="python")]
-        lifecycle_payload["permissions"] = []
-        lifecycle = AuctionLifecycleProjection.model_validate(lifecycle_payload)
-
-        engine = AuctionEngine(_config())
-        memory = engine.observation_provider._new_memory()
-        memory.trading_day = final.snapshot_time.date()
-        memory.last_snapshot_time = final.snapshot_time
-        memory.exhaustion_active = True
-        memory.exhaustion_side = DirectionalBias.DOWN
-        engine.observation_provider._memory["TEST"] = memory
-
-        unresolved_observation, unresolved_lifecycle = (
-            engine._resolve_restoration_exhaustion(
-                "TEST",
-                observation,
-                lifecycle,
-            )
-        )
-
-        self.assertTrue(unresolved_observation.exhaustion_active)
-        self.assertIs(unresolved_observation.exhausted_side, DirectionalBias.DOWN)
-        self.assertFalse(
-            unresolved_lifecycle.diagnostics["exhaustion_resolution_applied"]
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()

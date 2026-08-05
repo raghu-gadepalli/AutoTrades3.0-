@@ -483,11 +483,11 @@
 
   function renderContextRows(row) {
     const snap = row?.snapshot || {};
-    const directional = getPath(snap, "auction.lifecycle.directional", {}) || {};
-    const balance = getPath(snap, "auction.lifecycle.balance", {}) || {};
+    const directional = getPath(snap, "auction.directional", {}) || {};
+    const balance = getPath(snap, "auction.balance", {}) || {};
     const rows = [
       ["Auction Action", safeStr(row?.auction_action)],
-      ["Directional Episode", `${safeStr(row?.auction_state || directional.current_state || "—")} / ${safeStr(directional.direction || "UNKNOWN")}`],
+      ["Directional Episode", `${safeStr(row?.auction_state || directional.direction || "—")} / ${safeStr(directional.transition || "NONE")}`],
       ["Balance Episode", `${safeStr(balance.current_state || "NONE")} / ${safeStr(balance.episode_id || "—")}`],
       ["Opportunity", safeStr(row?.opportunity_key)],
       ["Candidate", safeStr(row?.candidate_id)],

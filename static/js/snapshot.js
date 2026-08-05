@@ -161,12 +161,11 @@
     const raw = structureRaw(data);
     const candidate = get(data, "structure.candidate", {}) || {};
     const auction = get(data, "auction", {}) || {};
-    const observation = auction.observation || {};
-    const lifecycle = auction.lifecycle || {};
-    const directional = lifecycle.directional || {};
-    const balance = lifecycle.balance || {};
-    const auctionEvents = Array.isArray(lifecycle.events) ? lifecycle.events : [];
-    const permissions = Array.isArray(lifecycle.permissions) ? lifecycle.permissions : [];
+    const evidence = auction.evidence || {};
+    const directional = auction.directional || {};
+    const balance = auction.balance || {};
+    const auctionEvents = Array.isArray(auction.events) ? auction.events : [];
+    const permissions = Array.isArray(auction.permissions) ? auction.permissions : [];
 
     const rangeText = (range) => {
       const r = range || {};
@@ -186,8 +185,8 @@
       ["ATR", `${num(get(data, "indicators.atr.value"))} · ${text(get(data, "indicators.atr.band"))}`],
       ["BB Zone", `${text(get(data, "indicators.bollinger.zone"))} · Pos ${num(get(data, "indicators.bollinger.position"), 3)}`],
 
-      ["Auction Observation", `${text(observation.observation_state, "UNKNOWN")} · bias ${text(observation.directional_bias, "UNKNOWN")}`],
-      ["Directional Episode", `${text(directional.current_state, "NONE")} · ${text(directional.direction, "UNKNOWN")} · ${text(directional.episode_id, "—")}`],
+      ["Fresh Direction", `${text(evidence.side, "UNAVAILABLE")} · candidate ${text(evidence.candidate_side, "UNKNOWN")}`],
+      ["Directional Episode", `${text(directional.direction, "UNKNOWN")} · ${text(directional.transition, "NONE")} · ${text(directional.active_episode_id, "—")}`],
       ["Balance Episode", `${text(balance.current_state, "NONE")} · ${num(balance.frozen_low)} - ${num(balance.frozen_high)} · ${text(balance.episode_id, "—")}`],
       ["Authoritative Events", auctionEvents.length ? auctionEvents.map(event => text(event.event_type)).join(", ") : "—"],
       ["Setup Permissions", permissions.length ? permissions.map(item => `${text(item.setup_family)}:${text(item.result)}`).join(", ") : "—"],

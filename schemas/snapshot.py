@@ -15,10 +15,9 @@ from sqlalchemy.exc import IntegrityError
 from database.database import get_trades_db
 from models.trade_models import Snapshot as SnapshotORM
 from utils.json_utils import sanitize_json
-from services.auction_engine.episode_contracts import (
-    AuctionEpisodeMemory,
-    AuctionLifecycleProjection,
-    AuctionObservation,
+from services.auction_engine.directional_contracts import (
+    AuctionMemory,
+    AuctionSnapshotProjection,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,8 +370,8 @@ class StructureMemoryBlock(StrictBaseModel):
     state: Dict[str, StateMemoryEntry]
 
 
-class AuctionMemoryBlock(AuctionEpisodeMemory):
-    """Authoritative snapshot-carried Auction Episode continuity."""
+class AuctionMemoryBlock(AuctionMemory):
+    """Snapshot-carried continuity for the Auction core."""
 
 
 
@@ -384,61 +383,16 @@ class SnapshotMemoryBlock(StrictBaseModel):
 # -----------------------------
 # Compact Auction public projection
 # -----------------------------
-class AuctionEngineIdentityProjection(StrictBaseModel):
-    name: str
-    version: str
-    # Legacy metadata accepted for old snapshots only; never used as a gate.
-    config_version: Optional[str] = None
-    config_hash: Optional[str] = None
+class AuctionSnapshotBlock(AuctionSnapshotProjection):
+    """Public Auction projection stored in each snapshot."""
 
 
-class AuctionSnapshotBlock(StrictBaseModel):
-    status: str
-    continuity_mode: str
-    previous_snapshot_time: Optional[datetime]
-    engine: Optional[AuctionEngineIdentityProjection]
-    observation: Optional[AuctionObservation]
-    lifecycle: Optional[AuctionLifecycleProjection]
-
-    @model_validator(mode="after")
-    def validate_status(self) -> "AuctionSnapshotBlock":
-        if self.status == "NOT_RUN":
-            if any(
-                value is not None
-                for value in (
-                    self.engine,
-                    self.observation,
-                    self.lifecycle,
-                )
-            ):
-                raise ValueError("NOT_RUN Auction block cannot contain evaluation output")
-            return self
-        if self.status != "OK":
-            raise ValueError("Auction status must be NOT_RUN or OK")
-        if self.engine is None or self.observation is None or self.lifecycle is None:
-            raise ValueError("Authoritative Auction output is required when status=OK")
-        if self.observation.symbol != self.lifecycle.symbol:
-            raise ValueError("Auction observation/lifecycle symbol mismatch")
-        if self.observation.snapshot_time != self.lifecycle.snapshot_time:
-            raise ValueError("Auction observation/lifecycle time mismatch")
-        if self.engine.name != self.lifecycle.engine_name:
-            raise ValueError("Auction engine name mismatch")
-        if self.continuity_mode == "COLD_START":
-            if self.previous_snapshot_time is not None:
-                raise ValueError("COLD_START cannot reference a previous Auction snapshot")
-        elif self.continuity_mode == "INCREMENTAL_PREVIOUS_SNAPSHOT":
-            if self.previous_snapshot_time is None:
-                raise ValueError("Incremental Auction continuity requires previous_snapshot_time")
-        else:
-            raise ValueError("Unsupported Auction continuity_mode")
-        return self
 
 
 # -----------------------------
 # Snapshot schema
 # -----------------------------
 class SnapshotSchema(StrictBaseModel):
-    version: str
     symbol: str
     snapshot_time: datetime
     tf: str
@@ -461,7 +415,7 @@ class SnapshotSchema(StrictBaseModel):
     auction: AuctionSnapshotBlock
     memory: SnapshotMemoryBlock
 
-    @field_validator("version", "symbol", "tf")
+    @field_validator("symbol", "tf")
     @classmethod
     def require_nonempty_text(cls, value: str) -> str:
         text = str(value).strip()
@@ -485,12 +439,10 @@ class SnapshotSchema(StrictBaseModel):
                 raise ValueError("memory.auction.trading_day must match snapshot_time")
             if self.memory.auction.last_snapshot_time != self.snapshot_time:
                 raise ValueError("memory.auction.last_snapshot_time must equal snapshot_time")
-            if self.auction.observation is None or self.auction.lifecycle is None:
-                raise ValueError("Validated Auction snapshot requires observation/lifecycle")
-            if self.auction.observation.symbol != self.symbol.strip().upper():
-                raise ValueError("auction.observation.symbol must equal snapshot symbol")
-            if self.auction.lifecycle.snapshot_time != self.snapshot_time:
-                raise ValueError("auction.lifecycle.snapshot_time must equal snapshot_time")
+            if self.auction.evidence is None or self.auction.directional is None:
+                raise ValueError("Validated Auction snapshot requires evidence/directional output")
+            if self.auction.evidence.observed_at != self.snapshot_time:
+                raise ValueError("auction.evidence.observed_at must equal snapshot_time")
         if self.ltp is not None and (not math.isfinite(float(self.ltp)) or self.ltp <= 0):
             raise ValueError("snapshot.ltp must be positive when present")
         return self

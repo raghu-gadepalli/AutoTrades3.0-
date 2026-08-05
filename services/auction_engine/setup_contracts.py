@@ -54,10 +54,6 @@ class AuthoritativeSetupCandidate(SetupContractModel):
     target_basis: str = Field(min_length=1)
     reference_price: float = Field(gt=0.0)
     reference_source: str = Field(min_length=1)
-    risk_points: float = Field(gt=0.0)
-    expected_move_points: float = Field(gt=0.0)
-    expected_move_pct: float = Field(gt=0.0)
-    reward_risk: float = Field(gt=0.0)
     valid_until: Optional[datetime]
     reason_codes: Tuple[str, ...] = ()
 

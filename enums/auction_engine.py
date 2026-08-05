@@ -37,6 +37,22 @@ class BoundarySide(StringEnum):
     NONE = "NONE"
 
 
+class FreshDirection(StringEnum):
+    UP = "UP"
+    DOWN = "DOWN"
+    UNRESOLVED = "UNRESOLVED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class DirectionalTransition(StringEnum):
+    NONE = "NONE"
+    STARTED = "STARTED"
+    CONTINUED = "CONTINUED"
+    REVERSED = "REVERSED"
+    ENDED = "ENDED"
+    DEFERRED = "DEFERRED"
+
+
 class DirectionalBias(StringEnum):
     UP = "UP"
     DOWN = "DOWN"
@@ -64,8 +80,8 @@ class EvidencePolarity(StringEnum):
 class AuctionStateName(StringEnum):
     """Current-snapshot Auction observation classification.
 
-    These values describe current evidence only. Persistent directional and
-    balance lifecycle is owned by the Persistent Episode Engine.
+    These values describe current evidence only. Directional and balance
+    continuity is published separately by the current Auction engine.
     """
 
     UNKNOWN = "UNKNOWN"
@@ -111,21 +127,6 @@ class ContextAlignment(StringEnum):
     UNKNOWN = "UNKNOWN"
 
 
-class DirectionalEpisodeState(StringEnum):
-    NONE = "NONE"
-    DIRECTIONAL = "DIRECTIONAL"
-    MATURE = "MATURE"
-    REVERSAL_WATCH = "REVERSAL_WATCH"
-    REVERSAL_LEG = "REVERSAL_LEG"
-    COMPLETED = "COMPLETED"
-
-
-class DirectionalEpisodeOrigin(StringEnum):
-    NONE = "NONE"
-    OBSERVATION_CONFIRMATION = "OBSERVATION_CONFIRMATION"
-    REVERSAL_EVENT_HANDOFF = "REVERSAL_EVENT_HANDOFF"
-
-
 class BalanceEpisodeState(StringEnum):
     NONE = "NONE"
     FORMING = "FORMING"
@@ -139,16 +140,8 @@ class BalanceEpisodeState(StringEnum):
 
 class AuctionEventType(StringEnum):
     DIRECTIONAL_STARTED = "DIRECTIONAL_STARTED"
-    DIRECTIONAL_MATURED = "DIRECTIONAL_MATURED"
-    REVERSAL_WATCH_STARTED = "REVERSAL_WATCH_STARTED"
-    DIRECTIONAL_REVERSAL_CONFIRMED = "DIRECTIONAL_REVERSAL_CONFIRMED"
-    DIRECTIONAL_REVERSAL_LEG_STARTED = "DIRECTIONAL_REVERSAL_LEG_STARTED"
-    DIRECTIONAL_REVERSAL_LEG_ESTABLISHED = "DIRECTIONAL_REVERSAL_LEG_ESTABLISHED"
-    DIRECTIONAL_REVERSAL_LEG_FAILED = "DIRECTIONAL_REVERSAL_LEG_FAILED"
-    DIRECTIONAL_TREND_RESTORED = "DIRECTIONAL_TREND_RESTORED"
-    DIRECTIONAL_CONTINUATION_CONFIRMED = "DIRECTIONAL_CONTINUATION_CONFIRMED"
-    DIRECTIONAL_REACCELERATION_CONFIRMED = "DIRECTIONAL_REACCELERATION_CONFIRMED"
-    DIRECTIONAL_COMPLETED = "DIRECTIONAL_COMPLETED"
+    DIRECTIONAL_REVERSED = "DIRECTIONAL_REVERSED"
+    DIRECTIONAL_ENDED = "DIRECTIONAL_ENDED"
     BALANCE_FORMING_STARTED = "BALANCE_FORMING_STARTED"
     BALANCE_PROBABLE = "BALANCE_PROBABLE"
     BALANCE_LOCKED = "BALANCE_LOCKED"
@@ -173,36 +166,12 @@ class SetupEventAction(StringEnum):
     CLOSE = "CLOSE"
 
 
-class DirectionObservationSource(StringEnum):
-    OBSERVATION_STATE = "OBSERVATION_STATE"
-    DIRECTIONAL_BIAS = "DIRECTIONAL_BIAS"
-    TREND_DIRECTION = "TREND_DIRECTION"
-
-
-class DirectionalEfficiencySource(StringEnum):
-    NONE = "NONE"
-    PRICE_ACTION = "PRICE_ACTION"
-    TREND = "TREND"
-
-
-class MaturityObservationSource(StringEnum):
-    CURRENT_LEG = "CURRENT_LEG"
-    EXTENSION = "EXTENSION"
-    OBSERVATION_STATE = "OBSERVATION_STATE"
-
-
-class ReversalWatchSource(StringEnum):
-    EXHAUSTION = "EXHAUSTION"
-    REJECTION = "REJECTION"
-    FAILED_EXTREME = "FAILED_EXTREME"
-    STRUCTURAL_FAILURE = "STRUCTURAL_FAILURE"
-    OBSERVATION_STATE = "OBSERVATION_STATE"
-
-
 __all__ = [
     "StringEnum",
     "TradeSide",
     "BoundarySide",
+    "FreshDirection",
+    "DirectionalTransition",
     "DirectionalBias",
     "QualityStatus",
     "EvidencePolarity",
@@ -210,14 +179,8 @@ __all__ = [
     "AdvisorAction",
     "SetupFamily",
     "ContextAlignment",
-    "DirectionalEpisodeState",
-    "DirectionalEpisodeOrigin",
     "BalanceEpisodeState",
     "AuctionEventType",
     "StructuralPermissionResult",
     "SetupEventAction",
-    "DirectionObservationSource",
-    "DirectionalEfficiencySource",
-    "MaturityObservationSource",
-    "ReversalWatchSource",
 ]

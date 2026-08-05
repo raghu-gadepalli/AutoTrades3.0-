@@ -1413,20 +1413,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     trade.exit_status.value for trade in current_trades
                 )
 
-                lifecycle_projection = snapshot.auction.lifecycle
-                if lifecycle_projection is None:
+                auction_projection = snapshot.auction
+                if (
+                    auction_projection.status != "OK"
+                    or auction_projection.directional is None
+                    or auction_projection.balance is None
+                ):
                     raise ValueError(
-                        "snapshot authoritative Auction lifecycle is required"
+                        "snapshot authoritative Auction projection is required"
                     )
                 snapshot_event_types = [
-                    event.event_type.value for event in lifecycle_projection.events
+                    event.event_type.value for event in auction_projection.events
                 ]
                 snapshot_event_ids = [
-                    event.event_id for event in lifecycle_projection.events
+                    event.event_id for event in auction_projection.events
                 ]
                 snapshot_permissions = [
                     f"{permission.setup_family.value}:{permission.result.value}"
-                    for permission in lifecycle_projection.permissions
+                    for permission in auction_projection.permissions
                 ]
 
                 timeline_rows.append(
@@ -1439,10 +1443,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             if snapshot_event_types else "NO_EVENT"
                         ),
                         "snapshot_auction_state": (
-                            lifecycle_projection.directional.current_state.value
+                            auction_projection.directional.direction.value
                         ),
                         "snapshot_balance_state": (
-                            lifecycle_projection.balance.current_state.value
+                            auction_projection.balance.current_state.value
                         ),
                         "snapshot_authoritative_event_ids": json.dumps(
                             snapshot_event_ids

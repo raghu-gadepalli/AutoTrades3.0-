@@ -1424,7 +1424,6 @@ class SnapshotGenerator:
         }
 
         pre_auction_payload = {
-            "version": "SNAPSHOT_AUCTION_AUTHORITY_V3A",
             "symbol": self.symbol,
             "snapshot_time": snap_time,
             "tf": "3m",

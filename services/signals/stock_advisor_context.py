@@ -366,12 +366,13 @@ def summarise_episode_history(
     opposite = [row for row in same_episode if str(row.side).upper() != side.value]
 
     facts: List[str] = []
-    lifecycle = snapshot.auction.lifecycle
-    observation = snapshot.auction.observation
-    if lifecycle is None or observation is None:
-        raise ValueError("Advisor episode history requires Auction lifecycle and observation")
+    balance = snapshot.auction.balance
+    directional = snapshot.auction.directional
+    if balance is None or directional is None:
+        raise ValueError(
+            "Advisor episode history requires Auction projections"
+        )
 
-    balance = lifecycle.balance
     if balance.episode_id == source_episode_id:
         if balance.escape_attempt_count >= policy.balance_min_escape_attempts:
             facts.append("MULTIPLE_BALANCE_ESCAPE_ATTEMPTS")
@@ -381,22 +382,6 @@ def summarise_episode_history(
             facts.append("BALANCE_REARM_REQUIRED")
         if balance.attempt_limit_reached:
             facts.append("BALANCE_ATTEMPT_LIMIT_REACHED")
-
-    directional = lifecycle.directional
-    if directional.episode_id == source_episode_id:
-        side_direction = DirectionalBias.UP if side is TradeSide.BUY else DirectionalBias.DOWN
-        if (
-            policy.directional_maturity_counts_as_exhausted
-            and directional.direction is side_direction
-            and (observation.current_leg_mature or observation.extension_mature)
-        ):
-            facts.append("DIRECTIONAL_LEG_MATURE")
-        if (
-            policy.directional_exhaustion_counts_as_exhausted
-            and observation.exhaustion_active
-            and observation.exhausted_side is side_direction
-        ):
-            facts.append("DIRECTIONAL_EXHAUSTION_ACTIVE")
 
     prior_count_for_rule = len(same_side) if policy.require_same_side else len(same_episode)
     exhausted = bool(
@@ -420,13 +405,10 @@ def _matching_fresh_events(
     side: TradeSide,
     accepted: Iterable[str],
 ) -> Tuple[str, ...]:
-    lifecycle = snapshot.auction.lifecycle
-    if lifecycle is None:
-        raise ValueError("Deferred freshness requires Auction lifecycle")
     accepted_set = {str(item).strip().upper() for item in accepted}
     direction = DirectionalBias.UP if side is TradeSide.BUY else DirectionalBias.DOWN
     found = []
-    for event in lifecycle.events:
+    for event in snapshot.auction.events:
         if event.event_type.value in accepted_set and event.direction is direction:
             found.append(event.event_type.value)
     return tuple(found)

@@ -1,9 +1,9 @@
 """Common authoritative Auction-event routing for every setup family.
 
 This module does not create setup candidates.  It converts the ordered events
-and structural permissions already published by the Auction lifecycle into a
-strict setup-consumption contract for later setup evaluators.  No evaluator is
-allowed to infer a lifecycle transition that is absent from this router.
+and structural permissions already published by Auction into a strict setup-
+consumption contract for later setup evaluators.  No evaluator is allowed to
+infer a structural event that is absent from this router.
 
 ``CLOSE`` ends the creation/update window of a structural setup opportunity.
 It is not an instruction to force-exit an already deployed signal or trade.
@@ -22,7 +22,6 @@ from enums.auction_engine import (
 )
 from services.auction_engine.episode_contracts import (
     AuctionEvent,
-    AuctionLifecycleProjection,
     AuthoritativeSetupEventRoute,
     StructuralSetupPermission,
 )
@@ -35,29 +34,16 @@ class _RoutePolicy:
 
 
 _EVENT_ROUTE_POLICY: Dict[AuctionEventType, Tuple[_RoutePolicy, ...]] = {
-    AuctionEventType.DIRECTIONAL_REVERSAL_CONFIRMED: (
-        _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.WATCH),
-    ),
-    AuctionEventType.DIRECTIONAL_REVERSAL_LEG_STARTED: (
-        _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.WATCH),
-    ),
-    AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED: (
+    AuctionEventType.DIRECTIONAL_REVERSED: (
         _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.EVALUATE),
-    ),
-    AuctionEventType.DIRECTIONAL_REVERSAL_LEG_FAILED: (
         _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.INVALIDATE),
+        _RoutePolicy(SetupFamily.CONTINUATION, SetupEventAction.INVALIDATE),
+        _RoutePolicy(SetupFamily.REACCELERATION, SetupEventAction.INVALIDATE),
+        _RoutePolicy(SetupFamily.BREAKOUT_INITIATION, SetupEventAction.INVALIDATE),
+        _RoutePolicy(SetupFamily.ACCEPTED_BREAKOUT, SetupEventAction.INVALIDATE),
+        _RoutePolicy(SetupFamily.FAILED_BREAKOUT, SetupEventAction.INVALIDATE),
     ),
-    AuctionEventType.DIRECTIONAL_TREND_RESTORED: (
-        _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.INVALIDATE),
-        _RoutePolicy(SetupFamily.CONTINUATION, SetupEventAction.EVALUATE),
-    ),
-    AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED: (
-        _RoutePolicy(SetupFamily.CONTINUATION, SetupEventAction.EVALUATE),
-    ),
-    AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED: (
-        _RoutePolicy(SetupFamily.REACCELERATION, SetupEventAction.EVALUATE),
-    ),
-    AuctionEventType.DIRECTIONAL_COMPLETED: (
+    AuctionEventType.DIRECTIONAL_ENDED: (
         _RoutePolicy(SetupFamily.REVERSAL, SetupEventAction.CLOSE),
         _RoutePolicy(SetupFamily.CONTINUATION, SetupEventAction.CLOSE),
         _RoutePolicy(SetupFamily.REACCELERATION, SetupEventAction.CLOSE),
@@ -83,23 +69,22 @@ _EVENT_ROUTE_POLICY: Dict[AuctionEventType, Tuple[_RoutePolicy, ...]] = {
 
 
 class AuthoritativeSetupEventRouter:
-    """Route lifecycle events without setup discovery or compatibility logic."""
+    """Route authoritative Auction events without setup discovery or compatibility logic."""
 
-    def route(
+    def route_authority(
         self,
-        lifecycle: AuctionLifecycleProjection,
+        *,
+        events: Tuple[AuctionEvent, ...],
+        permissions: Tuple[StructuralSetupPermission, ...],
     ) -> Tuple[AuthoritativeSetupEventRoute, ...]:
-        if not isinstance(lifecycle, AuctionLifecycleProjection):
-            raise TypeError(
-                "AuthoritativeSetupEventRouter.route requires "
-                "AuctionLifecycleProjection"
-            )
+        """Route an explicit event/permission projection without structural inference."""
+
         permission_by_family = {
             permission.setup_family: permission
-            for permission in lifecycle.permissions
+            for permission in permissions
         }
         routes: List[AuthoritativeSetupEventRoute] = []
-        for event in lifecycle.events:
+        for event in events:
             routes.extend(
                 self._route_event(
                     event,

@@ -1,6 +1,6 @@
 """Strict causal deployment Advisor for Auction candidates and deferred entries.
 
-The Advisor never discovers a setup, changes Auction lifecycle, closes a signal,
+The Advisor never discovers a setup, changes Auction structure or episode state, closes a signal,
 or manages a trade.  It answers only whether deployment quality is ALLOW,
 WATCH, or BLOCK at the current completed snapshot.  Required context failures
 raise; there is no fail-open path.
@@ -36,10 +36,6 @@ from services.signals.stock_advisor_history import (
     StockAdvisorHistoryProviderProtocol,
 )
 
-
-_TREND_RESTORATION_RANGE_EXCEPTION = (
-    "TREND_RESTORATION_FAILED_PULLBACK_RANGE_EXCEPTION"
-)
 
 
 _SOURCE_RANGE_EVENT_TYPES = {
@@ -93,12 +89,10 @@ class StockAdvisor:
                 advisor_context=advisor_context,
             )
 
-        observation = snapshot.auction.observation
-        lifecycle = snapshot.auction.lifecycle
-        assert observation is not None and lifecycle is not None
+        balance = snapshot.auction.balance
+        assert balance is not None
         family = candidate.setup_family.value
         subtype = candidate.setup_subtype.upper()
-        side_direction = "UP" if candidate.side is TradeSide.BUY else "DOWN"
         matches: List[Tuple[str, str]] = []
         applied_exceptions: List[str] = []
         range_context = self._resolve_range_context(snapshot, candidate)
@@ -118,16 +112,6 @@ class StockAdvisor:
         )
         day_snapshots = [*prior_snapshots, snapshot]
 
-        if (
-            observation.exhaustion_active
-            and observation.exhausted_side.value == side_direction
-            and family in self._normalised(self.policy.same_direction_exhaustion_families)
-        ):
-            matches.append((
-                self.policy.same_direction_exhaustion_action,
-                "SAME_DIRECTION_EXHAUSTION",
-            ))
-
         inside_exempt = bool(
             family in self._normalised(self.policy.inside_range_exempt_families)
             or subtype in self._normalised(self.policy.inside_range_exempt_subtypes)
@@ -138,8 +122,6 @@ class StockAdvisor:
                     self.policy.inside_accepted_range_action,
                     "INSIDE_ACCEPTED_RANGE",
                 ))
-            elif subtype == "TREND_RESTORATION":
-                applied_exceptions.append(_TREND_RESTORATION_RANGE_EXCEPTION)
 
         if family in self._normalised(
             self.policy.accepted_breakout_current_context_families
@@ -166,7 +148,7 @@ class StockAdvisor:
         ):
             churn_matched, churn_facts = is_mature_narrow_range_churn(
                 day_path,
-                failed_escape_count=lifecycle.balance.failed_escape_count,
+                failed_escape_count=balance.failed_escape_count,
                 policy=churn_policy,
             )
             if churn_matched:
@@ -254,8 +236,14 @@ class StockAdvisor:
         signal_symbol = str(signal.symbol or signal.equity_ref or "").strip().upper()
         if signal_symbol != symbol:
             raise ValueError("Deferred StockAdvisor signal/snapshot symbol mismatch")
-        if snapshot.auction.status != "OK" or snapshot.auction.lifecycle is None:
-            raise ValueError("Deferred StockAdvisor requires authoritative Auction lifecycle")
+        if (
+            snapshot.auction.status != "OK"
+            or snapshot.auction.directional is None
+            or snapshot.auction.balance is None
+        ):
+            raise ValueError(
+                "Deferred StockAdvisor requires authoritative Auction projection"
+            )
         if signal.first_seen_time is None:
             raise ValueError("Deferred StockAdvisor requires signal.first_seen_time")
         side = TradeSide(str(getattr(signal.side, "value", signal.side)).upper())
@@ -333,10 +321,12 @@ class StockAdvisor:
             raise TypeError("StockAdvisor requires AuthoritativeSetupCandidate")
         if (
             snapshot.auction.status != "OK"
-            or snapshot.auction.observation is None
-            or snapshot.auction.lifecycle is None
+            or snapshot.auction.directional is None
+            or snapshot.auction.balance is None
         ):
-            raise ValueError("StockAdvisor requires authoritative Auction observation")
+            raise ValueError(
+                "StockAdvisor requires authoritative Auction projection"
+            )
         symbol = snapshot.symbol.strip().upper()
         if candidate.symbol != symbol:
             raise ValueError("StockAdvisor candidate/snapshot symbol mismatch")
@@ -351,17 +341,16 @@ class StockAdvisor:
         range_context: _AdvisorRangeContext,
         candidate: AuthoritativeSetupCandidate,
     ) -> AdvisorDayPathSummary:
-        lifecycle = snapshot.auction.lifecycle
-        observation = snapshot.auction.observation
-        assert lifecycle is not None and observation is not None
-        if lifecycle.balance.episode_id == candidate.source_episode_id:
-            started_at = lifecycle.balance.started_at
-            containment = lifecycle.balance.containment_ratio
+        balance = snapshot.auction.balance
+        assert balance is not None
+        if balance.episode_id == candidate.source_episode_id:
+            started_at = balance.started_at
+            containment = balance.containment_ratio
         else:
-            started_at = observation.accepted_range_established_at
+            started_at = snapshot.structure.accepted.promoted_time
             containment = (
-                lifecycle.balance.containment_ratio
-                if lifecycle.balance.episode_id is not None
+                balance.containment_ratio
+                if balance.episode_id is not None
                 else None
             )
         return summarise_day_path(
@@ -379,7 +368,7 @@ class StockAdvisor:
     ) -> _AdvisorRangeContext:
         if candidate.source_event_type in _SOURCE_RANGE_EVENT_TYPES:
             return self._source_episode_range_context(snapshot, candidate)
-        return self._current_observation_range_context(snapshot, candidate)
+        return self._current_accepted_range_context(snapshot, candidate)
 
     @staticmethod
     def _source_episode_range_context(
@@ -398,12 +387,9 @@ class StockAdvisor:
                 "StockAdvisor balance-event candidate requires frozen boundary reference"
             )
 
-        lifecycle = snapshot.auction.lifecycle
-        if lifecycle is None:
-            raise ValueError("StockAdvisor source-range resolution requires Auction lifecycle")
         matching_events = [
             event
-            for event in lifecycle.events
+            for event in snapshot.auction.events
             if event.event_id == candidate.source_event_id
         ]
         if len(matching_events) != 1:
@@ -447,20 +433,30 @@ class StockAdvisor:
         )
 
     @staticmethod
-    def _current_observation_range_context(
+    def _current_accepted_range_context(
         snapshot: SnapshotSchema,
         candidate: AuthoritativeSetupCandidate,
     ) -> _AdvisorRangeContext:
-        observation = snapshot.auction.observation
-        assert observation is not None
+        accepted = snapshot.structure.accepted
+        accepted_range = accepted.range
         range_valid = bool(
-            observation.accepted_range_low is not None
-            and observation.accepted_range_high is not None
-            and observation.accepted_range_breakout_eligible
-            and not observation.accepted_range_provisional
+            accepted_range is not None
+            and accepted_range.low is not None
+            and accepted_range.high is not None
+            and accepted_range.breakout_eligible
+            and not accepted_range.provisional
+            and accepted.frozen
         )
-        low = float(observation.accepted_range_low) if range_valid else None
-        high = float(observation.accepted_range_high) if range_valid else None
+        low = (
+            float(accepted_range.low)
+            if range_valid and accepted_range is not None
+            else None
+        )
+        high = (
+            float(accepted_range.high)
+            if range_valid and accepted_range is not None
+            else None
+        )
         if range_valid:
             assert low is not None and high is not None
             if (
@@ -470,7 +466,7 @@ class StockAdvisor:
                 or high <= low
             ):
                 raise ValueError(
-                    "StockAdvisor observation has invalid accepted range geometry"
+                    "StockAdvisor accepted structure has invalid range geometry"
                 )
             reference = high if candidate.side is TradeSide.BUY else low
             current_price = float(snapshot.close)
@@ -483,11 +479,16 @@ class StockAdvisor:
             reference = None
             outside = False
         return _AdvisorRangeContext(
-            authority="CURRENT_AUCTION_OBSERVATION",
+            authority="CURRENT_ACCEPTED_STRUCTURE",
             low=low,
             high=high,
             reference_price=reference,
-            inside_for_rule=bool(observation.accepted_range_inside),
+            inside_for_rule=bool(
+                range_valid
+                and low is not None
+                and high is not None
+                and low <= float(snapshot.close) <= high
+            ),
             outside_for_side=outside,
             source_event_id=None,
             source_episode_id=None,
@@ -505,7 +506,8 @@ class StockAdvisor:
         context_diagnostics: Dict[str, Any],
         advisor_context: StockAdvisorContextAssessment,
     ) -> AdvisorDecision:
-        observation = snapshot.auction.observation
+        accepted = snapshot.structure.accepted
+        accepted_range = accepted.range
         diagnostics: Dict[str, Any] = {
             "deployment_scope": "NEW_SIGNAL_ONLY",
             "candidate_family": candidate.setup_family.value,
@@ -530,14 +532,19 @@ class StockAdvisor:
                 "outside_for_side": range_context.outside_for_side,
                 "source_event_id": range_context.source_event_id,
                 "source_episode_id": range_context.source_episode_id,
-                "observation_accepted_range_inside": (
-                    observation.accepted_range_inside if observation is not None else None
+                "accepted_structure_inside": bool(
+                    accepted_range is not None
+                    and accepted_range.low is not None
+                    and accepted_range.high is not None
+                    and float(accepted_range.low)
+                    <= float(snapshot.close)
+                    <= float(accepted_range.high)
                 ),
-                "observation_accepted_range_low": (
-                    observation.accepted_range_low if observation is not None else None
+                "accepted_structure_low": (
+                    accepted_range.low if accepted_range is not None else None
                 ),
-                "observation_accepted_range_high": (
-                    observation.accepted_range_high if observation is not None else None
+                "accepted_structure_high": (
+                    accepted_range.high if accepted_range is not None else None
                 ),
             }
         return AdvisorDecision(

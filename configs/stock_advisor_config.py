@@ -1,7 +1,7 @@
 """Strict StockAdvisor deployment-intelligence policy.
 
 The Advisor is a causal deployment-quality gate.  It does not create setups,
-change Auction lifecycle, close signals, or manage trades.  The defaults below
+change Auction structure or episode state, close signals, or manage trades.  The defaults below
 are deliberately conservative and fully explainable so replay can determine
 whether WATCH/BLOCK decisions should be retained or relaxed.
 """
@@ -107,10 +107,7 @@ class DeferredEntryFreshnessPolicyConfig(BaseModel):
     accepted_fresh_event_types: Tuple[str, ...] = (
         "BALANCE_ESCAPE_STARTED",
         "BALANCE_ESCAPE_ACCEPTED",
-        "DIRECTIONAL_TREND_RESTORED",
-        "DIRECTIONAL_CONTINUATION_CONFIRMED",
-        "DIRECTIONAL_REACCELERATION_CONFIRMED",
-        "DIRECTIONAL_REVERSAL_LEG_ESTABLISHED",
+        "DIRECTIONAL_REVERSED",
     )
 
 
@@ -131,14 +128,8 @@ class StockAdvisorPolicyConfig(BaseModel):
 
     inside_accepted_range_action: AdvisorRuleAction = "WATCH"
     inside_range_exempt_families: Tuple[str, ...] = ("FAILED_BREAKOUT",)
-    # A proven trend restoration is an established opposite-side reversal/pullback
-    # that lost control back to its parent trend.  Like FAILED_BREAKOUT, the
-    # failure itself is fresh setup proof, so current-range containment must not
-    # categorically suppress it.  Ordinary continuation and reacceleration
-    # candidates remain subject to INSIDE_ACCEPTED_RANGE.
     inside_range_exempt_subtypes: Tuple[str, ...] = (
         "EXHAUSTION_REVERSAL",
-        "TREND_RESTORATION",
     )
 
     accepted_breakout_current_context_action: AdvisorRuleAction = "BLOCK"

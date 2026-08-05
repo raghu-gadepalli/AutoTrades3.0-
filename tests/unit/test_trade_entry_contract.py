@@ -277,7 +277,8 @@ class TradeEntryStaticContractTests(unittest.TestCase):
         self.assertNotIn("auction.decision", snapshot_src)
         self.assertNotIn("auction.state", snapshot_src)
         self.assertNotIn("auction.boundary", snapshot_src)
-        self.assertIn("auction.lifecycle", snapshot_src)
+        self.assertIn("auction.directional", snapshot_src)
+        self.assertIn("auction.balance", snapshot_src)
         self.assertIn("market_windows", snapshot_src)
 
     def test_manual_derivative_price_never_falls_back_to_equity_close(self):

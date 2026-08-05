@@ -32,7 +32,7 @@ class _EmptyHistoryProvider:
 
 
 def _candidate(snapshot):
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    routes = AuthoritativeSetupEventRouter().route_authority(events=snapshot.auction.events, permissions=snapshot.auction.permissions)
     evaluations = EventDrivenSetupEngine().evaluate(snapshot, routes)
     approved = [item for item in evaluations if item.approved]
     assert len(approved) == 1

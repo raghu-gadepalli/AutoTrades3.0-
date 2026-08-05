@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -17,7 +17,7 @@ from services.auction_engine.event_driven_setup_engine import (
     EventDrivenSetupManager,
 )
 from services.auction_engine.setup_event_router import AuthoritativeSetupEventRouter
-from tests.unit.test_auction_authority_snapshot import _finalize, _snapshot
+from tests.unit.test_auction_engine import _finalize, _snapshot
 
 
 TS = datetime(2026, 7, 27, 11, 0)
@@ -35,7 +35,16 @@ def _event_snapshot(
 ) -> SnapshotSchema:
     row = _finalize(_snapshot(TS, close=close, direction="UP" if direction is DirectionalBias.UP else "DOWN"))
     payload = row.model_dump(mode="python", by_alias=True)
-    lifecycle = payload["auction"]["lifecycle"]
+    if event_type is AuctionEventType.DIRECTIONAL_REVERSED:
+        current_bar = dict(payload["memory"]["structure"]["bars_3m"][-1])
+        previous_bar = dict(current_bar)
+        previous_bar["date"] = TS - timedelta(minutes=3)
+        if direction is DirectionalBias.UP:
+            previous_bar.update({"open": close - 1.5, "high": close - 0.5, "low": close - 3.0, "close": close - 1.0})
+        else:
+            previous_bar.update({"open": close + 1.5, "high": close + 3.0, "low": close + 0.5, "close": close + 1.0})
+        payload["memory"]["structure"]["bars_3m"] = [previous_bar, current_bar]
+    auction = payload["auction"]
     event_id = f"EVENT:{event_type.value}"
     event = AuctionEvent(
         event_id=event_id,
@@ -53,11 +62,11 @@ def _event_snapshot(
         result=result,
         source_event_ids=(event_id,),
         source_event_types=(event_type,),
-        balance_state=row.auction.lifecycle.balance.current_state,
+        balance_state=row.auction.balance.current_state,
         reason_codes=("TEST_PERMISSION",),
     )
-    lifecycle["events"] = [event.model_dump(mode="python")]
-    lifecycle["permissions"] = [permission.model_dump(mode="python")]
+    auction["events"] = [event.model_dump(mode="python")]
+    auction["permissions"] = [permission.model_dump(mode="python")]
     return SnapshotSchema.model_validate(payload)
 
 
@@ -86,29 +95,15 @@ def _event_snapshot(
             {"frozen_low": 99.0, "frozen_high": 101.0},
         ),
         (
-            AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED,
-            SetupFamily.CONTINUATION,
-            DirectionalBias.UP,
-            102.0,
-            {"origin_price": 101.4, "protection_level": 100.8},
-        ),
-        (
-            AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED,
-            SetupFamily.REACCELERATION,
-            DirectionalBias.UP,
-            102.0,
-            {"origin_price": 101.4, "protection_level": 100.8},
-        ),
-        (
-            AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            AuctionEventType.DIRECTIONAL_REVERSED,
             SetupFamily.REVERSAL,
             DirectionalBias.UP,
             102.0,
-            {"origin_price": 100.0},
+            {"start_price": 100.0},
         ),
     ),
 )
-def test_all_families_create_only_from_permitted_authoritative_event(
+def test_current_event_backed_families_create_only_from_permitted_event(
     event_type, family, direction, close, data
 ) -> None:
     snapshot = _event_snapshot(
@@ -118,7 +113,7 @@ def test_all_families_create_only_from_permitted_authoritative_event(
         close=close,
         data=data,
     )
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    routes = AuthoritativeSetupEventRouter().route_authority(events=snapshot.auction.events, permissions=snapshot.auction.permissions)
     evaluations = EventDrivenSetupEngine().evaluate(snapshot, routes)
     approved = [item for item in evaluations if item.approved]
     assert len(approved) == 1
@@ -133,13 +128,13 @@ def test_all_families_create_only_from_permitted_authoritative_event(
 
 def test_wait_or_block_never_creates_candidate() -> None:
     snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         result=StructuralPermissionResult.BLOCK,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
+    routes = AuthoritativeSetupEventRouter().route_authority(events=snapshot.auction.events, permissions=snapshot.auction.permissions)
     evaluations = EventDrivenSetupEngine().evaluate(snapshot, routes)
     assert len(evaluations) == 1
     assert evaluations[0].approved is False
@@ -149,10 +144,10 @@ def test_wait_or_block_never_creates_candidate() -> None:
 
 def test_manager_defers_opposite_authoritative_candidates() -> None:
     up = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+        AuctionEventType.DIRECTIONAL_REVERSED,
         SetupFamily.REVERSAL,
         close=102.0,
-        data={"origin_price": 100.0},
+        data={"start_price": 100.0},
     )
     down = _event_snapshot(
         AuctionEventType.BALANCE_ESCAPE_FAILED,
@@ -162,52 +157,11 @@ def test_manager_defers_opposite_authoritative_candidates() -> None:
         data={"frozen_low": 99.0, "frozen_high": 101.0},
     )
     engine = EventDrivenSetupEngine()
-    up_eval = engine.evaluate(up, AuthoritativeSetupEventRouter().route(up.auction.lifecycle))[0]
-    down_eval = engine.evaluate(down, AuthoritativeSetupEventRouter().route(down.auction.lifecycle))[0]
+    up_eval = engine.evaluate(up, AuthoritativeSetupEventRouter().route_authority(events=up.auction.events, permissions=up.auction.permissions))[0]
+    down_eval = engine.evaluate(down, AuthoritativeSetupEventRouter().route_authority(events=down.auction.events, permissions=down.auction.permissions))[0]
     decision = EventDrivenSetupManager().select(up, (up_eval, down_eval))
     assert decision.selected_candidate is None
     assert set(decision.deferred_candidate_ids) == {
         up_eval.candidate.candidate_id,
         down_eval.candidate.candidate_id,
     }
-
-
-def test_reversal_prefers_preserved_confirmation_boundary_for_geometry() -> None:
-    snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
-        direction=DirectionalBias.DOWN,
-        close=98.0,
-        data={
-            "origin_price": 99.0,
-            "reversal_confirmation_level": 100.0,
-        },
-    )
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
-    evaluation = EventDrivenSetupEngine().evaluate(snapshot, routes)[0]
-
-    assert evaluation.approved is True
-    assert evaluation.candidate is not None
-    assert evaluation.candidate.stop_anchor_price == pytest.approx(100.0)
-    assert evaluation.candidate.stop_anchor_type == "REVERSAL_CONFIRMATION_LEVEL"
-    assert evaluation.candidate.reference_price == pytest.approx(99.0)
-
-
-def test_reversal_stop_boundary_does_not_replace_entry_freshness_origin() -> None:
-    snapshot = _event_snapshot(
-        AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
-        SetupFamily.REVERSAL,
-        direction=DirectionalBias.UP,
-        close=104.8,
-        data={
-            "origin_price": 103.0,
-            "reversal_confirmation_level": 100.0,
-        },
-    )
-    routes = AuthoritativeSetupEventRouter().route(snapshot.auction.lifecycle)
-    evaluation = EventDrivenSetupEngine().evaluate(snapshot, routes)[0]
-
-    assert evaluation.approved is True
-    assert evaluation.candidate is not None
-    assert evaluation.candidate.stop_anchor_price == pytest.approx(100.0)
-    assert evaluation.candidate.reference_price == pytest.approx(103.0)

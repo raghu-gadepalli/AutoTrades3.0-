@@ -1,10 +1,4 @@
-"""Strict authoritative Auction snapshot adapter.
-
-The adapter restores only Persistent Episode memory from the immediately
-previous same-day snapshot, evaluates objective evidence and lifecycle once,
-and writes the final Auction observation/lifecycle projection.  It contains no
-legacy state, boundary, setup, opportunity, decision or fallback path.
-"""
+"""Snapshot adapter for the Auction directional core."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -14,33 +8,29 @@ from typing import Optional
 
 from configs.auction_engine_config import AUCTION_ENGINE_CONFIG
 from configs.snapshot_config import SNAPSHOT_CONFIG
-from schemas.snapshot import (
-    AuctionEngineIdentityProjection,
-    AuctionMemoryBlock,
-    AuctionSnapshotBlock,
-    SnapshotSchema,
-)
+from schemas.snapshot import AuctionMemoryBlock, AuctionSnapshotBlock, SnapshotSchema
 from services.auction_engine.engine import AuctionEngine
 
 logger = logging.getLogger(__name__)
 
 
 def initial_auction_memory(symbol: str, snapshot_time: datetime) -> AuctionMemoryBlock:
-    """Return the explicit first-snapshot authoritative memory state."""
     return AuctionMemoryBlock.model_validate(
         AuctionEngine.initial_memory(symbol, snapshot_time).model_dump(mode="python")
     )
 
 
 def empty_auction_block() -> AuctionSnapshotBlock:
-    """Explicit pre-evaluation placeholder used only during snapshot assembly."""
     return AuctionSnapshotBlock(
         status="NOT_RUN",
         continuity_mode="COLD_START",
         previous_snapshot_time=None,
-        engine=None,
-        observation=None,
-        lifecycle=None,
+        evidence=None,
+        directional=None,
+        balance=None,
+        events=(),
+        permissions=(),
+        diagnostics={},
     )
 
 
@@ -49,7 +39,6 @@ def enrich_snapshot_with_auction(
     *,
     previous_snapshot: Optional[SnapshotSchema] = None,
 ) -> tuple[AuctionSnapshotBlock, AuctionMemoryBlock]:
-    """Evaluate one snapshot through the sole authoritative Auction lifecycle."""
     symbol = snapshot.symbol.strip().upper()
     snapshot_time = snapshot.snapshot_time
     engine = AuctionEngine(AUCTION_ENGINE_CONFIG)
@@ -77,45 +66,62 @@ def enrich_snapshot_with_auction(
                     f"maximum is {max_gap:.3f}"
                 )
             if previous_snapshot.auction.status != "OK":
-                raise ValueError("Previous same-day authoritative Auction block is not OK")
+                raise ValueError("Previous same-day Auction block is not OK")
             previous_memory = previous_snapshot.memory.auction
             if previous_memory.last_snapshot_time != previous_time:
                 raise ValueError(
                     "Previous Auction memory last_snapshot_time does not match snapshot"
                 )
-            engine.restore_incremental_state(symbol, previous_memory)
+            history_limit = int(AUCTION_ENGINE_CONFIG.state.history_bars)
+            query_time = (
+                previous_time.replace(tzinfo=None)
+                if previous_time.tzinfo is not None
+                else previous_time
+            )
+            history_snapshots = SnapshotSchema.fetch_recent_today_for_symbol_before_time(
+                symbol,
+                query_time,
+                limit=history_limit,
+                ascending=True,
+            )
+            by_time = {item.snapshot_time: item for item in history_snapshots}
+            by_time[previous_snapshot.snapshot_time] = previous_snapshot
+            history_snapshots = [by_time[key] for key in sorted(by_time)]
+            engine.restore_incremental_state(
+                symbol,
+                previous_memory,
+                history_snapshots=history_snapshots[-history_limit:],
+            )
             continuity_mode = "INCREMENTAL_PREVIOUS_SNAPSHOT"
 
     result = engine.evaluate_snapshot(snapshot, equity_ref=symbol)
     memory = AuctionMemoryBlock.model_validate(
         engine.export_incremental_state(symbol).model_dump(mode="python")
     )
-    lifecycle = result.lifecycle
-
     block = AuctionSnapshotBlock(
         status="OK",
         continuity_mode=continuity_mode,
         previous_snapshot_time=previous_time,
-        engine=AuctionEngineIdentityProjection(
-            name=AUCTION_ENGINE_CONFIG.engine.engine_name,
-            version=AUCTION_ENGINE_CONFIG.engine.engine_version,
-        ),
-        observation=result.observation,
-        lifecycle=lifecycle,
+        evidence=result.fresh_direction,
+        directional=result.directional,
+        balance=result.balance,
+        events=result.events,
+        permissions=result.permissions,
+        diagnostics=result.diagnostics,
     )
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     logger.info(
-        "auction_authority_snapshot symbol=%s snapshot_time=%s continuity_mode=%s "
-        "elapsed_ms=%.3f directional=%s balance=%s events=%d permissions=%d",
+        "auction_snapshot symbol=%s snapshot_time=%s continuity_mode=%s "
+        "elapsed_ms=%.3f fresh_direction=%s active_episode=%s balance=%s events=%d",
         symbol,
         snapshot_time,
         continuity_mode,
         elapsed_ms,
-        lifecycle.directional.current_state.value,
-        lifecycle.balance.current_state.value,
-        len(lifecycle.events),
-        len(lifecycle.permissions),
+        result.fresh_direction.side.value,
+        result.directional.active_episode_id,
+        result.balance.current_state.value,
+        len(result.events),
     )
     return block, memory
 

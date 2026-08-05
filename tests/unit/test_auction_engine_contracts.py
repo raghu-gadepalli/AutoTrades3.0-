@@ -88,31 +88,52 @@ class AuctionEngineConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AUCTION_ENGINE_CONFIG.engine.engine_version = "2.0.0"
 
+    def test_only_current_directional_event_vocabulary_remains(self) -> None:
+        directional_events = {
+            event.value
+            for event in AuctionEventType
+            if event.value.startswith("DIRECTIONAL_")
+        }
+        self.assertEqual(
+            directional_events,
+            {
+                "DIRECTIONAL_STARTED",
+                "DIRECTIONAL_REVERSED",
+                "DIRECTIONAL_ENDED",
+            },
+        )
+
+    def test_removed_directional_policy_fields_are_rejected(self) -> None:
+        payload = AUCTION_ENGINE_CONFIG.resolved_dict()
+        payload["episode"]["directional"]["trend_restoration_confirmation_bars"] = 2
+        with self.assertRaises(ValidationError):
+            AuctionEngineConfig.model_validate(payload)
+
     def test_permission_matrix_is_fully_typed_and_versioned(self) -> None:
         event_types = {
             rule.event_type for rule in AUCTION_ENGINE_CONFIG.episode.permissions.event_rules
         }
         self.assertIn(
-            AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            AuctionEventType.DIRECTIONAL_REVERSED,
             event_types,
         )
         self.assertIn(AuctionEventType.BALANCE_ESCAPE_ACCEPTED, event_types)
         self.assertIn(AuctionEventType.BALANCE_ESCAPE_FAILED, event_types)
-        self.assertIn(
-            AuctionEventType.DIRECTIONAL_CONTINUATION_CONFIRMED,
-            event_types,
-        )
-        self.assertIn(
-            AuctionEventType.DIRECTIONAL_REACCELERATION_CONFIRMED,
-            event_types,
-        )
         permit_families = {
             family
             for rule in AUCTION_ENGINE_CONFIG.episode.permissions.event_rules
             if rule.result is StructuralPermissionResult.PERMIT
             for family in rule.setup_families
         }
-        self.assertEqual(permit_families, set(SetupFamily))
+        self.assertEqual(
+            permit_families,
+            {
+                SetupFamily.REVERSAL,
+                SetupFamily.BREAKOUT_INITIATION,
+                SetupFamily.ACCEPTED_BREAKOUT,
+                SetupFamily.FAILED_BREAKOUT,
+            },
+        )
         self.assertEqual(
             set(AUCTION_ENGINE_CONFIG.episode.permissions.result_precedence),
             set(StructuralPermissionResult),
@@ -211,7 +232,7 @@ class AuctionEngineConfigTests(unittest.TestCase):
     def test_locked_balance_overrides_reversal_event_permission(self) -> None:
         event = AuctionEvent(
             event_id="DIR:TEST:2026-07-20:001:UP:100000:REVERSAL:100300",
-            event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            event_type=AuctionEventType.DIRECTIONAL_REVERSED,
             episode_id="DIR:TEST:2026-07-20:001:UP:100000",
             symbol="TEST",
             trading_day=date(2026, 7, 20),
@@ -298,7 +319,7 @@ class AuctionEngineContractTests(unittest.TestCase):
             setup_subtype="STRUCTURAL_REVERSAL",
             side=TradeSide.BUY,
             source_event_id="event-1",
-            source_event_type=AuctionEventType.DIRECTIONAL_REVERSAL_LEG_ESTABLISHED,
+            source_event_type=AuctionEventType.DIRECTIONAL_REVERSED,
             source_episode_id="episode-1",
             structural_result=StructuralPermissionResult.PERMIT,
             entry_price=101.0,
@@ -308,15 +329,15 @@ class AuctionEngineContractTests(unittest.TestCase):
             target_basis="ONE_POINT_FIVE_R",
             reference_price=100.0,
             reference_source="AUTHORITATIVE_EVENT_GEOMETRY",
-            risk_points=1.0,
-            expected_move_points=1.5,
-            expected_move_pct=1.5 / 101.0,
-            reward_risk=1.5,
             valid_until=self.ts + timedelta(minutes=6),
             reason_codes=("AUTHORITATIVE_EVENT_ROUTE",),
         )
         self.assertEqual(candidate.source_event_id, "event-1")
         payload = candidate.model_dump(mode="python")
+        self.assertNotIn("risk_points", payload)
+        self.assertNotIn("expected_move_points", payload)
+        self.assertNotIn("expected_move_pct", payload)
+        self.assertNotIn("reward_risk", payload)
         payload["structural_result"] = StructuralPermissionResult.BLOCK
         with self.assertRaises(ValidationError):
             AuthoritativeSetupCandidate.model_validate(payload)
