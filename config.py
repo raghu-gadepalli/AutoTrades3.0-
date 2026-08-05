@@ -31,7 +31,7 @@ class AppConfig:
     SQLALCHEMY_BINDS: Dict[str, str] = {
         "trades": os.getenv(
             "TRADE_DATABASE_URI",
-            "mysql+mysqlconnector://autotrades:Autotrades001%23@88.222.212.231/backtest",
+            "mysql+mysqlconnector://autotrades:Autotrades001%23@88.222.212.231/autotrades",
         ),
     }
 # -----------------------
