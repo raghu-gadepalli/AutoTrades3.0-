@@ -25,7 +25,7 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 # Hard-coded replay configuration
 # ---------------------------------------------------------------------------
 START = datetime(2026, 8, 6, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
-END = datetime(2026, 8, 6, 9, 27, tzinfo=ZoneInfo("Asia/Kolkata"))
+END = datetime(2026, 8, 6, 9, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
 
 # Use exactly one of these forms:
 #   ["ALL"]                         -> all symbols allowed by ACTIVE_ONLY
