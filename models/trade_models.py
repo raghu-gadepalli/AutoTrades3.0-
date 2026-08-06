@@ -459,6 +459,21 @@ class Snapshot(Base):
         return f"<Snapshot {self.symbol} - {self.snapshot_time}>"
 
 
+class StockMap(Base):
+    __tablename__ = "stockmaps"
+    __table_args__ = (
+        Index("idx_stockmaps_time_symbol", "stockmap_time", "symbol"),
+    )
+
+    symbol = Column(String(50), primary_key=True, nullable=False)
+    # Completed 15-minute candle start label, matching Snapshot convention.
+    stockmap_time = Column(DateTime, primary_key=True, nullable=False)
+    data = Column(JSON, nullable=False)
+
+    def __repr__(self):
+        return f"<StockMap {self.symbol} - {self.stockmap_time}>"
+
+
 class DerivativesChain(Base):
     __tablename__ = "derivativeschain"
     __table_args__ = (
