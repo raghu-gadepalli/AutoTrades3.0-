@@ -121,7 +121,7 @@ class OpeningRangeBlock(StrictBaseModel):
     def validate_range(self) -> "OpeningRangeBlock":
         if self.ready and (self.high is None or self.low is None):
             raise ValueError("opening range high/low are required when ready=True")
-        if self.high is not None and self.low is not None and self.high <= self.low:
+        if self.high is not None and self.low is not None and self.high < self.low:
             raise ValueError("opening range high must exceed low")
         return self
 
