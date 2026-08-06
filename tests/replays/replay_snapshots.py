@@ -24,13 +24,13 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 # ---------------------------------------------------------------------------
 # Hard-coded replay configuration
 # ---------------------------------------------------------------------------
-START = datetime(2026, 8, 4, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
-END = datetime(2026, 8, 4, 15, 15, tzinfo=ZoneInfo("Asia/Kolkata"))
+START = datetime(2026, 8, 6, 9, 18, tzinfo=ZoneInfo("Asia/Kolkata"))
+END = datetime(2026, 8, 6, 15, 24, tzinfo=ZoneInfo("Asia/Kolkata"))
 
 # Use exactly one of these forms:
 #   ["ALL"]                         -> all symbols allowed by ACTIVE_ONLY
 #   ["MARUTI", "INFY", "ASTRAL"]  -> only the named symbols allowed by ACTIVE_ONLY
-# SYMBOLS: List[str] = ['MARUTI', 'ABB', 'AUBANK', 'AXISBANK']
+SYMBOLS: List[str] = ['ALL']
 # SYMBOLS: List[str] = ['360ONE', 'ABB', 'ABCAPITAL', 'ADANIGREEN', 'ADANIPORTS', 'AMBER', 'ANGELONE', 'ASTRAL', 'AUBANK', 'AXISBANK']
 # SYMBOLS: List[str] = ['BAJAJ-AUTO', 'BAJFINANCE', 'BANKBARODA', 'BDL', 'BEL', 'BHARATFORG', 'BHEL', 'BIOCON', 'BLUESTARCO', 'BPCL']
 # SYMBOLS: List[str] = ['BSE', 'CGPOWER', 'CHOLAFIN', 'COFORGE', 'CROMPTON', 'DELHIVERY', 'DIVISLAB', 'DLF', 'DMART', 'DRREDDY']
