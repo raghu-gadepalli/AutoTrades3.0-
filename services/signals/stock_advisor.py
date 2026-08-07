@@ -424,8 +424,7 @@ class StockAdvisor:
         details = {
             "applicable": True,
             "creation_stockmap_time": creation_map.stockmap_time,
-            "creation_stockmap_asof_time": creation_map_asof,
-            "range_id": accepted_range.range_id,
+            "creation_stockmap_asof_time": creation_time,
             "frozen_low": low,
             "frozen_high": high,
             "signal_created_price": created_price,
