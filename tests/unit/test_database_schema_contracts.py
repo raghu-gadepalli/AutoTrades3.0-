@@ -13,8 +13,6 @@ from models.trade_models import (
     Instrument,
     Signal,
     Snapshot,
-    StockRank,
-    StockRankHistory,
     Symbol,
     User,
     UserTrade,
@@ -27,7 +25,6 @@ from schemas.event import EventSchema
 from schemas.instrument import InstrumentSchema
 from schemas.signal import SignalSchema
 from schemas.stock_opportunity import StockOpportunitySchema
-from schemas.stock_rank import StockRankSchema
 from schemas.symbol import SymbolSchema
 from schemas.user import UserSchema
 from schemas.user_trade import UserTradeSchema
@@ -71,8 +68,6 @@ def test_every_live_table_has_one_orm_mapping() -> None:
         "signals_history",
         "snapshots",
         "stock_opportunities",
-        "stock_rank",
-        "stock_rank_history",
         "symbols",
         "user_trades",
         "user_trades_history",
@@ -89,7 +84,6 @@ def test_db_backed_pydantic_fields_match_orm_columns() -> None:
         (Event, EventSchema),
         (Instrument, InstrumentSchema),
         (Signal, SignalSchema),
-        (StockRank, StockRankSchema),
         (Symbol, SymbolSchema),
         (User, UserSchema),
         (UserTrade, UserTradeSchema),
@@ -194,13 +188,6 @@ def test_signal_indexes_include_keyset_pagination_paths() -> None:
     indexes = _index_columns(Signal)
     assert ("status", "last_eval_time", "id") in indexes
     assert ("last_eval_time", "id") in indexes
-
-
-def test_stock_rank_tables_keep_current_and_history_identity_contracts() -> None:
-    assert ("symbol", "rank_time") in _unique_columns(StockRank)
-    assert ("symbol", "rank_time") in _unique_columns(StockRankHistory)
-    assert ("rank_time", "rank_position") in _index_columns(StockRank)
-    assert ("rank_time", "rank_position") in _index_columns(StockRankHistory)
 
 
 def test_user_trade_history_has_generated_day_and_archive_defaults() -> None:

@@ -10,7 +10,6 @@ from enums.advisor_context import (
     ContextAvailability,
     ContextInfluence,
     MarketRegimeState,
-    StockRankTier,
 )
 from utils.datetime_utils import to_ist_naive
 
@@ -24,91 +23,6 @@ class _ContextContract(BaseModel):
         allow_inf_nan=False,
     )
 
-
-class StockRankAssessment(_ContextContract):
-    symbol: str = Field(min_length=1, max_length=32)
-    as_of: datetime
-    availability: ContextAvailability
-    rank_time: Optional[datetime] = None
-    age_seconds: Optional[float] = Field(default=None, ge=0.0)
-    fresh: bool = False
-
-    rank_position: Optional[int] = Field(default=None, ge=1)
-    universe_size: Optional[int] = Field(default=None, ge=1)
-    attention_tier: Optional[StockRankTier] = None
-    direction: Optional[str] = None
-    classification: Optional[str] = None
-
-    total_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    movement_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    quality_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    range_penalty: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    stall_penalty: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    reason_codes: Tuple[str, ...] = ()
-
-    @field_validator("symbol", mode="before")
-    @classmethod
-    def _normalise_symbol(cls, value: object) -> str:
-        symbol = str(value or "").strip().upper()
-        if not symbol:
-            raise ValueError("StockRankAssessment symbol is required")
-        return symbol
-
-    @field_validator("direction", "classification", mode="before")
-    @classmethod
-    def _normalise_optional_text(cls, value: object) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip().upper()
-        return text or None
-
-    @field_validator("reason_codes", mode="before")
-    @classmethod
-    def _normalise_reasons(cls, value: object) -> Tuple[str, ...]:
-        return tuple(str(item).strip().upper() for item in (value or ()) if str(item).strip())
-
-    @model_validator(mode="after")
-    def _validate_assessment(self) -> "StockRankAssessment":
-        if len(self.reason_codes) != len(set(self.reason_codes)):
-            raise ValueError("StockRankAssessment reason codes must be unique")
-
-        populated = (
-            self.rank_time,
-            self.age_seconds,
-            self.rank_position,
-            self.universe_size,
-            self.attention_tier,
-            self.direction,
-            self.classification,
-            self.total_score,
-            self.movement_score,
-            self.quality_score,
-            self.range_penalty,
-            self.stall_penalty,
-        )
-        if self.availability is ContextAvailability.UNAVAILABLE:
-            if self.fresh or any(item is not None for item in populated):
-                raise ValueError("Unavailable StockRank assessment cannot contain rank data")
-            return self
-
-        if any(item is None for item in populated):
-            raise ValueError("Available or stale StockRank assessment requires complete rank data")
-        assert self.rank_time is not None
-        assert self.rank_position is not None
-        assert self.universe_size is not None
-        if self.rank_position > self.universe_size:
-            raise ValueError("StockRankAssessment rank_position exceeds universe_size")
-        rank_time = to_ist_naive(self.rank_time)
-        as_of = to_ist_naive(self.as_of)
-        if rank_time is None or as_of is None:
-            raise ValueError("StockRankAssessment timestamps must be valid datetimes")
-        if rank_time > as_of:
-            raise ValueError("StockRankAssessment rank_time cannot be in the future")
-        if self.availability is ContextAvailability.AVAILABLE and not self.fresh:
-            raise ValueError("Available StockRank assessment must be fresh")
-        if self.availability is ContextAvailability.STALE and self.fresh:
-            raise ValueError("Stale StockRank assessment cannot be fresh")
-        return self
 
 
 class MarketRegimeEvidence(_ContextContract):
@@ -224,9 +138,7 @@ class MarketRegimeAssessment(_ContextContract):
 class StockAdvisorContextAssessment(_ContextContract):
     symbol: str = Field(min_length=1, max_length=32)
     as_of: datetime
-    stock_rank: StockRankAssessment
     market_regime: MarketRegimeAssessment
-    stock_rank_influence: ContextInfluence
     market_regime_influence: ContextInfluence
 
     @field_validator("symbol", mode="before")
@@ -239,12 +151,9 @@ class StockAdvisorContextAssessment(_ContextContract):
 
     @model_validator(mode="after")
     def _validate_context(self) -> "StockAdvisorContextAssessment":
-        if self.stock_rank.symbol != self.symbol:
-            raise ValueError("StockAdvisor context/StockRank symbol mismatch")
         as_of = to_ist_naive(self.as_of)
-        rank_as_of = to_ist_naive(self.stock_rank.as_of)
         regime_as_of = to_ist_naive(self.market_regime.as_of)
-        if as_of is None or rank_as_of != as_of or regime_as_of != as_of:
+        if as_of is None or regime_as_of != as_of:
             raise ValueError("StockAdvisor context timestamps must match")
         return self
 
@@ -253,7 +162,6 @@ class StockAdvisorContextAssessment(_ContextContract):
 
 
 __all__ = [
-    "StockRankAssessment",
     "MarketRegimeEvidence",
     "MarketRegimeHysteresis",
     "MarketRegimeAssessment",

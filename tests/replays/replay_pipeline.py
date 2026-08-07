@@ -18,7 +18,7 @@ This is intentionally a simple clean-run utility:
 
 - fixed hard-coded symbol list
 - fixed hard-coded replay window
-- no CLI arguments
+- visible source defaults with CLI overrides
 - no checkpoint/resume logic
 - no raw candle deletion; historical data is fetched from the API on demand
 - optional global clearing of auditlog, user_trades, stock_opportunities, signals and snapshots
@@ -30,6 +30,7 @@ replay_unprocessed.py instead.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import logging
@@ -65,10 +66,15 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 from services.trade.executor.trade_executor import TradeExecutor
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
+from tests.replays.replay_execution_prices import (
+    DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE,
+    SUPPORTED_REPLAY_PRICE_SOURCES,
+    replay_execution_price_source,
+)
 
 
 # =============================================================================
-# HARD-CODED CONFIGURATION
+# SOURCE DEFAULTS - CLI values override these
 # =============================================================================
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -101,6 +107,7 @@ CLEAR_DATA: bool = False
 GENERATE_CSV_REPORTS: bool = True
 REPORT_DIR = Path("reports")
 LOG_FILE = REPORT_DIR / "replay_pipeline.log"
+EXECUTION_PRICE_SOURCE = DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -682,10 +689,95 @@ def _log_timing_summary() -> None:
     logger.info("=============================")
 
 
-def main() -> None:
+def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the fixed-symbol end-to-end replay pipeline. Defaults live in "
+            "this file; CLI values override them."
+        )
+    )
+    parser.add_argument("--day", default=START.date().isoformat())
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="Override SYMBOLS; comma-separated items are also accepted",
+    )
+    parser.add_argument("--userid", default=REPLAY_USERID)
+    parser.add_argument("--start-time", default=START.strftime("%H:%M:%S"))
+    parser.add_argument("--end-time", default=END.strftime("%H:%M:%S"))
+    parser.add_argument("--step-minutes", type=int, default=STEP_MINUTES)
+    parser.add_argument(
+        "--clear-data",
+        action=argparse.BooleanOptionalAction,
+        default=CLEAR_DATA,
+    )
+    parser.add_argument(
+        "--csv-reports",
+        action=argparse.BooleanOptionalAction,
+        default=GENERATE_CSV_REPORTS,
+    )
+    parser.add_argument("--data-user", default=DATA_USER_ID)
+    parser.add_argument("--api-key", default=API_KEY_OVERRIDE)
+    parser.add_argument("--access-token", default=ACCESS_TOKEN_OVERRIDE)
+    parser.add_argument("--report-dir", default=str(REPORT_DIR))
+    parser.add_argument("--log-file", default=None)
+    parser.add_argument(
+        "--execution-price-source",
+        default=EXECUTION_PRICE_SOURCE,
+        choices=SUPPORTED_REPLAY_PRICE_SOURCES,
+        help=(
+            "Virtual replay fill source; 1m_candle is strict/no-fallback and "
+            f"snapshot preserves prior behavior (default: {EXECUTION_PRICE_SOURCE})"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def _cli_symbols(raw: Optional[Sequence[str]]) -> List[str]:
+    if raw is None:
+        return list(SYMBOLS)
+    out: List[str] = []
+    seen = set()
+    for value in raw:
+        for item in str(value or "").split(","):
+            symbol = item.strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                out.append(symbol)
+    if not out:
+        raise ValueError("--symbols cannot be empty")
+    return out
+
+
+def _cli_datetime(day_raw: str, clock_raw: str) -> datetime:
+    day = date.fromisoformat(str(day_raw))
+    clock = datetime.strptime(str(clock_raw), "%H:%M:%S").time()
+    return datetime.combine(day, clock, tzinfo=IST)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = _args(argv)
+    global logger, START, END, STEP_MINUTES, SYMBOLS, REPLAY_USERID
+    global DATA_USER_ID, API_KEY_OVERRIDE, ACCESS_TOKEN_OVERRIDE, CLEAR_DATA
+    global GENERATE_CSV_REPORTS, REPORT_DIR, LOG_FILE, EXECUTION_PRICE_SOURCE
+
+    START = _cli_datetime(args.day, args.start_time)
+    END = _cli_datetime(args.day, args.end_time)
+    STEP_MINUTES = max(1, int(args.step_minutes))
+    SYMBOLS = _cli_symbols(args.symbols)
+    REPLAY_USERID = str(args.userid).strip()
+    DATA_USER_ID = str(args.data_user).strip()
+    API_KEY_OVERRIDE = str(args.api_key or "").strip()
+    ACCESS_TOKEN_OVERRIDE = str(args.access_token or "").strip()
+    CLEAR_DATA = bool(args.clear_data)
+    GENERATE_CSV_REPORTS = bool(args.csv_reports)
+    REPORT_DIR = Path(args.report_dir)
+    LOG_FILE = Path(args.log_file) if args.log_file else REPORT_DIR / "replay_pipeline.log"
+    EXECUTION_PRICE_SOURCE = str(args.execution_price_source).strip().lower()
+
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     setup_logging(log_file=str(LOG_FILE))
-    global logger
     logger = logging.getLogger(__name__)
 
     started_at = datetime.now(IST)
@@ -702,7 +794,8 @@ def main() -> None:
 
     logger.info(
         "Starting replay_pipeline | trading_day=%s start=%s end=%s step=%dm "
-        "symbols=%s replay_user=%s clear=%s csv_reports=%s data_user=%s credentials=%s",
+        "symbols=%s replay_user=%s clear=%s csv_reports=%s execution_price_source=%s "
+        "data_user=%s credentials=%s",
         trading_day,
         START,
         END,
@@ -711,6 +804,7 @@ def main() -> None:
         REPLAY_USERID,
         CLEAR_DATA,
         GENERATE_CSV_REPORTS,
+        EXECUTION_PRICE_SOURCE,
         DATA_USER_ID,
         credential_source,
     )
@@ -732,11 +826,12 @@ def main() -> None:
     )
 
     try:
-        run_replay(
-            symbol_rows=symbol_rows,
-            api_key=api_key,
-            access_token=access_token,
-        )
+        with replay_execution_price_source(EXECUTION_PRICE_SOURCE):
+            run_replay(
+                symbol_rows=symbol_rows,
+                api_key=api_key,
+                access_token=access_token,
+            )
     finally:
         EXECUTION_CONFIG.use_snapshot = old_use_snapshot
         EXECUTION_CONFIG.use_live_price_for_virtual = old_use_live_price_for_virtual

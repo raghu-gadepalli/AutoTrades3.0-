@@ -22,14 +22,6 @@ AdvisorRuleAction = Literal["ALLOW", "WATCH", "BLOCK"]
 AdvisorContextInfluence = Literal["NONE", "DIAGNOSTIC", "WEIGHTED"]
 
 
-class StockRankAdvisorContextConfig(BaseModel):
-    model_config = STRICT_CONFIG
-
-    enabled: bool = True
-    max_age_seconds: float = Field(default=540.0, gt=0.0)
-    influence: AdvisorContextInfluence = "DIAGNOSTIC"
-
-
 class MarketRegimeAdvisorContextConfig(BaseModel):
     model_config = STRICT_CONFIG
 
@@ -144,9 +136,6 @@ class StockAdvisorPolicyConfig(BaseModel):
     day_history_limit: int = Field(default=160, ge=10)
     prior_opportunity_limit: int = Field(default=50, ge=1)
 
-    stock_rank_context: StockRankAdvisorContextConfig = Field(
-        default_factory=StockRankAdvisorContextConfig
-    )
     market_regime_context: MarketRegimeAdvisorContextConfig = Field(
         default_factory=MarketRegimeAdvisorContextConfig
     )
@@ -191,10 +180,6 @@ class StockAdvisorPolicyConfig(BaseModel):
             raise ValueError(
                 "research stockmap_boundary_transition must remain exclusive when enabled"
             )
-        if self.stock_rank_context.influence != "DIAGNOSTIC":
-            raise ValueError(
-                "stock_rank_context.influence must remain DIAGNOSTIC until replay validation"
-            )
         if self.market_regime_context.influence != "NONE":
             raise ValueError(
                 "market_regime_context.influence must remain NONE until regime implementation"
@@ -208,7 +193,6 @@ STOCK_ADVISOR_CONFIG = StockAdvisorPolicyConfig()
 __all__ = [
     "AdvisorRuleAction",
     "AdvisorContextInfluence",
-    "StockRankAdvisorContextConfig",
     "MarketRegimeAdvisorContextConfig",
     "MatureRangeChurnPolicyConfig",
     "BarrierPolicyConfig",

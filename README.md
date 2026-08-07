@@ -84,7 +84,6 @@ Primary service entry points are under `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `run_stock_rank.py` | Run the production StockRank service over the active EQ universe |
 | `gen_derivatives.py` | Generate derivatives-chain context |
 | `gen_snapshots.py` | Generate completed-candle snapshots |
 | `gen_signals.py` | Process unprocessed snapshots through SignalGenerator |
@@ -117,8 +116,6 @@ refresh broker instruments
 → review/apply enabled universe
 → review/apply active universe
 ```
-
-StockRank is the production intraday attention-ranking service. It is read-only with respect to symbol membership, Auction continuity, signals, and trades.
 
 ## Service window and failure handling
 
@@ -211,7 +208,7 @@ python -m pytest -q
 
 ### Functionality programs
 
-`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, StockRank, TradeGenerator, TradeExecutor, or TradeMonitor.
+`tests/functionality/` contains manually executed programs that exercise one real component, such as one snapshot, derivatives processing, TradeGenerator, TradeExecutor, or TradeMonitor.
 
 Examples:
 
@@ -235,7 +232,6 @@ These programs are not intended to be collected and run together as unit tests. 
 | `replay_signal_generator.py` | Focused signal and opportunity lifecycle diagnostics from stored snapshots |
 | `replay_signal_trade_pipeline.py` | Strict downstream validation through trade creation, execution, monitoring, and exits |
 | `replay_setup_evaluation.py` | Focused Auction-to-setup evaluation diagnostics |
-| `replay_stock_rank.py` | Historical StockRank replay and diagnostics |
 
 `replay_unprocessed.py` is the single production-like unprocessed-snapshot runner. Signal evaluation may run concurrently across symbols at the same snapshot time. The downstream trade pipeline remains cadence-based and single-threaded.
 
@@ -317,7 +313,6 @@ Day Prep performs mandatory verified archives before current-state tables are cl
 ```text
 signals       → signals_history
 user_trades   → user_trades_history
-stock_rank    → stock_rank_history
 ```
 
 Auditlog history is optional and disabled by default through `SERVICE_CONFIG.day_prep.archive_auditlog`. Whether archived or not, the current audit table is cleared during preparation.

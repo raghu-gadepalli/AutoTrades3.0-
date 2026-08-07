@@ -13,27 +13,7 @@ def _diagnostics() -> dict:
         "advisor_context": {
             "symbol": "TCS",
             "as_of": "2026-07-31T11:24:00",
-            "stock_rank_influence": "DIAGNOSTIC",
             "market_regime_influence": "NONE",
-            "stock_rank": {
-                "symbol": "TCS",
-                "as_of": "2026-07-31T11:24:00",
-                "availability": "AVAILABLE",
-                "rank_time": "2026-07-31T11:21:00",
-                "age_seconds": 180.0,
-                "fresh": True,
-                "rank_position": 12,
-                "universe_size": 80,
-                "attention_tier": "PRIORITY",
-                "direction": "UP",
-                "classification": "MOVING_UP",
-                "total_score": 52.5,
-                "movement_score": 71.0,
-                "quality_score": 63.0,
-                "range_penalty": 0.0,
-                "stall_penalty": 0.0,
-                "reason_codes": ["STOCK_RANK_AVAILABLE"],
-            },
             "market_regime": {
                 "as_of": "2026-07-31T11:24:00",
                 "availability": "UNAVAILABLE",
@@ -72,17 +52,6 @@ def test_flattens_context_for_every_advisor_action(advisor_action: str) -> None:
     assert row["advisor_context_present"] is True
     assert row["advisor_context_symbol"] == "TCS"
     assert row["advisor_context_as_of"] == "2026-07-31T11:24:00"
-    assert row["stock_rank_influence"] == "DIAGNOSTIC"
-    assert row["stock_rank_availability"] == "AVAILABLE"
-    assert row["stock_rank_rank_time"] == "2026-07-31T11:21:00"
-    assert row["stock_rank_age_seconds"] == 180.0
-    assert row["stock_rank_fresh"] is True
-    assert row["stock_rank_position"] == 12
-    assert row["stock_rank_attention_tier"] == "PRIORITY"
-    assert row["stock_rank_classification"] == "MOVING_UP"
-    assert json.loads(row["stock_rank_reason_codes"]) == [
-        "STOCK_RANK_AVAILABLE"
-    ]
     assert row["market_regime_influence"] == "NONE"
     assert row["market_regime_availability"] == "UNAVAILABLE"
     assert row["market_regime_state"] == "UNKNOWN"
@@ -105,8 +74,6 @@ def test_non_advisor_evaluation_has_blank_context_columns() -> None:
     )
 
     assert row["advisor_context_present"] is False
-    assert row["stock_rank_availability"] is None
-    assert row["stock_rank_attention_tier"] is None
     assert row["market_regime_availability"] is None
     assert row["market_regime_state"] is None
     assert row["advisor_diagnostics_json"] is None
@@ -128,7 +95,7 @@ def test_advisor_evaluation_requires_context_contract() -> None:
         )
 
 
-def test_advisor_evaluation_requires_both_context_sources() -> None:
+def test_advisor_evaluation_requires_market_regime_context() -> None:
     diagnostics = _diagnostics()
     diagnostics["advisor_context"].pop("market_regime")
 

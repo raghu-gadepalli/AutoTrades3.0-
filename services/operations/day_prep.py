@@ -21,8 +21,6 @@ from models.trade_models import (
     SignalHistory,
     Snapshot,
     StockOpportunity,
-    StockRank,
-    StockRankHistory,
     User,
     UserFunds,
     UserOrders,
@@ -32,7 +30,6 @@ from models.trade_models import (
 )
 from schemas.archive import ArchiveResult, ArchiveSpec, archive_rows
 from schemas.signal import SignalSchema
-from schemas.stock_rank import StockRankSchema
 from schemas.user_trade import UserTradeSchema
 
 logger = logging.getLogger(__name__)
@@ -83,9 +80,7 @@ class DayPrepService:
             SignalHistory,
             UserTrade,
             UserTradeHistory,
-            StockRank,
-            StockRankHistory,
-            StockOpportunity,
+                            StockOpportunity,
             Snapshot,
             Candle,
             DerivativesChain,
@@ -197,8 +192,7 @@ class DayPrepService:
         models: list[type] = [
             UserTrade,
             Signal,
-            StockRank,
-            StockOpportunity,
+                    StockOpportunity,
             Snapshot,
             Candle,
             DerivativesChain,
@@ -247,20 +241,61 @@ class DayPrepService:
             db.commit()
         return enabled, missing
 
-    def _archive_rows(self) -> dict[str, dict[str, Any]]:
-        results: list[ArchiveResult] = [
-            SignalSchema.archive_current_rows(),
-            UserTradeSchema.archive_current_rows(),
-            StockRankSchema.archive_current_rows(),
+    def _archive_rows(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        """Archive independent durable tables without aborting Day Prep.
+
+        A failed archive is isolated to its source table.  The failure is logged
+        with context and that source table is protected from clearing later in
+        the run.  Other archive/clear work continues.
+        """
+
+        archive_jobs = [
+            ("signals", Signal.__table__.name, SignalSchema.archive_current_rows),
+            (
+                "user_trades",
+                UserTrade.__table__.name,
+                UserTradeSchema.archive_current_rows,
+            ),
         ]
         if self.config.archive_auditlog:
-            results.append(archive_rows(self._audit_archive_spec()))
+            archive_jobs.append(
+                (
+                    "auditlog",
+                    AuditLog.__table__.name,
+                    lambda: archive_rows(self._audit_archive_spec()),
+                )
+            )
 
         archives: dict[str, dict[str, Any]] = {}
-        for result in results:
-            archives[result.name] = result.as_dict()
-            logger.info("DAY_PREP_ARCHIVE | %s", result.as_dict())
-        return archives
+        failed_source_tables: set[str] = set()
+        for name, source_table, archive_fn in archive_jobs:
+            try:
+                result: ArchiveResult = archive_fn()
+            except Exception as exc:
+                failed_source_tables.add(source_table)
+                archives[name] = {
+                    "name": name,
+                    "success": False,
+                    "source_table": source_table,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                logger.exception(
+                    "DAY_PREP_ARCHIVE_FAILED | name=%s | table=%s | "
+                    "action=SKIP_CLEAR_CONTINUE",
+                    name,
+                    source_table,
+                )
+                continue
+
+            payload = result.as_dict()
+            payload["success"] = True
+            archives[result.name] = payload
+            logger.info("DAY_PREP_ARCHIVE | %s", payload)
+
+        return archives, failed_source_tables
 
     def prepare(self) -> dict[str, Any]:
         started_at = datetime.now(self.tz)
@@ -275,14 +310,15 @@ class DayPrepService:
 
         self._verify_tables_exist()
         unresolved = self._unresolved_trade_rows()
-        if unresolved and self.config.strict_unresolved_trade_check:
-            raise RuntimeError(
-                "Day Prep blocked by unresolved trades: "
-                f"count={len(unresolved)} sample={unresolved[:20]}"
-            )
         if unresolved:
-            logger.warning(
-                "DAY_PREP_UNRESOLVED_TRADES | count=%d | rows=%s",
+            log_unresolved = (
+                logger.error
+                if self.config.strict_unresolved_trade_check
+                else logger.warning
+            )
+            log_unresolved(
+                "DAY_PREP_UNRESOLVED_TRADES | count=%d | rows=%s | "
+                "action=ARCHIVE_AND_CONTINUE",
                 len(unresolved),
                 unresolved[:20],
             )
@@ -294,19 +330,78 @@ class DayPrepService:
             opportunity_states,
         )
 
-        # All mandatory archives must verify before any current table is cleared.
-        archives = self._archive_rows()
+        # Archive failures are isolated by table.  A source table whose archive
+        # failed is never cleared; independent tables continue through Day Prep.
+        archives, archive_failed_tables = self._archive_rows()
 
         cleared: dict[str, dict[str, Any]] = {}
         for model in self._clear_models():
-            result = self._clear_model(model)
-            cleared[result.table] = result.as_dict()
-            logger.info("DAY_PREP_CLEAR | %s", result.as_dict())
+            table_name = model.__table__.name
+            if table_name in archive_failed_tables:
+                payload = {
+                    "table": table_name,
+                    "skipped": True,
+                    "reason": "ARCHIVE_FAILED",
+                }
+                cleared[table_name] = payload
+                logger.error(
+                    "DAY_PREP_CLEAR_SKIPPED | table=%s | reason=ARCHIVE_FAILED",
+                    table_name,
+                )
+                continue
 
-        users_reset = (
-            self._reset_user_logins() if self.config.reset_user_logins else 0
-        )
-        virtual_users_enabled, missing_virtual_users = self._enable_virtual_users()
+            try:
+                result = self._clear_model(model)
+            except Exception as exc:
+                payload = {
+                    "table": table_name,
+                    "skipped": False,
+                    "success": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                cleared[table_name] = payload
+                logger.exception(
+                    "DAY_PREP_CLEAR_FAILED | table=%s | action=CONTINUE",
+                    table_name,
+                )
+                continue
+
+            payload = result.as_dict()
+            payload["success"] = True
+            cleared[result.table] = payload
+            logger.info("DAY_PREP_CLEAR | %s", payload)
+
+        users_reset = 0
+        user_reset_error: dict[str, str] | None = None
+        if self.config.reset_user_logins:
+            try:
+                users_reset = self._reset_user_logins()
+            except Exception as exc:
+                user_reset_error = {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                logger.exception(
+                    "DAY_PREP_USER_RESET_FAILED | action=CONTINUE"
+                )
+
+        virtual_users_enabled = 0
+        missing_virtual_users: list[str] = []
+        virtual_user_error: dict[str, str] | None = None
+        try:
+            virtual_users_enabled, missing_virtual_users = (
+                self._enable_virtual_users()
+            )
+        except Exception as exc:
+            virtual_user_error = {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            logger.exception(
+                "DAY_PREP_VIRTUAL_USERS_FAILED | action=CONTINUE"
+            )
+
         logger.info(
             "DAY_PREP_USERS | reset=%d | virtual_enabled=%d | missing=%s",
             users_reset,
@@ -315,6 +410,19 @@ class DayPrepService:
         )
 
         finished_at = datetime.now(self.tz)
+        clear_failed_tables = sorted(
+            table
+            for table, payload in cleared.items()
+            if payload.get("success") is False
+        )
+        completed_with_errors = bool(
+            unresolved
+            or archive_failed_tables
+            or clear_failed_tables
+            or user_reset_error
+            or virtual_user_error
+        )
+
         summary = {
             "success": True,
             "started_at": started_at.isoformat(),
@@ -328,9 +436,14 @@ class DayPrepService:
             "stock_opportunity_states_before_clear": opportunity_states,
             "unresolved_trade_count": len(unresolved),
             "unresolved_trades": unresolved,
+            "archive_failed_tables": sorted(archive_failed_tables),
+            "clear_failed_tables": clear_failed_tables,
+            "completed_with_errors": completed_with_errors,
             "users_reset": users_reset,
+            "user_reset_error": user_reset_error,
             "virtual_users_enabled": virtual_users_enabled,
             "missing_virtual_users": missing_virtual_users,
+            "virtual_user_error": virtual_user_error,
         }
         logger.info("DAY_PREP_SUMMARY | %s", summary)
         return summary

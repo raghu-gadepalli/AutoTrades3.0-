@@ -305,9 +305,7 @@ WHERE table_schema = DATABASE()
       'derivativeschain',
       'signals',
       'user_trades',
-      'user_trades_history',
-      'stock_rank',
-      'stock_rank_history'
+      'user_trades_history'
   )
 GROUP BY table_name, index_name, non_unique
 ORDER BY table_name, index_name;

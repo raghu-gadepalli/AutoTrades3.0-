@@ -18,7 +18,6 @@ from models.trade_models import (
     Signal,
     Snapshot,
     StockOpportunity,
-    StockRank,
     User,
     UserFunds,
     UserOrders,
@@ -27,7 +26,6 @@ from models.trade_models import (
 )
 from schemas.archive import ArchiveResult, archive_columns
 from schemas.signal import SignalSchema
-from schemas.stock_rank import StockRankSchema
 from schemas.user_trade import UserTradeSchema
 from services.operations.day_prep import ClearResult, DayPrepService
 
@@ -61,7 +59,6 @@ def test_day_prep_never_owns_symbol_state() -> None:
     assert cleared == {
         "user_trades",
         "signals",
-        "stock_rank",
         "stock_opportunities",
         "snapshots",
         "candles",
@@ -74,7 +71,6 @@ def test_day_prep_never_owns_symbol_state() -> None:
     assert not {
         "signals_history",
         "user_trades_history",
-        "stock_rank_history",
         "auditlog_history",
         "oms_funds_history",
         "oms_positions_history",
@@ -86,13 +82,11 @@ def test_archive_specs_derive_complete_matching_payloads(monkeypatch) -> None:
     specs = (
         _capture_archive_spec(monkeypatch, SignalSchema.archive_current_rows),
         _capture_archive_spec(monkeypatch, UserTradeSchema.archive_current_rows),
-        _capture_archive_spec(monkeypatch, StockRankSchema.archive_current_rows),
     )
 
     expected = {
         "signals": (Signal, {"hist_id", "archived_on", "trading_date"}),
         "user_trades": (UserTrade, {"hist_id", "archived_on", "trading_date"}),
-        "stock_rank": (StockRank, {"history_id", "archived_on"}),
     }
 
     for spec in specs:
@@ -103,14 +97,6 @@ def test_archive_specs_derive_complete_matching_payloads(monkeypatch) -> None:
             column.name for column in source_model.__table__.columns
         }
         assert excluded.isdisjoint({column.name for column in target_columns})
-
-    rank_spec = specs[-1]
-    target_columns, source_columns = archive_columns(rank_spec)
-    mapping = dict(zip(
-        (column.name for column in target_columns),
-        (column.name for column in source_columns),
-    ))
-    assert mapping["stock_rank_id"] == "id"
 
 
 def test_audit_archive_is_optional_but_idempotent_when_enabled() -> None:
@@ -160,14 +146,14 @@ def test_prepare_archives_every_durable_table_before_any_clear(monkeypatch) -> N
     monkeypatch.setattr(service, "_opportunity_state_counts", lambda: {"OBSERVING": 2})
 
     def archive_all():
-        events.extend(["archive:signals", "archive:user_trades", "archive:stock_rank"])
+        events.extend(["archive:signals", "archive:user_trades"])
         return {
             name: ArchiveResult(name, 1, 1, 1).as_dict()
-            for name in ("signals", "user_trades", "stock_rank")
+            for name in ("signals", "user_trades")
         }
 
-    monkeypatch.setattr(service, "_archive_rows", archive_all)
-    monkeypatch.setattr(service, "_clear_models", lambda: (Signal, StockRank))
+    monkeypatch.setattr(service, "_archive_rows", lambda: (archive_all(), set()))
+    monkeypatch.setattr(service, "_clear_models", lambda: (Signal, UserTrade))
 
     def clear_model(model):
         events.append(f"clear:{model.__table__.name}")
@@ -186,10 +172,11 @@ def test_prepare_archives_every_durable_table_before_any_clear(monkeypatch) -> N
     assert summary["stock_opportunity_states_before_clear"] == {"OBSERVING": 2}
 
 
-def test_prepare_blocks_before_archive_when_unresolved_trades_exist(monkeypatch) -> None:
+def test_prepare_logs_unresolved_trades_and_continues(monkeypatch) -> None:
     service = DayPrepService(
         DayPrepConfig(
             strict_unresolved_trade_check=True,
+            clear_oms_current_state=False,
             virtual_autologin_userids=[],
         )
     )
@@ -200,11 +187,90 @@ def test_prepare_blocks_before_archive_when_unresolved_trades_exist(monkeypatch)
         "_unresolved_trade_rows",
         lambda: [{"id": 7, "entry_status": "FILLED", "exit_status": "NONE"}],
     )
-    monkeypatch.setattr(service, "_archive_rows", lambda: events.append("archive"))
+    monkeypatch.setattr(service, "_opportunity_state_counts", lambda: {})
+    monkeypatch.setattr(
+        service,
+        "_archive_rows",
+        lambda: (events.append("archive") or {}, set()),
+    )
+    monkeypatch.setattr(service, "_clear_models", lambda: ())
+    monkeypatch.setattr(service, "_reset_user_logins", lambda: 0)
+    monkeypatch.setattr(service, "_enable_virtual_users", lambda: (0, []))
 
-    with pytest.raises(RuntimeError, match="unresolved trades"):
-        service.prepare()
-    assert events == []
+    summary = service.prepare()
+
+    assert events == ["archive"]
+    assert summary["success"] is True
+    assert summary["completed_with_errors"] is True
+    assert summary["unresolved_trade_count"] == 1
+
+
+def test_prepare_skips_clear_for_failed_archive_and_continues(monkeypatch) -> None:
+    service = DayPrepService(
+        DayPrepConfig(
+            clear_oms_current_state=False,
+            virtual_autologin_userids=[],
+        )
+    )
+    events: list[str] = []
+    monkeypatch.setattr(service, "_verify_tables_exist", lambda: None)
+    monkeypatch.setattr(service, "_unresolved_trade_rows", lambda: [])
+    monkeypatch.setattr(service, "_opportunity_state_counts", lambda: {})
+    monkeypatch.setattr(
+        service,
+        "_archive_rows",
+        lambda: ({"signals": {"success": False}}, {Signal.__table__.name}),
+    )
+    monkeypatch.setattr(service, "_clear_models", lambda: (Signal, UserTrade))
+
+    def clear_model(model):
+        events.append(model.__table__.name)
+        return ClearResult(model.__table__.name, 1, 0)
+
+    monkeypatch.setattr(service, "_clear_model", clear_model)
+    monkeypatch.setattr(service, "_reset_user_logins", lambda: 0)
+    monkeypatch.setattr(service, "_enable_virtual_users", lambda: (0, []))
+
+    summary = service.prepare()
+
+    assert events == [UserTrade.__table__.name]
+    assert summary["cleared"][Signal.__table__.name] == {
+        "table": Signal.__table__.name,
+        "skipped": True,
+        "reason": "ARCHIVE_FAILED",
+    }
+    assert summary["archive_failed_tables"] == [Signal.__table__.name]
+    assert summary["completed_with_errors"] is True
+
+
+def test_prepare_logs_clear_failure_and_continues(monkeypatch) -> None:
+    service = DayPrepService(
+        DayPrepConfig(
+            clear_oms_current_state=False,
+            virtual_autologin_userids=[],
+        )
+    )
+    monkeypatch.setattr(service, "_verify_tables_exist", lambda: None)
+    monkeypatch.setattr(service, "_unresolved_trade_rows", lambda: [])
+    monkeypatch.setattr(service, "_opportunity_state_counts", lambda: {})
+    monkeypatch.setattr(service, "_archive_rows", lambda: ({}, set()))
+    monkeypatch.setattr(service, "_clear_models", lambda: (Signal, UserTrade))
+
+    def clear_model(model):
+        if model is Signal:
+            raise RuntimeError("clear failed")
+        return ClearResult(model.__table__.name, 1, 0)
+
+    monkeypatch.setattr(service, "_clear_model", clear_model)
+    monkeypatch.setattr(service, "_reset_user_logins", lambda: 0)
+    monkeypatch.setattr(service, "_enable_virtual_users", lambda: (0, []))
+
+    summary = service.prepare()
+
+    assert summary["cleared"][Signal.__table__.name]["success"] is False
+    assert summary["cleared"][UserTrade.__table__.name]["success"] is True
+    assert summary["clear_failed_tables"] == [Signal.__table__.name]
+    assert summary["completed_with_errors"] is True
 
 
 def test_user_access_token_contract_and_day_prep_migration() -> None:

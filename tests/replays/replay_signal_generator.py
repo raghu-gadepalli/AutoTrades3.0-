@@ -68,7 +68,8 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--date",
+        "--day", "--date",
+        dest="date",
         default=DEFAULT_TRADING_DAY,
         help=f"Trading day YYYY-MM-DD (default: {DEFAULT_TRADING_DAY})",
     )
@@ -542,10 +543,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     evaluation_outcome_counts: Counter[str] = Counter()
     advisor_action_counts: Counter[str] = Counter()
     advisor_context_presence_counts: Counter[str] = Counter()
-    stock_rank_availability_counts: Counter[str] = Counter()
-    stock_rank_tier_counts: Counter[str] = Counter()
-    stock_rank_freshness_counts: Counter[str] = Counter()
-    stock_rank_influence_counts: Counter[str] = Counter()
     market_regime_availability_counts: Counter[str] = Counter()
     market_regime_state_counts: Counter[str] = Counter()
     market_regime_influence_counts: Counter[str] = Counter()
@@ -630,18 +627,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 advisor_action_counts[str(advisor_action)] += 1
                 advisor_context_presence_counts[
                     "PRESENT" if context_fields["advisor_context_present"] else "MISSING"
-                ] += 1
-                stock_rank_availability_counts[
-                    str(context_fields["stock_rank_availability"])
-                ] += 1
-                stock_rank_tier_counts[
-                    str(context_fields["stock_rank_attention_tier"] or "UNAVAILABLE")
-                ] += 1
-                stock_rank_freshness_counts[
-                    "FRESH" if context_fields["stock_rank_fresh"] else "NOT_FRESH"
-                ] += 1
-                stock_rank_influence_counts[
-                    str(context_fields["stock_rank_influence"])
                 ] += 1
                 market_regime_availability_counts[
                     str(context_fields["market_regime_availability"])
@@ -839,16 +824,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "advisor_context_presence_counts": dict(
             sorted(advisor_context_presence_counts.items())
         ),
-        "stock_rank_availability_counts": dict(
-            sorted(stock_rank_availability_counts.items())
-        ),
-        "stock_rank_tier_counts": dict(sorted(stock_rank_tier_counts.items())),
-        "stock_rank_freshness_counts": dict(
-            sorted(stock_rank_freshness_counts.items())
-        ),
-        "stock_rank_influence_counts": dict(
-            sorted(stock_rank_influence_counts.items())
-        ),
         "market_regime_availability_counts": dict(
             sorted(market_regime_availability_counts.items())
         ),
@@ -888,18 +863,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         "advisor_context_presence_counts": json.dumps(
             summary["advisor_context_presence_counts"], sort_keys=True
-        ),
-        "stock_rank_availability_counts": json.dumps(
-            summary["stock_rank_availability_counts"], sort_keys=True
-        ),
-        "stock_rank_tier_counts": json.dumps(
-            summary["stock_rank_tier_counts"], sort_keys=True
-        ),
-        "stock_rank_freshness_counts": json.dumps(
-            summary["stock_rank_freshness_counts"], sort_keys=True
-        ),
-        "stock_rank_influence_counts": json.dumps(
-            summary["stock_rank_influence_counts"], sort_keys=True
         ),
         "market_regime_availability_counts": json.dumps(
             summary["market_regime_availability_counts"], sort_keys=True

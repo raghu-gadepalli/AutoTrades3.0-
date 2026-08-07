@@ -41,7 +41,7 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate Auction setup events without downstream writes."
     )
-    parser.add_argument("--date", default=DEFAULT_TRADING_DAY)
+    parser.add_argument("--day", "--date", dest="date", default=DEFAULT_TRADING_DAY)
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument(
         "--csv",

@@ -2,7 +2,7 @@
 
 These enums are intentionally separate from ``enums.auction_engine``. Auction
 owns stock-level observation and setup authority; this module owns external
-context supplied to StockAdvisor by StockRank and Market Regime services.
+context supplied to StockAdvisor by external market-context services.
 """
 from __future__ import annotations
 
@@ -26,11 +26,6 @@ class ContextInfluence(_StringEnum):
     WEIGHTED = "WEIGHTED"
 
 
-class StockRankTier(_StringEnum):
-    PRIORITY = "PRIORITY"
-    SECONDARY = "SECONDARY"
-    SUPPRESSED = "SUPPRESSED"
-
 
 class MarketRegimeState(_StringEnum):
     UNKNOWN = "UNKNOWN"
@@ -46,6 +41,5 @@ class MarketRegimeState(_StringEnum):
 __all__ = [
     "ContextAvailability",
     "ContextInfluence",
-    "StockRankTier",
     "MarketRegimeState",
 ]

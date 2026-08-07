@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -362,8 +363,77 @@ def _generate_for_symbol(
     return "NOT_WRITTEN"
 
 
-def main():
-    setup_logging(log_file="replay_snapshots.log")
+def _args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate historical snapshots. Defaults live in this file; CLI "
+            "values override them."
+        )
+    )
+    parser.add_argument("--day", default=START.date().isoformat())
+    parser.add_argument("--start-time", default=START.strftime("%H:%M:%S"))
+    parser.add_argument("--end-time", default=END.strftime("%H:%M:%S"))
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="Override SYMBOLS; comma-separated items are also accepted",
+    )
+    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    parser.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="Ignore the intraday active flag; enabled universe policy remains enforced",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate rows even when the exact snapshot already exists",
+    )
+    parser.add_argument("--data-user", default=DATA_USER_ID)
+    parser.add_argument("--api-key", default=API_KEY_OVERRIDE)
+    parser.add_argument("--access-token", default=ACCESS_TOKEN_OVERRIDE)
+    parser.add_argument("--log-file", default="replay_snapshots.log")
+    return parser.parse_args(argv)
+
+
+def _cli_symbols(raw: Optional[List[str]]) -> List[str]:
+    if raw is None:
+        return list(SYMBOLS)
+    out: List[str] = []
+    seen = set()
+    for value in raw:
+        for item in str(value or "").split(","):
+            symbol = item.strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                out.append(symbol)
+    if not out:
+        raise ValueError("--symbols cannot be empty")
+    return out
+
+
+def _cli_datetime(day_raw: str, clock_raw: str) -> datetime:
+    replay_day = datetime.fromisoformat(str(day_raw)).date()
+    clock = datetime.strptime(str(clock_raw), "%H:%M:%S").time()
+    return datetime.combine(replay_day, clock, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+def main(argv: Optional[List[str]] = None):
+    args = _args(argv)
+    global START, END, SYMBOLS, MAX_WORKERS, ACTIVE_ONLY
+    global SKIP_EXISTING_SNAPSHOTS, DATA_USER_ID, API_KEY_OVERRIDE, ACCESS_TOKEN_OVERRIDE
+    START = _cli_datetime(args.day, args.start_time)
+    END = _cli_datetime(args.day, args.end_time)
+    SYMBOLS = _cli_symbols(args.symbols)
+    MAX_WORKERS = max(1, int(args.max_workers))
+    ACTIVE_ONLY = False if args.include_inactive else ACTIVE_ONLY
+    SKIP_EXISTING_SNAPSHOTS = False if args.force else SKIP_EXISTING_SNAPSHOTS
+    DATA_USER_ID = str(args.data_user).strip()
+    API_KEY_OVERRIDE = str(args.api_key or "").strip()
+    ACCESS_TOKEN_OVERRIDE = str(args.access_token or "").strip()
+
+    setup_logging(log_file=args.log_file)
     logger = logging.getLogger(__name__)
 
     # Resolve all startup dependencies before spawning worker processes.
@@ -405,7 +475,7 @@ def main():
 
             if expected_snapshot_time is None:
                 logger.info("Skipping tick %s: no completed candle yet", current)
-                current += timedelta(minutes=3)
+                current += timedelta(minutes=TF_PRIMARY_MIN)
                 continue
 
             symbols_to_generate = _missing_symbols_for_time(symbols, expected_snapshot_time)
@@ -420,7 +490,7 @@ def main():
                     skipped_existing,
                     elapsed,
                 )
-                current += timedelta(minutes=3)
+                current += timedelta(minutes=TF_PRIMARY_MIN)
                 continue
 
             logger.info(
@@ -492,7 +562,7 @@ def main():
                 elapsed,
             )
 
-            current += timedelta(minutes=3)
+            current += timedelta(minutes=TF_PRIMARY_MIN)
 
     logger.info("Finished replay_snapshots")
 

@@ -4,8 +4,8 @@
 This operation owns ``symbols.enabled``.  The configured whitelist and
 blacklist come from ``SCANNER_CONFIG.universe`` through ``utils.universe_policy``.
 For all other EQ symbols, a live broker quote enforces the configured minimum
-price (₹200 by default).  ATR, beta, first-candle movement, active-universe
-selection and StockRank are intentionally outside this program.
+price (₹200 by default).  ATR, beta, first-candle movement, and active-universe
+selection are intentionally outside this program.
 
 The default is review mode.  Pass ``--apply`` to persist enabled decisions and
 refresh the stored EQ price.  ``symbols.active`` and runtime signal flags are
