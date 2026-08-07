@@ -582,7 +582,12 @@ def _deferred_entry_advisor_decision(signal: SignalSchema):
     evaluation_time = to_ist_naive(evaluation_time)
     assert evaluation_time is not None
     age_minutes = (evaluation_time - created_time).total_seconds() / 60.0
-    if age_minutes < STOCK_ADVISOR_CONFIG.deferred_entry.min_age_minutes:
+    # The StockMap research gate must apply from the first deployment check.
+    # Otherwise the legacy maturation window would ALLOW before re-entry.
+    if (
+        not STOCK_ADVISOR_CONFIG.stockmap_boundary_transition.enabled
+        and age_minutes < STOCK_ADVISOR_CONFIG.deferred_entry.min_age_minutes
+    ):
         return AdvisorDecision(
             symbol=symbol,
             snapshot_time=evaluation_time,

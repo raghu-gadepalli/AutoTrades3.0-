@@ -90,6 +90,20 @@ class RepeatedEpisodePolicyConfig(BaseModel):
     balance_min_failed_escapes: int = Field(default=1, ge=1)
 
 
+class StockMapBoundaryTransitionPolicyConfig(BaseModel):
+    """Research-only gate for causal StockMap reversal re-entry deployment."""
+
+    model_config = STRICT_CONFIG
+
+    enabled: bool = True
+    research_only: bool = True
+    exclusive: bool = True
+    families: Tuple[str, ...] = ("REVERSAL",)
+    non_applicable_action: AdvisorRuleAction = "WATCH"
+    wait_action: AdvisorRuleAction = "WATCH"
+    allow_action: AdvisorRuleAction = "ALLOW"
+
+
 class DeferredEntryFreshnessPolicyConfig(BaseModel):
     model_config = STRICT_CONFIG
 
@@ -144,6 +158,9 @@ class StockAdvisorPolicyConfig(BaseModel):
     repeated_episode: RepeatedEpisodePolicyConfig = Field(
         default_factory=RepeatedEpisodePolicyConfig
     )
+    stockmap_boundary_transition: StockMapBoundaryTransitionPolicyConfig = Field(
+        default_factory=StockMapBoundaryTransitionPolicyConfig
+    )
     deferred_entry: DeferredEntryFreshnessPolicyConfig = Field(
         default_factory=DeferredEntryFreshnessPolicyConfig
     )
@@ -161,6 +178,19 @@ class StockAdvisorPolicyConfig(BaseModel):
             raise ValueError("barriers.action must remain WATCH")
         if self.deferred_entry.action != "WATCH":
             raise ValueError("deferred_entry.action must remain WATCH")
+        boundary = self.stockmap_boundary_transition
+        if boundary.non_applicable_action != "WATCH":
+            raise ValueError(
+                "stockmap_boundary_transition.non_applicable_action must remain WATCH"
+            )
+        if boundary.wait_action != "WATCH":
+            raise ValueError("stockmap_boundary_transition.wait_action must remain WATCH")
+        if boundary.allow_action != "ALLOW":
+            raise ValueError("stockmap_boundary_transition.allow_action must remain ALLOW")
+        if boundary.enabled and not boundary.exclusive:
+            raise ValueError(
+                "research stockmap_boundary_transition must remain exclusive when enabled"
+            )
         if self.stock_rank_context.influence != "DIAGNOSTIC":
             raise ValueError(
                 "stock_rank_context.influence must remain DIAGNOSTIC until replay validation"
@@ -183,6 +213,7 @@ __all__ = [
     "MatureRangeChurnPolicyConfig",
     "BarrierPolicyConfig",
     "RepeatedEpisodePolicyConfig",
+    "StockMapBoundaryTransitionPolicyConfig",
     "DeferredEntryFreshnessPolicyConfig",
     "StockAdvisorPolicyConfig",
     "STOCK_ADVISOR_CONFIG",

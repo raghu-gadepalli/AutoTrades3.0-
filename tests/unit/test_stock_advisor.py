@@ -160,3 +160,148 @@ def test_balance_candidate_rejects_reference_boundary_mismatch() -> None:
         assert str(exc) == "StockAdvisor candidate/source boundary mismatch"
     else:
         raise AssertionError("Expected source-boundary mismatch to fail loudly")
+
+
+
+def _stockmap_context(*, low: float = 99.0, high: float = 101.0, range_id: str = "SM:R1"):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from tests.unit.test_event_driven_setup_engine import TS
+
+    return SimpleNamespace(
+        stockmap_time=TS,
+        source_candle_time=TS - timedelta(minutes=15),
+        structure=SimpleNamespace(
+            accepted=SimpleNamespace(
+                frozen=True,
+                range=SimpleNamespace(
+                    range_id=range_id,
+                    low=low,
+                    high=high,
+                    breakout_eligible=True,
+                    provisional=False,
+                ),
+            )
+        ),
+    )
+
+
+def _deferred_signal(*, side: str, created_price: float, setup: str = "REVERSAL"):
+    from decimal import Decimal
+    from schemas.signal import SignalSchema
+    from tests.unit.test_event_driven_setup_engine import TS
+
+    return SignalSchema.model_construct(
+        signal_id=f"SIG:{side}:{created_price}",
+        equity_ref="TEST",
+        symbol="TEST",
+        lifecycle="INTRADAY",
+        setup=setup,
+        side=side,
+        first_seen_time=TS,
+        created_price=Decimal(str(created_price)),
+        last_eval_time=TS,
+        last_snapshot_time=TS,
+    )
+
+
+def _deferred_snapshot(*, close: float, minutes_after: int = 3):
+    from datetime import timedelta
+    from tests.unit.test_event_driven_setup_engine import TS
+
+    base = _event_snapshot(
+        AuctionEventType.DIRECTIONAL_REVERSED,
+        SetupFamily.REVERSAL,
+        direction=DirectionalBias.DOWN,
+        close=close,
+        data={"start_price": close + 1.0},
+    )
+    return base.model_copy(
+        update={
+            "symbol": "TEST",
+            "snapshot_time": TS + timedelta(minutes=minutes_after),
+            "close": close,
+        }
+    )
+
+
+def test_stockmap_sell_reversal_waits_until_frozen_high_reentry(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(side="SELL", created_price=102.0),
+        snapshot=_deferred_snapshot(close=101.4),
+    )
+
+    assert decision.action is AdvisorAction.WATCH
+    assert decision.reason_codes == ("STOCKMAP_REVERSAL_WAIT_REENTRY",)
+    details = decision.diagnostics["stockmap_boundary_transition"]
+    assert details["start_position"] == "ABOVE_RANGE"
+    assert details["frozen_high"] == 101.0
+
+
+def test_stockmap_sell_reversal_allows_first_completed_reentry(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(side="SELL", created_price=102.0),
+        snapshot=_deferred_snapshot(close=100.8),
+    )
+
+    assert decision.action is AdvisorAction.ALLOW
+    assert decision.reason_codes == ("STOCKMAP_REVERSAL_REENTRY_CONFIRMED",)
+    assert decision.diagnostics["stockmap_boundary_transition"]["range_id"] == "SM:R1"
+
+
+def test_stockmap_buy_reversal_allows_reentry_above_frozen_low(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(side="BUY", created_price=98.0),
+        snapshot=_deferred_snapshot(close=99.2),
+    )
+
+    assert decision.action is AdvisorAction.ALLOW
+    details = decision.diagnostics["stockmap_boundary_transition"]
+    assert details["start_position"] == "BELOW_RANGE"
+    assert details["required_transition"] == "BELOW_TO_INSIDE"
+
+
+def test_stockmap_research_gate_defers_non_selected_signal(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(
+            side="SELL",
+            created_price=102.0,
+            setup="FAILED_BREAKOUT",
+        ),
+        snapshot=_deferred_snapshot(close=100.8),
+    )
+
+    assert decision.action is AdvisorAction.WATCH
+    assert decision.reason_codes == ("STOCKMAP_BOUNDARY_TRANSITION_SETUP_NOT_SELECTED",)

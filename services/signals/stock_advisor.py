@@ -15,6 +15,7 @@ from configs.stock_advisor_config import STOCK_ADVISOR_CONFIG, StockAdvisorPolic
 from enums.auction_engine import AdvisorAction, AuctionEventType, SetupFamily, TradeSide
 from schemas.signal import SignalSchema
 from schemas.snapshot import SnapshotSchema
+from schemas.stockmap import StockMapSchema
 from services.auction_engine.contracts import AdvisorDecision
 from services.auction_engine.setup_contracts import AuthoritativeSetupCandidate
 from services.advisor_context.service import (
@@ -252,6 +253,14 @@ class StockAdvisor:
             as_of=snapshot.snapshot_time,
         )
 
+        if self.policy.enabled and self.policy.stockmap_boundary_transition.enabled:
+            return self._evaluate_stockmap_boundary_transition(
+                signal=signal,
+                snapshot=snapshot,
+                side=side,
+                advisor_context=advisor_context,
+            )
+
         if not self.policy.enabled or not self.policy.deferred_entry.enabled:
             summary = DeferredEntryFreshnessSummary(
                 applicable=False,
@@ -309,6 +318,138 @@ class StockAdvisor:
                 "advisor_context": advisor_context.to_diagnostics(),
             },
         )
+
+    def _evaluate_stockmap_boundary_transition(
+        self,
+        *,
+        signal: SignalSchema,
+        snapshot: SnapshotSchema,
+        side: TradeSide,
+        advisor_context: StockAdvisorContextAssessment,
+    ) -> AdvisorDecision:
+        """Gate deployment on re-entry through the creation-time StockMap range."""
+        policy = self.policy.stockmap_boundary_transition
+        symbol = snapshot.symbol.strip().upper()
+        setup = str(getattr(signal.setup, "value", signal.setup) or "").strip().upper()
+        selected_families = self._normalised(policy.families)
+
+        base_diagnostics: Dict[str, Any] = {
+            "deployment_scope": "DEFERRED_TRADE_ENTRY_ONLY",
+            "research_policy": "STOCKMAP_BOUNDARY_TRANSITION_V1",
+            "exclusive": bool(policy.exclusive),
+            "signal_id": signal.signal_id,
+            "signal_setup": setup,
+            "signal_side": side.value,
+            "signal_first_seen_time": signal.first_seen_time,
+            "advisor_context": advisor_context.to_diagnostics(),
+        }
+
+        def decision(action_text: str, reason: str, details: Dict[str, Any]) -> AdvisorDecision:
+            return AdvisorDecision(
+                symbol=symbol,
+                snapshot_time=snapshot.snapshot_time,
+                action=AdvisorAction(action_text),
+                selected_candidate_id=str(signal.signal_id),
+                reason_codes=(reason,),
+                diagnostics={
+                    **base_diagnostics,
+                    "stockmap_boundary_transition": details,
+                },
+            )
+
+        if setup not in selected_families:
+            return decision(
+                policy.non_applicable_action,
+                "STOCKMAP_BOUNDARY_TRANSITION_SETUP_NOT_SELECTED",
+                {"applicable": False, "selected_families": sorted(selected_families)},
+            )
+
+        creation_time = self._naive_time(signal.first_seen_time)
+        creation_map = StockMapSchema.fetch_latest_for_symbol_asof(symbol, creation_time)
+        if creation_map is None:
+            return decision(
+                policy.wait_action,
+                "STOCKMAP_CREATION_CONTEXT_UNAVAILABLE",
+                {"applicable": True, "creation_stockmap_time": None},
+            )
+
+        accepted = creation_map.structure.accepted
+        accepted_range = accepted.range
+        range_valid = bool(
+            accepted_range is not None
+            and accepted_range.low is not None
+            and accepted_range.high is not None
+            and accepted_range.breakout_eligible
+            and not accepted_range.provisional
+            and accepted.frozen
+        )
+        if not range_valid:
+            return decision(
+                policy.wait_action,
+                "STOCKMAP_CREATION_ACCEPTED_RANGE_UNAVAILABLE",
+                {
+                    "applicable": True,
+                    "creation_stockmap_time": creation_map.stockmap_time,
+                    "creation_source_candle_time": creation_map.source_candle_time,
+                    "range_id": getattr(accepted_range, "range_id", None),
+                },
+            )
+
+        low = float(accepted_range.low)
+        high = float(accepted_range.high)
+        if not math.isfinite(low) or not math.isfinite(high) or low <= 0.0 or high <= low:
+            raise ValueError("StockAdvisor StockMap creation range has invalid geometry")
+
+        created_price = float(signal.created_price)
+        current_price = float(snapshot.close)
+        if (
+            not math.isfinite(created_price)
+            or created_price <= 0.0
+            or not math.isfinite(current_price)
+            or current_price <= 0.0
+        ):
+            raise ValueError("StockAdvisor StockMap boundary transition requires valid prices")
+
+        if created_price < low:
+            start_position = "BELOW_RANGE"
+        elif created_price > high:
+            start_position = "ABOVE_RANGE"
+        else:
+            start_position = "INSIDE_RANGE"
+
+        opposite_outside = bool(
+            (side is TradeSide.BUY and created_price < low)
+            or (side is TradeSide.SELL and created_price > high)
+        )
+        current_inside = bool(low <= current_price <= high)
+        details = {
+            "applicable": True,
+            "creation_stockmap_time": creation_map.stockmap_time,
+            "creation_source_candle_time": creation_map.source_candle_time,
+            "range_id": accepted_range.range_id,
+            "frozen_low": low,
+            "frozen_high": high,
+            "signal_created_price": created_price,
+            "start_position": start_position,
+            "opposite_outside_at_creation": opposite_outside,
+            "current_snapshot_time": snapshot.snapshot_time,
+            "current_price": current_price,
+            "current_inside_frozen_range": current_inside,
+            "required_transition": (
+                "BELOW_TO_INSIDE" if side is TradeSide.BUY else "ABOVE_TO_INSIDE"
+            ),
+        }
+
+        if not opposite_outside:
+            return decision(
+                policy.non_applicable_action,
+                "STOCKMAP_REVERSAL_NOT_OUTSIDE_OPPOSITE_BOUNDARY",
+                details,
+            )
+        if not current_inside:
+            return decision(policy.wait_action, "STOCKMAP_REVERSAL_WAIT_REENTRY", details)
+        return decision(policy.allow_action, "STOCKMAP_REVERSAL_REENTRY_CONFIRMED", details)
+
 
     @staticmethod
     def _validate_candidate_inputs(
