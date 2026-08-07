@@ -1,0 +1,134 @@
+--- a/tests/replays/replay_price_provider.py
++++ b/tests/replays/replay_price_provider.py
+@@ -12,10 +12,11 @@
+ 
+ The 1-minute path is a read-through cache:
+ 1. If the exact replay-minute candle is already in ``candles``, use DB data.
+-2. If it is missing, fetch historical 1-minute data from the broker, persist
+-   only candle records that are not already present, then read the price from
+-   ``candles``.
+-3. If no causal candle exists after hydration, raise an explicit replay price
++2. If it is missing, fetch one week of historical 1-minute data ending at the
++   replay clock, select only the latest causal candle, and persist only that
++   selected candle when it is not already present.
++3. Return the latest persisted candle CLOSE at or before the replay clock.
++4. If no causal candle exists after hydration, raise an explicit replay price
+    error.  There is no fallback to snapshot/planned/live prices.
+ 
+ Production TradeExecutor and TradeMonitor code is not modified.
+@@ -104,7 +105,7 @@
+     return _replay_minute(value)
+ 
+ 
+-def _persist_missing_candles(symbol: str, records: Any, replay_minute: datetime) -> tuple[int, int]:
++def _latest_api_candle(records: Any, replay_minute: datetime, symbol: str) -> Optional[dict]:
+     if records is None:
+         records = []
+     if not isinstance(records, list):
+@@ -113,8 +114,8 @@
+             f"type={type(records).__name__}"
+         )
+ 
+-    written = 0
+-    skipped = 0
++    latest_raw: Optional[dict] = None
++    latest_time: Optional[datetime] = None
+     for raw in records:
+         if not isinstance(raw, dict):
+             raise ReplayPriceProviderError(
+@@ -124,28 +125,36 @@
+         candle_time = _raw_candle_time(raw)
+         if candle_time > replay_minute:
+             continue
+-
+-        if _exact_candle(symbol, candle_time) is not None:
+-            skipped += 1
+-            continue
+-
+-        CandleSchema.create_candle(
+-            {
+-                "symbol": symbol,
+-                "frequency": 1,
+-                "candle_time": candle_time,
+-                "open": float(raw["open"]),
+-                "high": float(raw["high"]),
+-                "low": float(raw["low"]),
+-                "close": float(raw["close"]),
+-                "volume": float(raw.get("volume") or 0),
+-                "oi": float(raw.get("oi") or 0),
+-                "active": True,
+-            }
+-        )
+-        written += 1
+-
+-    return written, skipped
++        if latest_time is None or candle_time > latest_time:
++            latest_raw = raw
++            latest_time = candle_time
++
++    return latest_raw
++
++
++def _persist_selected_candle(symbol: str, raw: Optional[dict]) -> tuple[int, int]:
++    if raw is None:
++        return 0, 0
++
++    candle_time = _raw_candle_time(raw)
++    if _exact_candle(symbol, candle_time) is not None:
++        return 0, 1
++
++    CandleSchema.create_candle(
++        {
++            "symbol": symbol,
++            "frequency": 1,
++            "candle_time": candle_time,
++            "open": float(raw["open"]),
++            "high": float(raw["high"]),
++            "low": float(raw["low"]),
++            "close": float(raw["close"]),
++            "volume": float(raw.get("volume") or 0),
++            "oi": float(raw.get("oi") or 0),
++            "active": True,
++        }
++    )
++    return 1, 0
+ 
+ 
+ def _hydrate_from_historical_api(symbol: str, replay_minute: datetime) -> None:
+@@ -154,13 +163,10 @@
+     if broker is None:
+         raise ReplayPriceProviderError(f"REPLAY_PRICE_BROKER_UNAVAILABLE symbol={symbol}")
+ 
+-    latest = _latest_candle(symbol, replay_minute)
+-    from_naive = (
+-        latest.candle_time
+-        if latest is not None
+-        else replay_minute - timedelta(days=7)
+-    )
+-    from_date = from_naive.replace(tzinfo=executor_module.IST)
++    # Always request one full week on a cache miss.  This keeps the API path
++    # simple and gives sparse derivatives a prior traded price without making
++    # additional progressive lookback calls.
++    from_date = (replay_minute - timedelta(days=7)).replace(tzinfo=executor_module.IST)
+     to_date = (replay_minute + timedelta(minutes=1)).replace(tzinfo=executor_module.IST)
+ 
+     records = broker.svc.fetch_historical_data(
+@@ -170,12 +176,16 @@
+         interval="minute",
+         oi=True,
+     )
+-    written, skipped = _persist_missing_candles(symbol, records, replay_minute)
++    selected = _latest_api_candle(records, replay_minute, symbol)
++    written, skipped = _persist_selected_candle(symbol, selected)
++    selected_time = _raw_candle_time(selected) if selected is not None else None
+     logger.info(
+-        "REPLAY_PRICE_HYDRATE | symbol=%s through=%s received=%d written=%d skipped_existing=%d",
++        "REPLAY_PRICE_HYDRATE | symbol=%s through=%s received=%d selected=%s "
++        "written=%d skipped_existing=%d",
+         symbol,
+         replay_minute,
+         len(records or []),
++        selected_time,
+         written,
+         skipped,
+     )
