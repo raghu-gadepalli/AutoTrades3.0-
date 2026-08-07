@@ -65,11 +65,7 @@ from services.trade.generator import tradegen_helper as tradegen_helper_module
 from services.trade.generator import tradegen_validator as tradegen_validator_module
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
-from tests.replays.replay_execution_prices import (
-    DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE,
-    SUPPORTED_REPLAY_PRICE_SOURCES,
-    replay_execution_price_source,
-)
+from tests.replays.replay_price_provider import replay_price_provider
 
 
 # =============================================================================
@@ -94,7 +90,6 @@ SIGNAL_MAX_WORKERS: int = 3
 SLOW_SIGNAL_SECONDS: float = 5.0
 
 LOG_FILE = "reports/replay_unprocessed.log"
-EXECUTION_PRICE_SOURCE = DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE
 IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
@@ -529,7 +524,7 @@ def run() -> int:
         with (
             _snapshot_execution_mode(),
             _deterministic_replay_clock() as set_time,
-            replay_execution_price_source(EXECUTION_PRICE_SOURCE),
+            replay_price_provider(),
         ):
             yield set_time
 
@@ -614,15 +609,6 @@ def _args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--userid", default=REPLAY_USERID)
     parser.add_argument("--max-workers", type=int, default=SIGNAL_MAX_WORKERS)
     parser.add_argument("--slow-signal-seconds", type=float, default=SLOW_SIGNAL_SECONDS)
-    parser.add_argument(
-        "--execution-price-source",
-        default=EXECUTION_PRICE_SOURCE,
-        choices=SUPPORTED_REPLAY_PRICE_SOURCES,
-        help=(
-            "Virtual replay fill source; 1m_candle is strict/no-fallback and "
-            f"snapshot preserves prior behavior (default: {EXECUTION_PRICE_SOURCE})"
-        ),
-    )
     parser.add_argument("--log-file", default=LOG_FILE)
     return parser.parse_args(argv)
 
@@ -630,25 +616,23 @@ def _args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _args(argv)
     global logger, GENERATE_TRADES, REPLAY_USERID, SIGNAL_MAX_WORKERS
-    global SLOW_SIGNAL_SECONDS, LOG_FILE, EXECUTION_PRICE_SOURCE
+    global SLOW_SIGNAL_SECONDS, LOG_FILE
     GENERATE_TRADES = bool(args.generate_trades)
     REPLAY_USERID = str(args.userid).strip() if args.userid is not None else None
     SIGNAL_MAX_WORKERS = max(1, int(args.max_workers))
     SLOW_SIGNAL_SECONDS = max(0.0, float(args.slow_signal_seconds))
     LOG_FILE = str(args.log_file)
-    EXECUTION_PRICE_SOURCE = str(args.execution_price_source).strip().lower()
 
     setup_logging(log_file=LOG_FILE)
     logger = logging.getLogger(__name__)
 
     logger.info(
         "Starting replay_unprocessed | generate_trades=%s userid=%s "
-        "signal_workers=%d execution_price_source=%s snapshot_generation=NEVER "
+        "signal_workers=%d snapshot_generation=NEVER "
         "clearing=NEVER processing=LIVE_CADENCE_THREADED",
         GENERATE_TRADES,
         REPLAY_USERID if GENERATE_TRADES else "NOT_USED",
         SIGNAL_MAX_WORKERS,
-        EXECUTION_PRICE_SOURCE,
     )
 
     try:

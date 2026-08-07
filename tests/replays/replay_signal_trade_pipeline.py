@@ -81,11 +81,7 @@ from services.account_governor.reporting import (
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
 from utils.json_utils import sanitize_json
-from tests.replays.replay_execution_prices import (
-    DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE,
-    SUPPORTED_REPLAY_PRICE_SOURCES,
-    replay_execution_price_source,
-)
+from tests.replays.replay_price_provider import replay_price_provider
 
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger(__name__)
@@ -105,7 +101,6 @@ DEFAULT_END_TIME: Optional[str] = None
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_REPORT_DIR = "reports"
 DEFAULT_LOG_FILE: Optional[str] = None
-DEFAULT_EXECUTION_PRICE_SOURCE = DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE
 
 _EXPECTED_TRADEGEN_NONFATAL = {
     "TRADE_DECISION_NOT_ALLOWED",
@@ -219,16 +214,6 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help=f"Snapshot fetch batch size (default: {DEFAULT_BATCH_SIZE})",
-    )
-    parser.add_argument(
-        "--execution-price-source",
-        default=DEFAULT_EXECUTION_PRICE_SOURCE,
-        choices=SUPPORTED_REPLAY_PRICE_SOURCES,
-        help=(
-            "Virtual replay fill source. 1m_candle uses exact persisted one-minute "
-            "candle OPEN with no fallback; snapshot preserves prior replay behavior "
-            f"(default: {DEFAULT_EXECUTION_PRICE_SOURCE})"
-        ),
     )
     parser.add_argument("--report-dir", default=DEFAULT_REPORT_DIR)
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
@@ -1255,7 +1240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info(
         "Resolved replay configuration | database=%s date=%s symbols=%s userid=%s "
         "instrument=%s test_mode=%s clear_data=%s require_trade=%s "
-        "require_exit=%s require_derivatives=%s execution_price_source=%s report_dir=%s",
+        "require_exit=%s require_derivatives=%s report_dir=%s",
         database_name,
         trading_day,
         symbols,
@@ -1266,7 +1251,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bool(args.require_trade),
         bool(args.require_exit),
         bool(args.require_derivatives),
-        args.execution_price_source,
         report_dir,
     )
     _validate_replay_user(userid, instrument_choice)
@@ -1346,7 +1330,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             trading_day=trading_day,
             symbols=symbols,
             userid=userid,
-        ), _deterministic_replay_clock() as set_replay_time, _monitor_test_policy(test_mode), replay_execution_price_source(args.execution_price_source):
+        ), _deterministic_replay_clock() as set_replay_time, _monitor_test_policy(test_mode), replay_price_provider():
             for index, snapshot in enumerate(snapshots, start=1):
                 set_replay_time(snapshot.snapshot_time)
                 signal_action = SignalGenerator(snapshot).generate() or "NO_ACTION"

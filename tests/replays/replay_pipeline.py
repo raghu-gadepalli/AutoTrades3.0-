@@ -66,11 +66,7 @@ from services.snapshot.snapshot_generator import SnapshotGenerator
 from services.trade.executor.trade_executor import TradeExecutor
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
-from tests.replays.replay_execution_prices import (
-    DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE,
-    SUPPORTED_REPLAY_PRICE_SOURCES,
-    replay_execution_price_source,
-)
+from tests.replays.replay_price_provider import replay_price_provider
 
 
 # =============================================================================
@@ -107,7 +103,6 @@ CLEAR_DATA: bool = False
 GENERATE_CSV_REPORTS: bool = True
 REPORT_DIR = Path("reports")
 LOG_FILE = REPORT_DIR / "replay_pipeline.log"
-EXECUTION_PRICE_SOURCE = DEFAULT_REPLAY_EXECUTION_PRICE_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -722,15 +717,6 @@ def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--access-token", default=ACCESS_TOKEN_OVERRIDE)
     parser.add_argument("--report-dir", default=str(REPORT_DIR))
     parser.add_argument("--log-file", default=None)
-    parser.add_argument(
-        "--execution-price-source",
-        default=EXECUTION_PRICE_SOURCE,
-        choices=SUPPORTED_REPLAY_PRICE_SOURCES,
-        help=(
-            "Virtual replay fill source; 1m_candle is strict/no-fallback and "
-            f"snapshot preserves prior behavior (default: {EXECUTION_PRICE_SOURCE})"
-        ),
-    )
     return parser.parse_args(argv)
 
 
@@ -760,7 +746,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _args(argv)
     global logger, START, END, STEP_MINUTES, SYMBOLS, REPLAY_USERID
     global DATA_USER_ID, API_KEY_OVERRIDE, ACCESS_TOKEN_OVERRIDE, CLEAR_DATA
-    global GENERATE_CSV_REPORTS, REPORT_DIR, LOG_FILE, EXECUTION_PRICE_SOURCE
+    global GENERATE_CSV_REPORTS, REPORT_DIR, LOG_FILE
 
     START = _cli_datetime(args.day, args.start_time)
     END = _cli_datetime(args.day, args.end_time)
@@ -774,7 +760,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     GENERATE_CSV_REPORTS = bool(args.csv_reports)
     REPORT_DIR = Path(args.report_dir)
     LOG_FILE = Path(args.log_file) if args.log_file else REPORT_DIR / "replay_pipeline.log"
-    EXECUTION_PRICE_SOURCE = str(args.execution_price_source).strip().lower()
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     setup_logging(log_file=str(LOG_FILE))
@@ -794,7 +779,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     logger.info(
         "Starting replay_pipeline | trading_day=%s start=%s end=%s step=%dm "
-        "symbols=%s replay_user=%s clear=%s csv_reports=%s execution_price_source=%s "
+        "symbols=%s replay_user=%s clear=%s csv_reports=%s "
         "data_user=%s credentials=%s",
         trading_day,
         START,
@@ -804,7 +789,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         REPLAY_USERID,
         CLEAR_DATA,
         GENERATE_CSV_REPORTS,
-        EXECUTION_PRICE_SOURCE,
         DATA_USER_ID,
         credential_source,
     )
@@ -826,7 +810,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     try:
-        with replay_execution_price_source(EXECUTION_PRICE_SOURCE):
+        with replay_price_provider():
             run_replay(
                 symbol_rows=symbol_rows,
                 api_key=api_key,
