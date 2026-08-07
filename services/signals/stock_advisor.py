@@ -8,6 +8,7 @@ raise; there is no fail-open path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -365,7 +366,8 @@ class StockAdvisor:
             )
 
         creation_time = self._naive_time(signal.first_seen_time)
-        creation_map = StockMapSchema.fetch_latest_for_symbol_asof(symbol, creation_time)
+        creation_map_asof = creation_time - timedelta(minutes=15)
+        creation_map = StockMapSchema.fetch_latest_for_symbol_asof(symbol, creation_map_asof)
         if creation_map is None:
             return decision(
                 policy.wait_action,
@@ -390,6 +392,7 @@ class StockAdvisor:
                 {
                     "applicable": True,
                     "creation_stockmap_time": creation_map.stockmap_time,
+                    "creation_stockmap_asof_time": creation_map_asof,
                     "range_id": getattr(accepted_range, "range_id", None),
                 },
             )
@@ -424,6 +427,7 @@ class StockAdvisor:
         details = {
             "applicable": True,
             "creation_stockmap_time": creation_map.stockmap_time,
+            "creation_stockmap_asof_time": creation_map_asof,
             "range_id": accepted_range.range_id,
             "frozen_low": low,
             "frozen_high": high,
