@@ -390,7 +390,6 @@ class StockAdvisor:
                 {
                     "applicable": True,
                     "creation_stockmap_time": creation_map.stockmap_time,
-                    "creation_source_candle_time": creation_map.source_candle_time,
                     "range_id": getattr(accepted_range, "range_id", None),
                 },
             )
@@ -425,7 +424,6 @@ class StockAdvisor:
         details = {
             "applicable": True,
             "creation_stockmap_time": creation_map.stockmap_time,
-            "creation_source_candle_time": creation_map.source_candle_time,
             "range_id": accepted_range.range_id,
             "frozen_low": low,
             "frozen_high": high,
