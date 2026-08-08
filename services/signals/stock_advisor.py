@@ -327,19 +327,21 @@ class StockAdvisor:
         side: TradeSide,
         advisor_context: StockAdvisorContextAssessment,
     ) -> AdvisorDecision:
-        """Gate deployment on causal failure away from a creation-time StockMap extreme."""
+        """Research gate: REVERSAL re-entry plus temporary BREAKOUT_INITIATION exception."""
         policy = self.policy.stockmap_boundary_transition
         symbol = snapshot.symbol.strip().upper()
         setup = str(getattr(signal.setup, "value", signal.setup) or "").strip().upper()
+        selected_setups = {"REVERSAL", "BREAKOUT_INITIATION"}
 
         base_diagnostics: Dict[str, Any] = {
             "deployment_scope": "DEFERRED_TRADE_ENTRY_ONLY",
-            "research_policy": "STOCKMAP_EXTREME_FAILURE_V2",
+            "research_policy": "STOCKMAP_REVERSAL_REENTRY_PLUS_BI_V2_1",
             "exclusive": bool(policy.exclusive),
             "signal_id": signal.signal_id,
             "signal_setup": setup,
             "signal_side": side.value,
             "signal_first_seen_time": signal.first_seen_time,
+            "selected_setups": sorted(selected_setups),
             "advisor_context": advisor_context.to_diagnostics(),
         }
 
@@ -353,6 +355,16 @@ class StockAdvisor:
                 diagnostics={
                     **base_diagnostics,
                     "stockmap_boundary_transition": details,
+                },
+            )
+
+        if setup not in selected_setups:
+            return decision(
+                policy.non_applicable_action,
+                "STOCKMAP_SETUP_NOT_SELECTED",
+                {
+                    "applicable": False,
+                    "selected_setups": sorted(selected_setups),
                 },
             )
 
@@ -419,9 +431,6 @@ class StockAdvisor:
             (side is TradeSide.BUY and current_price > created_price)
             or (side is TradeSide.SELL and current_price < created_price)
         )
-        failure_confirmed = bool(
-            subsequent_completed_observation and moved_away_from_extreme
-        )
         details = {
             "applicable": True,
             "creation_stockmap_time": creation_map.stockmap_time,
@@ -435,32 +444,57 @@ class StockAdvisor:
             "current_price": current_price,
             "subsequent_completed_observation": subsequent_completed_observation,
             "moved_away_from_extreme": moved_away_from_extreme,
-            "failure_confirmed": failure_confirmed,
             "current_inside_frozen_range": current_inside,
             "full_reentry_confirmed": current_inside,
-            "required_transition": (
-                "BELOW_AND_RISE" if side is TradeSide.BUY else "ABOVE_AND_FALL"
+            "confirmation_mode": (
+                "FROZEN_STOCKMAP_REENTRY"
+                if setup == "REVERSAL"
+                else "VALID_BALANCE_ESCAPE_AT_EXTREME"
             ),
         }
 
         if not extreme_location_met:
+            reason = (
+                "STOCKMAP_REVERSAL_NOT_OUTSIDE_OPPOSITE_BOUNDARY"
+                if setup == "REVERSAL"
+                else "STOCKMAP_BREAKOUT_INITIATION_EXTREME_LOCATION_NOT_MET"
+            )
+            return decision(policy.non_applicable_action, reason, details)
+
+        if setup == "REVERSAL":
+            details["required_transition"] = (
+                "BELOW_TO_INSIDE" if side is TradeSide.BUY else "ABOVE_TO_INSIDE"
+            )
+            if not current_inside:
+                return decision(
+                    policy.wait_action,
+                    "STOCKMAP_REVERSAL_WAIT_REENTRY",
+                    details,
+                )
             return decision(
-                policy.non_applicable_action,
-                "STOCKMAP_EXTREME_LOCATION_NOT_MET",
+                policy.allow_action,
+                "STOCKMAP_REVERSAL_REENTRY_CONFIRMED",
                 details,
             )
-        if not failure_confirmed:
+
+        # Temporary research exception.  Auction/setup evaluation has already
+        # proven BREAKOUT_INITIATION.  In the AUTO trade path, the strict
+        # favourable-price check runs before StockAdvisor, so require the same
+        # causal follow-through here as a defensive standalone contract.
+        details["required_transition"] = (
+            "BELOW_AND_RISE" if side is TradeSide.BUY else "ABOVE_AND_FALL"
+        )
+        if not subsequent_completed_observation or not moved_away_from_extreme:
             return decision(
                 policy.wait_action,
-                "STOCKMAP_EXTREME_WAIT_FAILURE_PROOF",
+                "STOCKMAP_BREAKOUT_INITIATION_WAIT_FOLLOW_THROUGH",
                 details,
             )
         return decision(
             policy.allow_action,
-            "STOCKMAP_EXTREME_FAILURE_CONFIRMED",
+            "STOCKMAP_BREAKOUT_INITIATION_EXTREME_CONFIRMED",
             details,
         )
-
 
     @staticmethod
     def _validate_candidate_inputs(

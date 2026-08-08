@@ -225,29 +225,7 @@ def _deferred_snapshot(*, close: float, minutes_after: int = 3):
     )
 
 
-def test_stockmap_sell_waits_until_price_moves_away_from_frozen_high(monkeypatch) -> None:
-    from schemas.stockmap import StockMapSchema
-
-    creation_map = _stockmap_context()
-    monkeypatch.setattr(
-        StockMapSchema,
-        "fetch_latest_for_symbol_asof",
-        staticmethod(lambda symbol, asof_time: creation_map),
-    )
-    decision = _advisor().evaluate_deferred_entry(
-        signal=_deferred_signal(side="SELL", created_price=102.0),
-        snapshot=_deferred_snapshot(close=102.2),
-    )
-
-    assert decision.action is AdvisorAction.WATCH
-    assert decision.reason_codes == ("STOCKMAP_EXTREME_WAIT_FAILURE_PROOF",)
-    details = decision.diagnostics["stockmap_boundary_transition"]
-    assert details["start_position"] == "ABOVE_RANGE"
-    assert details["extreme_location_met"] is True
-    assert details["moved_away_from_extreme"] is False
-
-
-def test_stockmap_sell_allows_failure_without_full_range_reentry(monkeypatch) -> None:
+def test_stockmap_sell_reversal_waits_until_frozen_high_reentry(monkeypatch) -> None:
     from schemas.stockmap import StockMapSchema
 
     creation_map = _stockmap_context()
@@ -261,14 +239,36 @@ def test_stockmap_sell_allows_failure_without_full_range_reentry(monkeypatch) ->
         snapshot=_deferred_snapshot(close=101.4),
     )
 
-    assert decision.action is AdvisorAction.ALLOW
-    assert decision.reason_codes == ("STOCKMAP_EXTREME_FAILURE_CONFIRMED",)
+    assert decision.action is AdvisorAction.WATCH
+    assert decision.reason_codes == ("STOCKMAP_REVERSAL_WAIT_REENTRY",)
     details = decision.diagnostics["stockmap_boundary_transition"]
-    assert details["full_reentry_confirmed"] is False
+    assert details["start_position"] == "ABOVE_RANGE"
     assert details["moved_away_from_extreme"] is True
+    assert details["full_reentry_confirmed"] is False
 
 
-def test_stockmap_buy_allows_failure_below_frozen_low(monkeypatch) -> None:
+def test_stockmap_sell_reversal_allows_first_completed_reentry(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(side="SELL", created_price=102.0),
+        snapshot=_deferred_snapshot(close=100.8),
+    )
+
+    assert decision.action is AdvisorAction.ALLOW
+    assert decision.reason_codes == ("STOCKMAP_REVERSAL_REENTRY_CONFIRMED",)
+    details = decision.diagnostics["stockmap_boundary_transition"]
+    assert details["full_reentry_confirmed"] is True
+    assert details["confirmation_mode"] == "FROZEN_STOCKMAP_REENTRY"
+
+
+def test_stockmap_buy_reversal_allows_reentry_above_frozen_low(monkeypatch) -> None:
     from schemas.stockmap import StockMapSchema
 
     creation_map = _stockmap_context()
@@ -279,17 +279,67 @@ def test_stockmap_buy_allows_failure_below_frozen_low(monkeypatch) -> None:
     )
     decision = _advisor().evaluate_deferred_entry(
         signal=_deferred_signal(side="BUY", created_price=98.0),
-        snapshot=_deferred_snapshot(close=98.4),
+        snapshot=_deferred_snapshot(close=99.2),
     )
 
     assert decision.action is AdvisorAction.ALLOW
-    assert decision.reason_codes == ("STOCKMAP_EXTREME_FAILURE_CONFIRMED",)
+    assert decision.reason_codes == ("STOCKMAP_REVERSAL_REENTRY_CONFIRMED",)
     details = decision.diagnostics["stockmap_boundary_transition"]
-    assert details["start_position"] == "BELOW_RANGE"
-    assert details["required_transition"] == "BELOW_AND_RISE"
+    assert details["required_transition"] == "BELOW_TO_INSIDE"
 
 
-def test_stockmap_gate_is_setup_family_agnostic(monkeypatch) -> None:
+def test_stockmap_breakout_initiation_allows_at_extreme_without_full_reentry(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(
+            side="SELL",
+            created_price=102.0,
+            setup="BREAKOUT_INITIATION",
+        ),
+        snapshot=_deferred_snapshot(close=101.4),
+    )
+
+    assert decision.action is AdvisorAction.ALLOW
+    assert decision.reason_codes == (
+        "STOCKMAP_BREAKOUT_INITIATION_EXTREME_CONFIRMED",
+    )
+    details = decision.diagnostics["stockmap_boundary_transition"]
+    assert details["full_reentry_confirmed"] is False
+    assert details["confirmation_mode"] == "VALID_BALANCE_ESCAPE_AT_EXTREME"
+
+
+def test_stockmap_breakout_initiation_waits_for_favourable_follow_through(monkeypatch) -> None:
+    from schemas.stockmap import StockMapSchema
+
+    creation_map = _stockmap_context()
+    monkeypatch.setattr(
+        StockMapSchema,
+        "fetch_latest_for_symbol_asof",
+        staticmethod(lambda symbol, asof_time: creation_map),
+    )
+    decision = _advisor().evaluate_deferred_entry(
+        signal=_deferred_signal(
+            side="SELL",
+            created_price=102.0,
+            setup="BREAKOUT_INITIATION",
+        ),
+        snapshot=_deferred_snapshot(close=102.2),
+    )
+
+    assert decision.action is AdvisorAction.WATCH
+    assert decision.reason_codes == (
+        "STOCKMAP_BREAKOUT_INITIATION_WAIT_FOLLOW_THROUGH",
+    )
+
+
+def test_stockmap_gate_defers_other_setup_families(monkeypatch) -> None:
     from schemas.stockmap import StockMapSchema
 
     creation_map = _stockmap_context()
@@ -299,21 +349,20 @@ def test_stockmap_gate_is_setup_family_agnostic(monkeypatch) -> None:
         staticmethod(lambda symbol, asof_time: creation_map),
     )
 
-    for setup in ("BREAKOUT_INITIATION", "FAILED_BREAKOUT", "CONTINUATION"):
+    for setup in ("FAILED_BREAKOUT", "CONTINUATION"):
         decision = _advisor().evaluate_deferred_entry(
             signal=_deferred_signal(
                 side="SELL",
                 created_price=102.0,
                 setup=setup,
             ),
-            snapshot=_deferred_snapshot(close=101.4),
+            snapshot=_deferred_snapshot(close=100.8),
         )
-        assert decision.action is AdvisorAction.ALLOW
-        assert decision.reason_codes == ("STOCKMAP_EXTREME_FAILURE_CONFIRMED",)
-        assert decision.diagnostics["signal_setup"] == setup
+        assert decision.action is AdvisorAction.WATCH
+        assert decision.reason_codes == ("STOCKMAP_SETUP_NOT_SELECTED",)
 
 
-def test_stockmap_gate_defers_signal_not_at_directional_extreme(monkeypatch) -> None:
+def test_stockmap_breakout_initiation_defers_when_not_at_extreme(monkeypatch) -> None:
     from schemas.stockmap import StockMapSchema
 
     creation_map = _stockmap_context()
@@ -332,4 +381,6 @@ def test_stockmap_gate_defers_signal_not_at_directional_extreme(monkeypatch) -> 
     )
 
     assert decision.action is AdvisorAction.WATCH
-    assert decision.reason_codes == ("STOCKMAP_EXTREME_LOCATION_NOT_MET",)
+    assert decision.reason_codes == (
+        "STOCKMAP_BREAKOUT_INITIATION_EXTREME_LOCATION_NOT_MET",
+    )

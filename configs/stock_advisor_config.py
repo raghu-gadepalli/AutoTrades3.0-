@@ -83,7 +83,7 @@ class RepeatedEpisodePolicyConfig(BaseModel):
 
 
 class StockMapBoundaryTransitionPolicyConfig(BaseModel):
-    """Research-only gate for setup-agnostic StockMap extreme-failure deployment."""
+    """Research-only StockMap deployment gate for selected setup experiments."""
 
     model_config = STRICT_CONFIG
 
