@@ -1,588 +1,529 @@
 #!/usr/bin/env python3
+"""Production-like historical replay scheduler.
+
+This module is the reusable replay orchestration layer. It deliberately does
+not implement alternative signal, trade, execution, or monitoring logic.
+Instead it advances a historical logical clock one minute at a time and invokes
+existing production services in production order against restored persisted
+snapshots.
+
+Default stage order for each logical minute:
+
+    snapshot stage      -> NO-OP (snapshots already restored/generated)
+    signal stage        -> process causally due unprocessed snapshots
+    trade stage         -> normal TradeGenerator
+    executor pre-pass   -> normal TradeExecutor using replay_price_provider
+    monitor stage       -> normal TradeMonitor using replay_price_provider
+    executor post-pass  -> settle monitor-created exits
+
+The default replay window is 09:18 through 15:15 IST, inclusive. Persisted
+three-minute snapshots become signal-eligible only when their candle has
+completed. Thus the snapshot labelled 09:15 is first processed at 09:18.
+
+Failure contract:
+- startup / unsafe preflight failures terminate the run;
+- per-record and per-stage failures are logged with replay time and processing
+  continues;
+- failed snapshots remain unprocessed;
+- later snapshots for the same symbol are not processed ahead of a failed
+  earlier snapshot in the same pass.
 """
-tests/replays/replay_pipeline.py
-
-Clean, fixed-symbol, end-to-end replay/backtest runner for AutoTrades.
-
-This program follows the same cadence-level order as the live services:
-
-    generate snapshots for the configured symbols
-    -> evaluate each generated snapshot through SignalGenerator
-    -> mark each snapshot processed immediately after successful signal evaluation
-    -> run TradeGenerator once for the cadence
-    -> run TradeExecutor entry once for the cadence
-    -> run TradeMonitor once for the cadence
-    -> run TradeExecutor exit once for the cadence
-
-This is intentionally a simple clean-run utility:
-
-- fixed hard-coded symbol list
-- fixed hard-coded replay window
-- visible source defaults with CLI overrides
-- no checkpoint/resume logic
-- no raw candle deletion; historical data is fetched from the API on demand
-- optional global clearing of auditlog, user_trades, stock_opportunities, signals and snapshots
-- optional CSV exports
-
-For large-universe work, use replay_snapshots.py followed by
-replay_unprocessed.py instead.
-"""
-
 from __future__ import annotations
 
-import argparse
-import csv
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import date, datetime, time as dtime, timedelta
 import json
 import logging
 import os
 import sys
 import time
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from decimal import Decimal
-from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-# Allow imports from project root.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from config import AppConfig
 from configs.execution_config import EXECUTION_CONFIG
+from configs.intraday_lifecycle_config import INTRADAY_LIFECYCLE_CONFIG
+from configs.monitor_config import MONITOR_CONFIG
+from configs.signal_config import SIGNAL_CONFIG
+from configs.snapshot_config import SNAPSHOT_CONFIG
 from database.database import get_trades_db
-from logconfig import setup_logging
-from models.trade_models import (
-    AuditLog as AuditLogORM,
-    Signal as SignalORM,
-    StockOpportunity as StockOpportunityORM,
-    Snapshot as SnapshotORM,
-    UserTrade as TradeORM,
-)
+from models.trade_models import Snapshot as SnapshotORM
 from schemas.snapshot import SnapshotSchema
-from schemas.symbol import SymbolSchema
 from schemas.user import UserSchema
 from services.signals.signal_generator import SignalGenerator
-from services.snapshot.snapshot_generator import SnapshotGenerator
+from services.trade.executor import trade_executor as executor_module
 from services.trade.executor.trade_executor import TradeExecutor
+from services.trade.generator import tradegen_helper as tradegen_helper_module
+from services.trade.generator import tradegen_validator as tradegen_validator_module
 from services.trade.generator.trade_generator import TradeGenerator
 from services.trade.monitor.trade_monitor import TradeMonitor
-from tests.replays.replay_price_provider import replay_price_provider
-
-
-# =============================================================================
-# SOURCE DEFAULTS - CLI values override these
-# =============================================================================
+from configs.replay_config import REPLAY_CONFIG
+from tests.replays.replay_price_provider import get_replay_price, replay_price_provider
 
 IST = ZoneInfo("Asia/Kolkata")
-
-# Snapshot API ticks. A tick at 09:18 normally persists the completed 09:15
-# three-minute snapshot; a tick at 15:30 normally persists 15:27.
-START = datetime(2026, 8, 3, 9, 18, tzinfo=IST)
-END = datetime(2026, 8, 3, 15, 30, tzinfo=IST)
-STEP_MINUTES = 3
-
-# Fixed replay universe. The symbols must be enabled EQ symbols in the DB.
-SYMBOLS: List[str] = ["TORNTPHARM", "DELHIVERY"]
-SYMBOL_TYPE_FILTER = "EQ"
-
-# The user for whom TradeGenerator creates the replay trades.
-REPLAY_USERID = "DR1812"
-
-# Market-data credentials are loaded from this DB user. Leave the override
-# values blank to use the DB values. A non-empty value overrides only that field.
-DATA_USER_ID = AppConfig.DATA_USER
-API_KEY_OVERRIDE = ""
-ACCESS_TOKEN_OVERRIDE = ""
-
-# False preserves the configured database state. Set True only when a clean
-# replay is required; auditlog, user_trades, stock_opportunities, signals and
-# snapshots are then cleared. Candles and derivatives data are preserved.
-CLEAR_DATA: bool = False
-
-# True writes signals, user_trades, auditlog and a one-row summary CSV.
-GENERATE_CSV_REPORTS: bool = True
-REPORT_DIR = Path("reports")
-LOG_FILE = REPORT_DIR / "replay_pipeline.log"
-
 logger = logging.getLogger(__name__)
 
-job_stats: Dict[str, List[float]] = {
-    "snapshots": [],
-    "signals": [],
-    "trades": [],
-    "execute_entry": [],
-    "monitor": [],
-    "execute_exit": [],
-}
-run_stats: Dict[str, int] = defaultdict(int)
+
+@dataclass(frozen=True)
+class ReplayStages:
+    """Stage switches kept in one object rather than many CLI flags."""
+
+    snapshots: bool = False
+    signals: bool = True
+    trade_generator: bool = True
+    executor: bool = True
+    monitor: bool = True
+
+
+@dataclass(frozen=True)
+class ReplayPipelineConfig:
+    trading_day: date
+    start_time: dtime = dtime(9, 18)
+    end_time: dtime = dtime(15, 15)
+    step_minutes: int = 1
+    userid: Optional[str] = None
+    stages: ReplayStages = field(default_factory=ReplayStages)
+
+
+@dataclass
+class ReplayPipelineResult:
+    stats: Counter[str]
+    remaining_unprocessed: int
+
+    @property
+    def had_errors(self) -> bool:
+        error_keys = (
+            "snapshot_load_errors",
+            "signal_errors",
+            "trade_generator_errors",
+            "executor_user_fetch_errors",
+            "executor_pre_monitor_user_errors",
+            "executor_post_monitor_user_errors",
+            "monitor_pass_errors",
+            "monitor_item_errors",
+        )
+        return any(self.stats[key] for key in error_keys)
 
 
 # =============================================================================
-# Startup helpers
+# Replay runtime boundaries
 # =============================================================================
 
 
-def _validate_replay_window() -> date:
-    start = START.astimezone(IST) if START.tzinfo else START.replace(tzinfo=IST)
-    end = END.astimezone(IST) if END.tzinfo else END.replace(tzinfo=IST)
+class _ReplayClock:
+    def __init__(self) -> None:
+        self._current: Optional[datetime] = None
 
-    if end < start:
-        raise ValueError("END must not be earlier than START")
-    if start.date() != end.date():
-        raise ValueError("START and END must be on the same trading day")
-    if int(STEP_MINUTES) < 1:
-        raise ValueError("STEP_MINUTES must be >= 1")
-    return start.date()
+    def set(self, value: datetime) -> None:
+        if not isinstance(value, datetime):
+            raise TypeError("Replay clock requires datetime")
+        self._current = value
+
+    def now(self) -> datetime:
+        current = self._current
+        if current is None:
+            raise RuntimeError("Replay clock used before logical time was assigned")
+        if current.tzinfo is not None:
+            return current.astimezone(IST).replace(tzinfo=None)
+        return current.replace(tzinfo=None)
 
 
-def _normalized_symbols() -> List[str]:
-    normalized: List[str] = []
-    seen = set()
-    for value in SYMBOLS:
-        symbol = str(value or "").strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
+@contextmanager
+def _deterministic_replay_clock() -> Iterator[_ReplayClock]:
+    """Route production trade clocks to the historical logical minute."""
+    clock = _ReplayClock()
 
-    if not normalized:
-        raise ValueError("SYMBOLS must contain at least one fixed EQ symbol")
-    if "ALL" in seen:
-        raise ValueError(
-            'replay_pipeline.py is for a fixed symbol list; use replay_snapshots.py for "ALL"'
+    original_helper_now = tradegen_helper_module.business_now_naive
+    original_validator_now = tradegen_validator_module.business_now_naive
+    original_executor_now = executor_module._now_ist_naive
+
+    tradegen_helper_module.business_now_naive = clock.now
+    tradegen_validator_module.business_now_naive = clock.now
+    executor_module._now_ist_naive = clock.now
+    try:
+        yield clock
+    finally:
+        tradegen_helper_module.business_now_naive = original_helper_now
+        tradegen_validator_module.business_now_naive = original_validator_now
+        executor_module._now_ist_naive = original_executor_now
+
+
+@contextmanager
+def _replay_execution_mode() -> Iterator[None]:
+    """Force replay-safe virtual execution; provider owns historical prices."""
+    old_use_snapshot = EXECUTION_CONFIG.use_snapshot
+    old_live_virtual = EXECUTION_CONFIG.use_live_price_for_virtual
+    old_force_virtual = EXECUTION_CONFIG.force_virtual_for_replay
+
+    EXECUTION_CONFIG.use_snapshot = True
+    EXECUTION_CONFIG.use_live_price_for_virtual = False
+    EXECUTION_CONFIG.force_virtual_for_replay = True
+    try:
+        yield
+    finally:
+        EXECUTION_CONFIG.use_snapshot = old_use_snapshot
+        EXECUTION_CONFIG.use_live_price_for_virtual = old_live_virtual
+        EXECUTION_CONFIG.force_virtual_for_replay = old_force_virtual
+
+
+@contextmanager
+def _replay_cutoffs(*, end_time: dtime) -> Iterator[None]:
+    """Map the 15:15 wall-clock replay close to the last completed 3m snapshot.
+
+    SignalGenerator evaluates snapshot labels, while TradeGenerator/Monitor use
+    wall-clock time. At a 15:15 replay close the final completed 3m snapshot is
+    labelled 15:12, so that label is the replay signal cutoff.
+    """
+    old_signal_snapshot_cutoff = SIGNAL_CONFIG.intraday_cutoff_time
+    old_trade_entry_cutoff = INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time
+    old_monitor_cutoff = MONITOR_CONFIG.intraday_cutoff_time
+
+    wall_cutoff = end_time.replace(second=0, microsecond=0)
+    wall_cutoff_text = wall_cutoff.isoformat()
+    cadence = int(SNAPSHOT_CONFIG.service.tick_minutes)
+    cutoff_anchor = datetime.combine(date(2000, 1, 1), wall_cutoff)
+    signal_label_cutoff = (cutoff_anchor - timedelta(minutes=cadence)).time()
+
+    SIGNAL_CONFIG.intraday_cutoff_time = signal_label_cutoff.isoformat()
+    INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time = wall_cutoff_text
+    MONITOR_CONFIG.intraday_cutoff_time = wall_cutoff_text
+    try:
+        logger.info(
+            "REPLAY_CUTOFFS | wall=%s signal_snapshot_label=%s monitor=%s",
+            wall_cutoff_text,
+            SIGNAL_CONFIG.intraday_cutoff_time,
+            MONITOR_CONFIG.intraday_cutoff_time,
         )
-    return normalized
+        yield
+    finally:
+        SIGNAL_CONFIG.intraday_cutoff_time = old_signal_snapshot_cutoff
+        INTRADAY_LIFECYCLE_CONFIG.signal_cutoff_time = old_trade_entry_cutoff
+        MONITOR_CONFIG.intraday_cutoff_time = old_monitor_cutoff
 
 
-def _selected_symbol_rows() -> List[Any]:
-    requested = _normalized_symbols()
+def _completed_snapshot_asof(replay_time: datetime) -> datetime:
+    cadence = int(SNAPSHOT_CONFIG.service.tick_minutes)
+    if cadence < 1:
+        raise RuntimeError("Snapshot service tick_minutes must be >= 1")
+    return replay_time - timedelta(minutes=cadence)
 
-    # active=None deliberately ignores the intraday active flag. enabled=True is
-    # still enforced inside SymbolSchema.fetch_symbols.
-    rows = SymbolSchema.fetch_symbols(
-        active=None,
-        type_filter=SYMBOL_TYPE_FILTER,
-    ) or []
-    by_symbol = {
-        str(getattr(row, "symbol", "") or "").strip().upper(): row
-        for row in rows
-        if str(getattr(row, "symbol", "") or "").strip()
-    }
 
-    missing = [symbol for symbol in requested if symbol not in by_symbol]
-    if missing:
-        raise RuntimeError(
-            "Requested symbols are not enabled %s symbols: %s"
-            % (SYMBOL_TYPE_FILTER, ", ".join(missing))
+@contextmanager
+def _replay_executor_snapshot_visibility(clock: _ReplayClock) -> Iterator[None]:
+    """Keep executor snapshot guards on completed 3m data only.
+
+    Restored replay databases already contain future snapshot rows. Production
+    would not have those rows yet. The executor's snapshot-based entry guard is
+    therefore capped to the latest snapshot that could actually be completed at
+    the logical replay minute, while execution price still comes from the 1m
+    replay price provider at the current logical minute.
+    """
+    original_latest = executor_module._latest_snapshot_record
+
+    def causal_latest(symbol: str, *, asof_time: datetime):
+        del asof_time
+        return original_latest(symbol, asof_time=_completed_snapshot_asof(clock.now()))
+
+    executor_module._latest_snapshot_record = causal_latest
+    try:
+        yield
+    finally:
+        executor_module._latest_snapshot_record = original_latest
+
+
+@contextmanager
+def _replay_monitor_runtime(clock: _ReplayClock) -> Iterator[None]:
+    """Give TradeMonitor production context plus minute-level replay price/time.
+
+    The latest completed 3m snapshot remains the authoritative structural
+    context. For ``1m_candle`` pricing only, the monitored instrument price is
+    read at the current one-minute replay clock. Trade-management age/cutoff
+    calculations also use that logical minute. No production TradeMonitor code
+    is changed.
+    """
+    original_fetch = TradeMonitor._fetch_snapshot
+    original_build = TradeMonitor._build_context
+    original_price = TradeMonitor._price_from_snapshot_for_trade
+
+    def causal_fetch(self, ut, asof_time=None):
+        del asof_time
+        return original_fetch(
+            self,
+            ut,
+            asof_time=_completed_snapshot_asof(clock.now()),
         )
 
-    selected = [by_symbol[symbol] for symbol in requested]
-    for row in selected:
-        symbol = str(getattr(row, "symbol", "") or "").strip().upper()
-        if getattr(row, "token", None) is None:
-            raise RuntimeError(f"Selected symbol {symbol} has no instrument token")
-    return selected
+    def logical_build(self, *args, **kwargs):
+        kwargs["last_time"] = clock.now()
+        return original_build(self, *args, **kwargs)
+
+    source = str(REPLAY_CONFIG.execution_price_source or "").strip().lower()
+
+    def logical_1m_price(self, ut, snapshot):
+        del self, snapshot
+        return get_replay_price(getattr(ut, "symbol", None), clock.now())
+
+    TradeMonitor._fetch_snapshot = causal_fetch
+    TradeMonitor._build_context = logical_build
+    if source == "1m_candle":
+        TradeMonitor._price_from_snapshot_for_trade = logical_1m_price
+
+    try:
+        yield
+    finally:
+        TradeMonitor._fetch_snapshot = original_fetch
+        TradeMonitor._build_context = original_build
+        TradeMonitor._price_from_snapshot_for_trade = original_price
 
 
-def _resolve_api_credentials() -> Tuple[str, str, str]:
-    userid = str(DATA_USER_ID or "").strip()
-    api_override = str(API_KEY_OVERRIDE or "").strip()
-    token_override = str(ACCESS_TOKEN_OVERRIDE or "").strip()
-
-    db_api_key = ""
-    db_access_token = ""
-
-    if userid:
-        user = UserSchema.fetch_user(userid)
-        if user is None:
-            if not (api_override and token_override):
-                raise RuntimeError(
-                    f"DATA_USER_ID {userid!r} was not found and complete overrides were not supplied"
-                )
-        else:
-            db_api_key = str(user.apikey or "").strip()
-            db_access_token = str(user.access_token or "").strip()
-    elif not (api_override and token_override):
-        raise RuntimeError(
-            "DATA_USER_ID is blank and complete credential overrides were not supplied"
-        )
-
-    api_key = api_override or db_api_key
-    access_token = token_override or db_access_token
-    if not api_key or not access_token:
-        missing = []
-        if not api_key:
-            missing.append("apikey")
-        if not access_token:
-            missing.append("access_token")
-        raise RuntimeError(
-            "Replay market-data credentials are incomplete; missing %s"
-            % ", ".join(missing)
-        )
-
-    if api_override and token_override:
-        source = "HARDCODED_OVERRIDES"
-    elif api_override or token_override:
-        source = "DATABASE_WITH_PARTIAL_OVERRIDE"
-    else:
-        source = "DATABASE"
-    return api_key, access_token, source
+# =============================================================================
+# Snapshot availability / signal stage
+# =============================================================================
 
 
-def _clear_replay_data() -> None:
-    if not CLEAR_DATA:
-        logger.info("CLEAR_DATA=False; existing replay rows are preserved")
-        return
+def resolve_trading_day(explicit_day: Optional[date]) -> date:
+    if explicit_day is not None:
+        return explicit_day
 
     with get_trades_db() as db:
-        try:
-            # Delete dependent/current pipeline rows before snapshots.
-            trades_deleted = int(db.query(TradeORM).delete(synchronize_session=False))
-            opportunities_deleted = int(
-                db.query(StockOpportunityORM).delete(synchronize_session=False)
-            )
-            signals_deleted = int(db.query(SignalORM).delete(synchronize_session=False))
-            audits_deleted = int(db.query(AuditLogORM).delete(synchronize_session=False))
-            snapshots_deleted = int(db.query(SnapshotORM).delete(synchronize_session=False))
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
+        rows = db.query(SnapshotORM.snapshot_time).order_by(SnapshotORM.snapshot_time.asc()).all()
 
-    logger.info(
-        "Clean replay reset complete | user_trades=%d stock_opportunities=%d "
-        "signals=%d auditlog=%d snapshots=%d",
-        trades_deleted,
-        opportunities_deleted,
-        signals_deleted,
-        audits_deleted,
-        snapshots_deleted,
-    )
+    days = sorted({row[0].date() for row in rows if row and isinstance(row[0], datetime)})
+    if not days:
+        raise RuntimeError("Replay preflight found no persisted snapshots")
+    if len(days) != 1:
+        raise RuntimeError(
+            "Replay preflight found snapshots from multiple trading days; "
+            "specify the replay day explicitly: " + ", ".join(day.isoformat() for day in days)
+        )
+    return days[0]
 
 
-# =============================================================================
-# Cadence jobs
-# =============================================================================
+def _load_due_unprocessed(*, trading_day: date, replay_time: datetime) -> Tuple[List[SnapshotSchema], int]:
+    cadence = int(SNAPSHOT_CONFIG.service.tick_minutes)
+    if cadence < 1:
+        raise RuntimeError("Snapshot service tick_minutes must be >= 1")
 
+    available_label = replay_time - timedelta(minutes=cadence)
+    day_start = datetime.combine(trading_day, dtime.min)
+    day_end = day_start + timedelta(days=1)
 
-def _generate_snapshots_for_tick(
-    *,
-    current_time: datetime,
-    symbol_rows: Sequence[Any],
-    api_key: str,
-    access_token: str,
-) -> List[SnapshotSchema]:
-    generated: List[SnapshotSchema] = []
+    with get_trades_db() as db:
+        rows = (
+            db.query(SnapshotORM)
+            .filter(SnapshotORM.processed == False)  # noqa: E712
+            .filter(SnapshotORM.snapshot_time >= day_start)
+            .filter(SnapshotORM.snapshot_time < day_end)
+            .filter(SnapshotORM.snapshot_time <= available_label)
+            .order_by(SnapshotORM.snapshot_time.asc(), SnapshotORM.symbol.asc())
+            .all()
+        )
 
-    for row in symbol_rows:
+    snapshots: List[SnapshotSchema] = []
+    invalid = 0
+    for row in rows:
         symbol = str(getattr(row, "symbol", "") or "").strip().upper()
-        token = int(getattr(row, "token"))
         try:
-            snapshot = SnapshotGenerator(
-                token=token,
-                symbol=symbol,
-                api_key=api_key,
-                access_token=access_token,
-            ).generate_snapshot(
-                end_date=current_time,
-                persist_snapshot=True,
-            )
-            if snapshot is None:
-                run_stats["snapshot_none"] += 1
-                logger.warning(
-                    "SnapshotGenerator returned None | symbol=%s tick=%s",
-                    symbol,
-                    current_time,
-                )
-                continue
+            raw = row.data
+            if isinstance(raw, str):
+                payload = json.loads(raw)
+            elif isinstance(raw, dict):
+                payload = dict(raw)
+            else:
+                raise TypeError("snapshot.data must be an object")
 
-            generated.append(snapshot)
-            run_stats["snapshots_generated"] += 1
+            if str(payload["symbol"]).strip().upper() != symbol:
+                raise ValueError("snapshot JSON symbol differs from DB symbol")
+
+            payload_time = payload["snapshot_time"]
+            if isinstance(payload_time, str):
+                payload_time = datetime.fromisoformat(payload_time)
+            if not isinstance(payload_time, datetime):
+                raise TypeError("snapshot JSON snapshot_time must be datetime")
+            if payload_time.replace(tzinfo=None) != row.snapshot_time.replace(tzinfo=None):
+                raise ValueError("snapshot JSON time differs from DB snapshot_time")
+
+            payload["ltp"] = float(row.ltp) if row.ltp is not None else None
+            payload["ltp_time"] = row.ltp_time
+            snapshots.append(SnapshotSchema.from_db_dict(payload))
         except Exception:
-            run_stats["snapshot_errors"] += 1
+            invalid += 1
             logger.exception(
-                "Snapshot generation failed | symbol=%s tick=%s",
+                "REPLAY_SNAPSHOT_LOAD_ERROR | replay_time=%s symbol=%s snapshot_time=%s; "
+                "row remains unprocessed",
+                replay_time,
                 symbol,
-                current_time,
+                getattr(row, "snapshot_time", None),
             )
 
-    return sorted(
-        generated,
-        key=lambda snapshot: (
-            getattr(snapshot, "snapshot_time"),
-            str(getattr(snapshot, "symbol", "") or ""),
-        ),
-    )
+    return snapshots, invalid
 
 
-def _naive_ist(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(IST).replace(tzinfo=None)
+def _signal_tick(*, trading_day: date, replay_time: datetime, stats: Counter[str]) -> None:
+    snapshots, invalid = _load_due_unprocessed(trading_day=trading_day, replay_time=replay_time)
+    stats["snapshot_load_errors"] += invalid
+    if not snapshots:
+        return
 
-
-def _generate_signals_and_acknowledge(snapshots: Sequence[SnapshotSchema]) -> int:
-    processed = 0
+    blocked_symbols: set[str] = set()
+    logger.info("SIGNAL_TICK | replay_time=%s due=%d", replay_time, len(snapshots))
 
     for snapshot in snapshots:
-        symbol = str(snapshot.symbol).strip().upper()
-        snapshot_time = snapshot.snapshot_time
-        try:
-            SignalGenerator(snapshot).generate_signal()
-        except Exception:
-            run_stats["signal_errors"] += 1
-            logger.exception(
-                "Signal generation failed; snapshot remains unprocessed | symbol=%s snapshot_time=%s",
+        symbol = str(snapshot.symbol or "").strip().upper()
+        if symbol in blocked_symbols:
+            stats["signal_deferred_after_symbol_failure"] += 1
+            logger.warning(
+                "SIGNAL_DEFER_AFTER_FAILURE | replay_time=%s symbol=%s snapshot_time=%s",
+                replay_time,
                 symbol,
-                snapshot_time,
+                snapshot.snapshot_time,
             )
             continue
 
         try:
-            marked = SnapshotSchema.mark_processed(
-                symbol,
-                _naive_ist(snapshot_time),
-            )
-            if not marked:
-                raise RuntimeError("SnapshotSchema.mark_processed returned False")
+            action = str(SignalGenerator(snapshot).generate() or "NO_ACTION")
+            if not SnapshotSchema.mark_processed(snapshot.symbol, snapshot.snapshot_time):
+                raise RuntimeError("snapshot could not be marked processed")
+            stats["snapshots_processed"] += 1
+            stats[f"signal_action:{action}"] += 1
         except Exception:
-            run_stats["mark_processed_errors"] += 1
+            blocked_symbols.add(symbol)
+            stats["signal_errors"] += 1
             logger.exception(
-                "Signal succeeded but snapshot acknowledgement failed | symbol=%s snapshot_time=%s",
+                "SIGNAL_ERROR | replay_time=%s symbol=%s snapshot_time=%s; "
+                "row remains unprocessed and later snapshots for this symbol are deferred",
+                replay_time,
                 symbol,
-                snapshot_time,
+                snapshot.snapshot_time,
             )
-            continue
-
-        processed += 1
-        run_stats["signals_processed"] += 1
-
-    return processed
-
-
-def _count_user_trades() -> int:
-    with get_trades_db() as db:
-        return int(db.query(TradeORM).count())
-
-
-def _generate_trades(current_time: datetime) -> int:
-    before = _count_user_trades()
-    try:
-        created = TradeGenerator().generate_user_trades(REPLAY_USERID) or []
-    except Exception:
-        run_stats["trade_generation_errors"] += 1
-        logger.exception("TradeGenerator failed @ %s", current_time)
-        return 0
-
-    after = _count_user_trades()
-    returned = len(created) if isinstance(created, (list, tuple, set)) else int(created or 0)
-    run_stats["trades_created_returned"] += returned
-    run_stats["trades_created_db_delta"] += max(0, after - before)
-    logger.info(
-        "Trade generation complete | time=%s returned=%d db_delta=%d total=%d userid=%s",
-        current_time,
-        returned,
-        after - before,
-        after,
-        REPLAY_USERID,
-    )
-    return returned
-
-
-def _execute_trades(current_time: datetime, label: str) -> int:
-    try:
-        result = TradeExecutor().execute_all(snapshot_time=current_time)
-    except Exception:
-        run_stats[f"{label}_errors"] += 1
-        logger.exception("TradeExecutor failed | pass=%s @ %s", label, current_time)
-        return 0
-
-    count = len(result) if isinstance(result, list) else int(result or 0)
-    run_stats[f"{label}_results"] += count
-    logger.info(
-        "TradeExecutor complete | pass=%s time=%s result_count=%d raw=%s",
-        label,
-        current_time,
-        count,
-        result,
-    )
-    return count
-
-
-def _monitor_trades(current_time: datetime) -> int:
-    try:
-        result = TradeMonitor().monitor(snapshot_time=current_time)
-    except Exception:
-        run_stats["monitor_errors"] += 1
-        logger.exception("TradeMonitor failed @ %s", current_time)
-        return 0
-
-    count = len(result) if isinstance(result, list) else int(result or 0)
-    run_stats["monitor_results"] += count
-    logger.info(
-        "TradeMonitor complete | time=%s updated=%d raw=%s",
-        current_time,
-        count,
-        result,
-    )
-    return count
 
 
 # =============================================================================
-# Reporting
+# Production stage adapters
 # =============================================================================
 
 
-def _enum_str(value: Any) -> str:
-    return str(getattr(value, "value", value) or "").strip().upper()
+def _trade_tick(*, replay_time: datetime, trade_generator: TradeGenerator, userid: Optional[str], stats: Counter[str]) -> None:
+    try:
+        created = (
+            trade_generator.generate_user_trades(userid)
+            if userid
+            else trade_generator.generate_user_trades()
+        ) or []
+        count = len(created) if isinstance(created, list) else int(created or 0)
+        stats["trades_created"] += count
+        if count:
+            logger.info("TRADE_TICK | replay_time=%s created=%d", replay_time, count)
+    except Exception:
+        stats["trade_generator_errors"] += 1
+        logger.exception("TRADE_TICK_ERROR | replay_time=%s; continuing", replay_time)
 
 
-def _serialize_csv_value(value: Any) -> Any:
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ")
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (dict, list, tuple, set)):
-        return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
-    return value
+def _eligible_execution_userids(userid: Optional[str]) -> List[str]:
+    users = UserSchema.fetch_tradeable_users() or []
+    userids = [
+        str(getattr(user, "userid", "") or "").strip()
+        for user in users
+        if int(getattr(user, "active", 0) or 0) == 1
+        and int(getattr(user, "logged_in", 0) or 0) == 1
+    ]
+    userids = [value for value in userids if value]
+    if userid:
+        userids = [value for value in userids if value == userid]
+    return userids
 
 
-def _export_orm_table(model: Any, path: Path) -> int:
-    columns = [column.name for column in model.__table__.columns]
-    primary_key = list(model.__table__.primary_key.columns)[0]
-
-    with get_trades_db() as db:
-        rows = db.query(model).order_by(primary_key).all()
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    column: _serialize_csv_value(getattr(row, column))
-                    for column in columns
-                }
-            )
-    return len(rows)
-
-
-def _db_summary() -> Dict[str, Any]:
-    summary: Dict[str, Any] = {
-        "snapshots": 0,
-        "processed_snapshots": 0,
-        "signals": 0,
-        "trades": 0,
-        "audit_rows": 0,
-        "entry_status": defaultdict(int),
-        "exit_status": defaultdict(int),
-        "instrument_type": defaultdict(int),
-        "execution_mode": defaultdict(int),
-    }
-
-    with get_trades_db() as db:
-        summary["snapshots"] = int(db.query(SnapshotORM).count())
-        summary["processed_snapshots"] = int(
-            db.query(SnapshotORM)
-            .filter(SnapshotORM.processed == True)  # noqa: E712
-            .count()
-        )
-        summary["signals"] = int(db.query(SignalORM).count())
-        summary["audit_rows"] = int(db.query(AuditLogORM).count())
-        trades = db.query(TradeORM).all()
-
-    summary["trades"] = len(trades)
-    for trade in trades:
-        summary["entry_status"][_enum_str(getattr(trade, "entry_status", ""))] += 1
-        summary["exit_status"][_enum_str(getattr(trade, "exit_status", ""))] += 1
-        summary["instrument_type"][_enum_str(getattr(trade, "instrument_type", ""))] += 1
-        summary["execution_mode"][_enum_str(getattr(trade, "execution_mode", ""))] += 1
-    return summary
-
-
-def _log_db_summary(summary: Dict[str, Any]) -> None:
-    logger.info("=== DB REPLAY OUTPUT SUMMARY ===")
-    logger.info(
-        "snapshots=%s processed_snapshots=%s signals=%s trades=%s audit_rows=%s",
-        summary["snapshots"],
-        summary["processed_snapshots"],
-        summary["signals"],
-        summary["trades"],
-        summary["audit_rows"],
+def _execute_one_user(userid: str, replay_time: datetime) -> Tuple[str, int]:
+    executor = TradeExecutor()
+    acted = executor.execute_user_once(
+        userid=userid,
+        limit=int(EXECUTION_CONFIG.limit),
+        snapshot_time=replay_time,
     )
-    for key in ("entry_status", "exit_status", "instrument_type", "execution_mode"):
-        logger.info("%s=%s", key, dict(sorted(summary[key].items())))
-    logger.info("================================")
+    return userid, int(acted or 0)
 
 
-def _write_csv_reports(
-    *,
-    started_at: datetime,
-    elapsed_seconds: float,
-    symbols: Sequence[str],
-    credential_source: str,
-    summary: Dict[str, Any],
-) -> None:
-    if not GENERATE_CSV_REPORTS:
-        logger.info("GENERATE_CSV_REPORTS=False; no CSV reports were written")
+def _executor_tick(*, replay_time: datetime, phase: str, userid: Optional[str], stats: Counter[str]) -> None:
+    try:
+        userids = _eligible_execution_userids(userid)
+    except Exception:
+        stats["executor_user_fetch_errors"] += 1
+        logger.exception("EXECUTOR_%s_USER_FETCH_ERROR | replay_time=%s", phase, replay_time)
         return
 
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-    prefix = f"replay_pipeline_{START.astimezone(IST).date().isoformat()}_{stamp}"
+    if not userids:
+        return
 
-    exported = {
-        "signals": _export_orm_table(SignalORM, REPORT_DIR / f"{prefix}_signals.csv"),
-        "user_trades": _export_orm_table(TradeORM, REPORT_DIR / f"{prefix}_user_trades.csv"),
-        "auditlog": _export_orm_table(AuditLogORM, REPORT_DIR / f"{prefix}_auditlog.csv"),
-    }
+    max_workers = min(int(EXECUTION_CONFIG.max_workers), max(1, len(userids)))
+    acted_total = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_execute_one_user, value, replay_time): value for value in userids}
+        for future in as_completed(futures):
+            current_userid = futures[future]
+            try:
+                _, acted = future.result()
+                acted_total += acted
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "EXECUTOR_%s_USER_ERROR | replay_time=%s userid=%s",
+                    phase,
+                    replay_time,
+                    current_userid,
+                )
 
-    summary_row: Dict[str, Any] = {
-        "run_started_at": started_at.isoformat(),
-        "run_finished_at": datetime.now(IST).isoformat(),
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "replay_start": START.isoformat(),
-        "replay_end": END.isoformat(),
-        "step_minutes": STEP_MINUTES,
-        "symbols": ",".join(symbols),
-        "symbol_count": len(symbols),
-        "replay_userid": REPLAY_USERID,
-        "data_user_id": DATA_USER_ID,
-        "credential_source": credential_source,
-        "clear_data": CLEAR_DATA,
-        "db_snapshots": summary["snapshots"],
-        "db_processed_snapshots": summary["processed_snapshots"],
-        "db_signals": summary["signals"],
-        "db_trades": summary["trades"],
-        "db_audit_rows": summary["audit_rows"],
-        "entry_status": json.dumps(dict(sorted(summary["entry_status"].items()))),
-        "exit_status": json.dumps(dict(sorted(summary["exit_status"].items()))),
-        "instrument_type": json.dumps(dict(sorted(summary["instrument_type"].items()))),
-        "execution_mode": json.dumps(dict(sorted(summary["execution_mode"].items()))),
-        **dict(sorted(run_stats.items())),
-        **{f"exported_{key}": value for key, value in exported.items()},
-    }
-
-    path = REPORT_DIR / f"{prefix}_summary.csv"
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(summary_row.keys()))
-        writer.writeheader()
-        writer.writerow(
-            {key: _serialize_csv_value(value) for key, value in summary_row.items()}
+    stats[f"executor_{phase.lower()}_updates"] += acted_total
+    stats[f"executor_{phase.lower()}_user_errors"] += failed
+    if acted_total or failed:
+        logger.info(
+            "EXECUTOR_%s | replay_time=%s users=%d acted=%d failed=%d",
+            phase,
+            replay_time,
+            len(userids),
+            acted_total,
+            failed,
         )
 
-    logger.info(
-        "CSV reports written | signals=%d trades=%d audit=%d summary=%s",
-        exported["signals"],
-        exported["user_trades"],
-        exported["auditlog"],
-        path,
-    )
+
+def _monitor_tick(*, replay_time: datetime, trade_monitor: TradeMonitor, stats: Counter[str]) -> None:
+    try:
+        updated = int(trade_monitor.monitor(snapshot_time=replay_time) or 0)
+        errors = list(trade_monitor.last_pass_errors)
+        stats["monitor_updates"] += updated
+        stats["monitor_item_errors"] += len(errors)
+        for error in errors:
+            logger.error("MONITOR_ITEM_ERROR | replay_time=%s error=%s", replay_time, error)
+        if updated or errors:
+            logger.info(
+                "MONITOR_TICK | replay_time=%s updated=%d item_errors=%d",
+                replay_time,
+                updated,
+                len(errors),
+            )
+    except Exception:
+        stats["monitor_pass_errors"] += 1
+        logger.exception("MONITOR_TICK_ERROR | replay_time=%s; continuing", replay_time)
+
+
+def _remaining_due_unprocessed(trading_day: date, end_time: dtime) -> int:
+    day_start = datetime.combine(trading_day, dtime.min)
+    replay_end = datetime.combine(trading_day, end_time)
+    final_available_label = _completed_snapshot_asof(replay_end)
+    with get_trades_db() as db:
+        return int(
+            db.query(SnapshotORM)
+            .filter(SnapshotORM.processed == False)  # noqa: E712
+            .filter(SnapshotORM.snapshot_time >= day_start)
+            .filter(SnapshotORM.snapshot_time <= final_available_label)
+            .count()
+        )
 
 
 # =============================================================================
@@ -590,251 +531,100 @@ def _write_csv_reports(
 # =============================================================================
 
 
-def run_replay(
-    *,
-    symbol_rows: Sequence[Any],
-    api_key: str,
-    access_token: str,
-) -> None:
-    _clear_replay_data()
+def run_replay_pipeline(config: ReplayPipelineConfig) -> ReplayPipelineResult:
+    if int(config.step_minutes) != 1:
+        raise ValueError("Replay pipeline must run at one-minute logical cadence")
+    if config.end_time < config.start_time:
+        raise ValueError("Replay end must not be earlier than replay start")
 
-    current = START
-    while current <= END:
-        run_stats["cadences"] += 1
-        logger.info("=== REPLAY PIPELINE @ %s ===", current)
-
-        started = time.perf_counter()
-        snapshots = _generate_snapshots_for_tick(
-            current_time=current,
-            symbol_rows=symbol_rows,
-            api_key=api_key,
-            access_token=access_token,
-        )
-        job_stats["snapshots"].append(time.perf_counter() - started)
-        logger.info(
-            "snapshots: generated=%d elapsed=%.3fs",
-            len(snapshots),
-            job_stats["snapshots"][-1],
-        )
-
-        started = time.perf_counter()
-        processed = _generate_signals_and_acknowledge(snapshots)
-        job_stats["signals"].append(time.perf_counter() - started)
-        logger.info(
-            "signals: processed=%d failed_or_unacknowledged=%d elapsed=%.3fs",
-            processed,
-            len(snapshots) - processed,
-            job_stats["signals"][-1],
-        )
-
-        # Match the live service cadence: each downstream service gets one pass
-        # for this replay clock, even when no new signal was created.
-        started = time.perf_counter()
-        trades = _generate_trades(current)
-        job_stats["trades"].append(time.perf_counter() - started)
-        logger.info(
-            "trades: result=%d elapsed=%.3fs",
-            trades,
-            job_stats["trades"][-1],
-        )
-
-        started = time.perf_counter()
-        entry = _execute_trades(current, "entry_pass")
-        job_stats["execute_entry"].append(time.perf_counter() - started)
-        logger.info(
-            "execute_entry: result=%d elapsed=%.3fs",
-            entry,
-            job_stats["execute_entry"][-1],
-        )
-
-        started = time.perf_counter()
-        monitored = _monitor_trades(current)
-        job_stats["monitor"].append(time.perf_counter() - started)
-        logger.info(
-            "monitor: result=%d elapsed=%.3fs",
-            monitored,
-            job_stats["monitor"][-1],
-        )
-
-        started = time.perf_counter()
-        exit_count = _execute_trades(current, "exit_pass")
-        job_stats["execute_exit"].append(time.perf_counter() - started)
-        logger.info(
-            "execute_exit: result=%d elapsed=%.3fs",
-            exit_count,
-            job_stats["execute_exit"][-1],
-        )
-
-        current += timedelta(minutes=STEP_MINUTES)
-
-
-def _log_timing_summary() -> None:
-    logger.info("=== REPLAY TIMING SUMMARY ===")
-    for name, values in job_stats.items():
-        if not values:
-            continue
-        total = sum(values)
-        logger.info(
-            "%s: total=%.3fs avg=%.3fs runs=%d",
-            name,
-            total,
-            total / len(values),
-            len(values),
-        )
-    logger.info("=============================")
-
-
-def _args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run the fixed-symbol end-to-end replay pipeline. Defaults live in "
-            "this file; CLI values override them."
-        )
-    )
-    parser.add_argument("--day", default=START.date().isoformat())
-    parser.add_argument(
-        "--symbols",
-        nargs="+",
-        default=None,
-        help="Override SYMBOLS; comma-separated items are also accepted",
-    )
-    parser.add_argument("--userid", default=REPLAY_USERID)
-    parser.add_argument("--start-time", default=START.strftime("%H:%M:%S"))
-    parser.add_argument("--end-time", default=END.strftime("%H:%M:%S"))
-    parser.add_argument("--step-minutes", type=int, default=STEP_MINUTES)
-    parser.add_argument(
-        "--clear-data",
-        action=argparse.BooleanOptionalAction,
-        default=CLEAR_DATA,
-    )
-    parser.add_argument(
-        "--csv-reports",
-        action=argparse.BooleanOptionalAction,
-        default=GENERATE_CSV_REPORTS,
-    )
-    parser.add_argument("--data-user", default=DATA_USER_ID)
-    parser.add_argument("--api-key", default=API_KEY_OVERRIDE)
-    parser.add_argument("--access-token", default=ACCESS_TOKEN_OVERRIDE)
-    parser.add_argument("--report-dir", default=str(REPORT_DIR))
-    parser.add_argument("--log-file", default=None)
-    return parser.parse_args(argv)
-
-
-def _cli_symbols(raw: Optional[Sequence[str]]) -> List[str]:
-    if raw is None:
-        return list(SYMBOLS)
-    out: List[str] = []
-    seen = set()
-    for value in raw:
-        for item in str(value or "").split(","):
-            symbol = item.strip().upper()
-            if symbol and symbol not in seen:
-                seen.add(symbol)
-                out.append(symbol)
-    if not out:
-        raise ValueError("--symbols cannot be empty")
-    return out
-
-
-def _cli_datetime(day_raw: str, clock_raw: str) -> datetime:
-    day = date.fromisoformat(str(day_raw))
-    clock = datetime.strptime(str(clock_raw), "%H:%M:%S").time()
-    return datetime.combine(day, clock, tzinfo=IST)
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = _args(argv)
-    global logger, START, END, STEP_MINUTES, SYMBOLS, REPLAY_USERID
-    global DATA_USER_ID, API_KEY_OVERRIDE, ACCESS_TOKEN_OVERRIDE, CLEAR_DATA
-    global GENERATE_CSV_REPORTS, REPORT_DIR, LOG_FILE
-
-    START = _cli_datetime(args.day, args.start_time)
-    END = _cli_datetime(args.day, args.end_time)
-    STEP_MINUTES = max(1, int(args.step_minutes))
-    SYMBOLS = _cli_symbols(args.symbols)
-    REPLAY_USERID = str(args.userid).strip()
-    DATA_USER_ID = str(args.data_user).strip()
-    API_KEY_OVERRIDE = str(args.api_key or "").strip()
-    ACCESS_TOKEN_OVERRIDE = str(args.access_token or "").strip()
-    CLEAR_DATA = bool(args.clear_data)
-    GENERATE_CSV_REPORTS = bool(args.csv_reports)
-    REPORT_DIR = Path(args.report_dir)
-    LOG_FILE = Path(args.log_file) if args.log_file else REPORT_DIR / "replay_pipeline.log"
-
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    setup_logging(log_file=str(LOG_FILE))
-    logger = logging.getLogger(__name__)
-
-    started_at = datetime.now(IST)
-    started_perf = time.perf_counter()
-
-    # Startup/preflight failures terminate because continuing would be unsafe.
-    trading_day = _validate_replay_window()
-    symbol_rows = _selected_symbol_rows()
-    symbols = [
-        str(getattr(row, "symbol", "") or "").strip().upper()
-        for row in symbol_rows
-    ]
-    api_key, access_token, credential_source = _resolve_api_credentials()
+    start = datetime.combine(config.trading_day, config.start_time)
+    end = datetime.combine(config.trading_day, config.end_time)
+    stats: Counter[str] = Counter()
 
     logger.info(
-        "Starting replay_pipeline | trading_day=%s start=%s end=%s step=%dm "
-        "symbols=%s replay_user=%s clear=%s csv_reports=%s "
-        "data_user=%s credentials=%s",
-        trading_day,
-        START,
-        END,
-        STEP_MINUTES,
-        symbols,
-        REPLAY_USERID,
-        CLEAR_DATA,
-        GENERATE_CSV_REPORTS,
-        DATA_USER_ID,
-        credential_source,
+        "REPLAY_PIPELINE_START | day=%s window=%s..%s step=1m userid=%s stages=%s",
+        config.trading_day,
+        start,
+        end,
+        config.userid or "PRODUCTION_ELIGIBLE_USERS",
+        config.stages,
     )
 
-    old_use_snapshot = EXECUTION_CONFIG.use_snapshot
-    old_use_live_price_for_virtual = EXECUTION_CONFIG.use_live_price_for_virtual
-    old_force_virtual_for_replay = EXECUTION_CONFIG.force_virtual_for_replay
+    with (
+        _replay_execution_mode(),
+        _replay_cutoffs(end_time=config.end_time),
+        _deterministic_replay_clock() as clock,
+        replay_price_provider(),
+        _replay_executor_snapshot_visibility(clock),
+        _replay_monitor_runtime(clock),
+    ):
+        trade_generator = TradeGenerator() if config.stages.trade_generator else None
+        # TradeMonitor caches intraday cutoff in __init__; instantiate only after
+        # replay cutoff overrides are active.
+        trade_monitor = TradeMonitor() if config.stages.monitor else None
 
-    EXECUTION_CONFIG.use_snapshot = True
-    EXECUTION_CONFIG.use_live_price_for_virtual = False
-    EXECUTION_CONFIG.force_virtual_for_replay = True
+        current = start
+        while current <= end:
+            clock.set(current)
+            stats["logical_minutes"] += 1
 
+            # Snapshot stage is deliberately retained in pipeline order but is a
+            # no-op for restored historical snapshots.
+            if config.stages.snapshots:
+                stats["snapshot_noop_ticks"] += 1
+                logger.debug("SNAPSHOT_TICK_NOOP | replay_time=%s", current)
+
+            if config.stages.signals:
+                _signal_tick(
+                    trading_day=config.trading_day,
+                    replay_time=current,
+                    stats=stats,
+                )
+
+            if config.stages.trade_generator:
+                assert trade_generator is not None
+                _trade_tick(
+                    replay_time=current,
+                    trade_generator=trade_generator,
+                    userid=config.userid,
+                    stats=stats,
+                )
+
+            # Production executor runs independently and more frequently than
+            # TradeMonitor. With one historical price observation per minute,
+            # one pass before monitor and one after monitor preserves the event
+            # ordering without inventing sub-minute prices.
+            if config.stages.executor:
+                _executor_tick(
+                    replay_time=current,
+                    phase="PRE_MONITOR",
+                    userid=config.userid,
+                    stats=stats,
+                )
+
+            if config.stages.monitor:
+                assert trade_monitor is not None
+                _monitor_tick(
+                    replay_time=current,
+                    trade_monitor=trade_monitor,
+                    stats=stats,
+                )
+
+            if config.stages.executor:
+                _executor_tick(
+                    replay_time=current,
+                    phase="POST_MONITOR",
+                    userid=config.userid,
+                    stats=stats,
+                )
+
+            current += timedelta(minutes=1)
+
+    remaining = _remaining_due_unprocessed(config.trading_day, config.end_time)
     logger.info(
-        "Replay forced execution config | use_snapshot=%s "
-        "use_live_price_for_virtual=%s force_virtual_for_replay=%s",
-        EXECUTION_CONFIG.use_snapshot,
-        EXECUTION_CONFIG.use_live_price_for_virtual,
-        EXECUTION_CONFIG.force_virtual_for_replay,
+        "REPLAY_PIPELINE_DONE | day=%s remaining_due_unprocessed=%d stats=%s",
+        config.trading_day,
+        remaining,
+        dict(sorted(stats.items())),
     )
-
-    try:
-        with replay_price_provider():
-            run_replay(
-                symbol_rows=symbol_rows,
-                api_key=api_key,
-                access_token=access_token,
-            )
-    finally:
-        EXECUTION_CONFIG.use_snapshot = old_use_snapshot
-        EXECUTION_CONFIG.use_live_price_for_virtual = old_use_live_price_for_virtual
-        EXECUTION_CONFIG.force_virtual_for_replay = old_force_virtual_for_replay
-
-    elapsed = time.perf_counter() - started_perf
-    _log_timing_summary()
-    summary = _db_summary()
-    _log_db_summary(summary)
-    _write_csv_reports(
-        started_at=started_at,
-        elapsed_seconds=elapsed,
-        symbols=symbols,
-        credential_source=credential_source,
-        summary=summary,
-    )
-
-    logger.info("Finished replay_pipeline | elapsed=%.3fs", elapsed)
-
-
-if __name__ == "__main__":
-    main()
+    return ReplayPipelineResult(stats=stats, remaining_unprocessed=remaining)
