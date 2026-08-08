@@ -6,17 +6,21 @@ contract.
 
 Configured source:
 - ``snapshot``: preserve the existing snapshot replay pricing unchanged.
-- ``1m_candle``: use one price everywhere -- the latest historical 1-minute
-  candle CLOSE available at or before the replay clock, including a prior
-  trading session when the instrument has not traded yet on the replay day.
+- ``1m_candle``: use one price everywhere -- the CLOSE of the latest
+  *completed* historical 1-minute candle available at the replay clock,
+  including a prior trading session when the instrument has not traded yet
+  on the replay day. Candle timestamps are candle-start labels, so at logical
+  11:15 the 11:14 candle is the latest completed 1-minute candle.
 
 The 1-minute path is a read-through cache:
-1. If the exact replay-minute candle is already in ``candles``, use DB data.
-2. If it is missing, request one week of historical 1-minute data ending at
-   the replay clock, select only the latest causal candle, and persist only
+1. Convert the replay clock to the latest completed 1-minute candle cutoff
+   (floor(replay_time) - 1 minute).
+2. If that exact completed-minute candle is already in ``candles``, use DB data.
+3. If it is missing, request one week of historical 1-minute data ending at
+   the completed cutoff, select only the latest causal candle, and persist only
    that selected candle when it is not already present.
-3. Return the latest persisted candle CLOSE at or before the replay clock.
-4. If no causal candle exists after hydration, raise an explicit replay price
+4. Return the latest persisted candle CLOSE at or before the completed cutoff.
+5. If no causal candle exists after hydration, raise an explicit replay price
    error.  There is no fallback to snapshot/planned/live prices.
 
 Production TradeExecutor and TradeMonitor code is not modified.
@@ -53,6 +57,16 @@ def _replay_minute(value: Optional[datetime]) -> datetime:
     if value.tzinfo is not None:
         value = value.astimezone(executor_module.IST).replace(tzinfo=None)
     return value.replace(second=0, microsecond=0)
+
+
+def _completed_1m_cutoff(replay_minute: datetime) -> datetime:
+    """Return the latest completed 1-minute candle start label.
+
+    Candle timestamps are candle-start times. Therefore at logical 11:15 the
+    11:15 candle is still forming and the 11:14 candle is the latest causal
+    close available to replay execution/monitoring.
+    """
+    return replay_minute - timedelta(minutes=1)
 
 
 def _exact_candle(symbol: str, replay_minute: datetime) -> Optional[CandleSchema]:
@@ -199,20 +213,24 @@ def get_replay_price(symbol: str, replay_time: datetime) -> Decimal:
         raise ReplayPriceProviderError("REPLAY_PRICE_SYMBOL_MISSING")
 
     replay_minute = _replay_minute(replay_time)
+    completed_cutoff = _completed_1m_cutoff(replay_minute)
 
-    # Exact minute already cached: no API work is needed.
-    exact = _exact_candle(symbol0, replay_minute)
+    # Candle timestamps are start labels. At logical replay minute T, the
+    # candle labelled T is still forming; only T-1 minute (or an earlier sparse
+    # traded candle) is causally available.
+    exact = _exact_candle(symbol0, completed_cutoff)
     if exact is None:
-        _hydrate_from_historical_api(symbol0, replay_minute)
+        _hydrate_from_historical_api(symbol0, completed_cutoff)
 
-    # Sparse derivatives need not trade every minute.  After the provider has
-    # hydrated through the replay clock, the latest causal close is the replay
-    # equivalent of the live last-traded price.
-    candle = _latest_candle(symbol0, replay_minute)
+    # Sparse derivatives need not trade every minute. After hydration through
+    # the completed cutoff, the latest close at/before that cutoff is the
+    # replay equivalent of the live last-traded price known at replay_time.
+    candle = _latest_candle(symbol0, completed_cutoff)
     if candle is None:
         message = (
             "REPLAY_PRICE_CANDLE_MISSING_AFTER_HYDRATION "
-            f"symbol={symbol0} replay_time={replay_minute} frequency=1"
+            f"symbol={symbol0} replay_time={replay_minute} "
+            f"completed_cutoff={completed_cutoff} frequency=1"
         )
         logger.error(message)
         raise ReplayPriceProviderError(message)
@@ -222,15 +240,18 @@ def get_replay_price(symbol: str, replay_time: datetime) -> Decimal:
         message = (
             "REPLAY_PRICE_CANDLE_INVALID "
             f"symbol={symbol0} replay_time={replay_minute} "
+            f"completed_cutoff={completed_cutoff} "
             f"candle_time={candle.candle_time} close={candle.close}"
         )
         logger.error(message)
         raise ReplayPriceProviderError(message)
 
     logger.debug(
-        "REPLAY_PRICE | symbol=%s replay_time=%s candle_time=%s close=%s",
+        "REPLAY_PRICE | symbol=%s replay_time=%s completed_cutoff=%s "
+        "candle_time=%s close=%s",
         symbol0,
         replay_minute,
+        completed_cutoff,
         candle.candle_time,
         price,
     )
