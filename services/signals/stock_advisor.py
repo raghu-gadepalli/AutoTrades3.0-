@@ -327,15 +327,14 @@ class StockAdvisor:
         side: TradeSide,
         advisor_context: StockAdvisorContextAssessment,
     ) -> AdvisorDecision:
-        """Gate deployment on re-entry through the creation-time StockMap range."""
+        """Gate deployment on causal failure away from a creation-time StockMap extreme."""
         policy = self.policy.stockmap_boundary_transition
         symbol = snapshot.symbol.strip().upper()
         setup = str(getattr(signal.setup, "value", signal.setup) or "").strip().upper()
-        selected_families = self._normalised(policy.families)
 
         base_diagnostics: Dict[str, Any] = {
             "deployment_scope": "DEFERRED_TRADE_ENTRY_ONLY",
-            "research_policy": "STOCKMAP_BOUNDARY_TRANSITION_V1",
+            "research_policy": "STOCKMAP_EXTREME_FAILURE_V2",
             "exclusive": bool(policy.exclusive),
             "signal_id": signal.signal_id,
             "signal_setup": setup,
@@ -355,13 +354,6 @@ class StockAdvisor:
                     **base_diagnostics,
                     "stockmap_boundary_transition": details,
                 },
-            )
-
-        if setup not in selected_families:
-            return decision(
-                policy.non_applicable_action,
-                "STOCKMAP_BOUNDARY_TRANSITION_SETUP_NOT_SELECTED",
-                {"applicable": False, "selected_families": sorted(selected_families)},
             )
 
         creation_time = self._naive_time(signal.first_seen_time)
@@ -416,11 +408,20 @@ class StockAdvisor:
         else:
             start_position = "INSIDE_RANGE"
 
-        opposite_outside = bool(
+        extreme_location_met = bool(
             (side is TradeSide.BUY and created_price < low)
             or (side is TradeSide.SELL and created_price > high)
         )
         current_inside = bool(low <= current_price <= high)
+        evaluation_time = self._naive_time(snapshot.snapshot_time)
+        subsequent_completed_observation = bool(evaluation_time > creation_time)
+        moved_away_from_extreme = bool(
+            (side is TradeSide.BUY and current_price > created_price)
+            or (side is TradeSide.SELL and current_price < created_price)
+        )
+        failure_confirmed = bool(
+            subsequent_completed_observation and moved_away_from_extreme
+        )
         details = {
             "applicable": True,
             "creation_stockmap_time": creation_map.stockmap_time,
@@ -429,24 +430,36 @@ class StockAdvisor:
             "frozen_high": high,
             "signal_created_price": created_price,
             "start_position": start_position,
-            "opposite_outside_at_creation": opposite_outside,
+            "extreme_location_met": extreme_location_met,
             "current_snapshot_time": snapshot.snapshot_time,
             "current_price": current_price,
+            "subsequent_completed_observation": subsequent_completed_observation,
+            "moved_away_from_extreme": moved_away_from_extreme,
+            "failure_confirmed": failure_confirmed,
             "current_inside_frozen_range": current_inside,
+            "full_reentry_confirmed": current_inside,
             "required_transition": (
-                "BELOW_TO_INSIDE" if side is TradeSide.BUY else "ABOVE_TO_INSIDE"
+                "BELOW_AND_RISE" if side is TradeSide.BUY else "ABOVE_AND_FALL"
             ),
         }
 
-        if not opposite_outside:
+        if not extreme_location_met:
             return decision(
                 policy.non_applicable_action,
-                "STOCKMAP_REVERSAL_NOT_OUTSIDE_OPPOSITE_BOUNDARY",
+                "STOCKMAP_EXTREME_LOCATION_NOT_MET",
                 details,
             )
-        if not current_inside:
-            return decision(policy.wait_action, "STOCKMAP_REVERSAL_WAIT_REENTRY", details)
-        return decision(policy.allow_action, "STOCKMAP_REVERSAL_REENTRY_CONFIRMED", details)
+        if not failure_confirmed:
+            return decision(
+                policy.wait_action,
+                "STOCKMAP_EXTREME_WAIT_FAILURE_PROOF",
+                details,
+            )
+        return decision(
+            policy.allow_action,
+            "STOCKMAP_EXTREME_FAILURE_CONFIRMED",
+            details,
+        )
 
 
     @staticmethod

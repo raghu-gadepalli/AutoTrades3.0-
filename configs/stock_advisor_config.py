@@ -83,14 +83,13 @@ class RepeatedEpisodePolicyConfig(BaseModel):
 
 
 class StockMapBoundaryTransitionPolicyConfig(BaseModel):
-    """Research-only gate for causal StockMap reversal re-entry deployment."""
+    """Research-only gate for setup-agnostic StockMap extreme-failure deployment."""
 
     model_config = STRICT_CONFIG
 
     enabled: bool = True
     research_only: bool = True
     exclusive: bool = True
-    families: Tuple[str, ...] = ("REVERSAL",)
     non_applicable_action: AdvisorRuleAction = "WATCH"
     wait_action: AdvisorRuleAction = "WATCH"
     allow_action: AdvisorRuleAction = "ALLOW"
